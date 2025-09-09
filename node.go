@@ -659,28 +659,28 @@ func validateCOSETx(b []byte) (string, string, int64, error) {
     }
 
     // Decode payload (canonical CBOR bytes) and validate minimal schema
-    var pl map[int]interface{}
-    if err := decMode.Unmarshal(payload, &pl); err != nil {
+    var plRaw map[int]interface{}
+    if err := decMode.Unmarshal(payload, &plRaw); err != nil {
         return "", "", 0, fmt.Errorf("payload: decode: %w", err)
     }
     // types
-    if _, ok := pl[0].(int64); !ok && !isUint(pl[0]) { return "", "", 0, fmt.Errorf("payload[0] version int") }
-    if _, ok := pl[1].(string); !ok { return "", "", 0, fmt.Errorf("payload[1] network_id string") }
-    if _, ok := pl[2].(string); !ok { return "", "", 0, fmt.Errorf("payload[2] tx_type string") }
-    devMap, ok := pl[3].(map[int]interface{})
+    if _, ok := plRaw[0].(int64); !ok && !isUint(plRaw[0]) { return "", "", 0, fmt.Errorf("payload[0] version int") }
+    if _, ok := plRaw[1].(string); !ok { return "", "", 0, fmt.Errorf("payload[1] network_id string") }
+    if _, ok := plRaw[2].(string); !ok { return "", "", 0, fmt.Errorf("payload[2] tx_type string") }
+    devMap, ok := asIntKeyedMap(plRaw[3])
     if !ok { return "", "", 0, fmt.Errorf("payload[3] device map") }
-    seq := toInt64(pl[4])
+    seq := toInt64(plRaw[4])
     if seq <= 0 { return "", "", 0, fmt.Errorf("payload[4] seq > 0") }
     // fee
-    fee, ok := pl[6].(map[int]interface{})
+    feeMap, ok := asIntKeyedMap(plRaw[6])
     if !ok { return "", "", 0, fmt.Errorf("payload[6] fee map") }
-    amt := toInt64(fee[0])
-    denom, _ := fee[1].(string)
+    amt := toInt64(feeMap[int64(0)])
+    denom, _ := feeMap[int64(1)].(string)
     if amt < 1 || denom != "uCR" { return "", "", 0, fmt.Errorf("fee invalid") }
-    if _, ok := pl[8].(map[int]interface{}); !ok { return "", "", 0, fmt.Errorf("payload[8] map") }
+    if _, ok := asIntKeyedMap(plRaw[8]); !ok { return "", "", 0, fmt.Errorf("payload[8] map") }
 
     // device id
-    devID, _ := devMap[0].(string)
+    devID, _ := devMap[int64(0)].(string)
     if devID == "" { return "", "", 0, fmt.Errorf("device id missing") }
 
     // txid is hash of payload canonical bytes
@@ -714,6 +714,36 @@ func isUint(v interface{}) bool {
         return true
     default:
         return false
+    }
+}
+
+// asIntKeyedMap normalizes a CBOR-decoded map whose keys are small integers
+// into a map[int64]interface{} regardless of concrete key types.
+func asIntKeyedMap(v interface{}) (map[int64]interface{}, bool) {
+    out := make(map[int64]interface{})
+    switch m := v.(type) {
+    case map[int]interface{}:
+        for k, val := range m { out[int64(k)] = val }
+        return out, true
+    case map[int64]interface{}:
+        for k, val := range m { out[k] = val }
+        return out, true
+    case map[uint64]interface{}:
+        for k, val := range m { out[int64(k)] = val }
+        return out, true
+    case map[interface{}]interface{}:
+        for k, val := range m {
+            switch kk := k.(type) {
+            case int: out[int64(kk)] = val
+            case int64: out[kk] = val
+            case uint64: out[int64(kk)] = val
+            case uint: out[int64(kk)] = val
+            default: return nil, false
+            }
+        }
+        return out, true
+    default:
+        return nil, false
     }
 }
 
