@@ -3,6 +3,7 @@ package main
 import (
     "crypto/ecdsa"
     "crypto/elliptic"
+    crand "crypto/rand"
     "crypto/sha256"
     "encoding/asn1"
     "encoding/base64"
@@ -18,6 +19,7 @@ import (
     "os/signal"
     "strings"
     "sync"
+    "sync/atomic"
     "time"
     "math/big"
 
@@ -28,6 +30,7 @@ import (
     pubsub "github.com/libp2p/go-libp2p-pubsub"
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
     ma "github.com/multiformats/go-multiaddr"
+    mrand "math/rand"
 )
 
 // protocolID identifies our very simple stream type.
@@ -194,6 +197,10 @@ func main() {
     txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
     bridgeURL := flag.String("bridge-url", "", "optional HTTP URL to forward validated txs (e.g., http://localhost:1337/tx)")
     httpIn := flag.String("http", "", "optional HTTP listen addr to accept POST /tx and publish to gossip (e.g., :14000)")
+    // Dev: synthetic tx generator
+    devGen := flag.Bool("dev-gen-tx", false, "enable built-in synthetic tx generator")
+    devInterval := flag.Duration("dev-interval", 500*time.Millisecond, "interval between dev tx publishes")
+    devReuseKey := flag.Bool("dev-reuse-key", true, "reuse a single dev private key (device) per node")
     var bootstraps multiFlag
     flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
     flag.Parse()
@@ -389,6 +396,48 @@ func main() {
         defer srv.Shutdown(ctx)
     }
 
+    // Dev synthetic tx generator
+    if *devGen {
+        var devPriv *ecdsa.PrivateKey
+        var err error
+        if *devReuseKey {
+            devPriv, err = ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+            if err != nil {
+                log.Fatalf("dev: keygen: %v", err)
+            }
+        }
+        var devNonce uint64
+        go func() {
+            t := time.NewTicker(*devInterval)
+            defer t.Stop()
+            for {
+                select {
+                case <-ctx.Done():
+                    return
+                case <-t.C:
+                    var priv *ecdsa.PrivateKey
+                    if *devReuseKey {
+                        priv = devPriv
+                    } else {
+                        var err error
+                        priv, err = ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+                        if err != nil {
+                            log.Printf("dev: keygen: %v", err)
+                            continue
+                        }
+                    }
+                    tx := generateDevTx(priv, h, atomic.AddUint64(&devNonce, 1))
+                    b, _ := json.Marshal(tx)
+                    if err := txTopic.Publish(ctx, b); err != nil {
+                        log.Printf("dev: publish failed: %v", err)
+                    } else {
+                        log.Printf("dev: published tx %s", tx.TxID)
+                    }
+                }
+            }
+        }()
+    }
+
     // Stats logger: all_nodes and connected_nodes_counter
     if statsInterval != nil && *statsInterval > 0 {
         go func() {
@@ -485,6 +534,57 @@ func validateTxSignature(tx BlockchainTx) error {
         return fmt.Errorf("signature mismatch")
     }
     return nil
+}
+
+// generateDevTx creates a synthetic valid transaction signed with priv.
+func generateDevTx(priv *ecdsa.PrivateKey, h host.Host, nonce uint64) BlockchainTx {
+    // Build fields
+    pubB := elliptic.Marshal(priv.Curve, priv.PublicKey.X, priv.PublicKey.Y)
+    tx := BlockchainTx{
+        DeviceID:   fmt.Sprintf("dev-%s", h.ID()),
+        PublicKey:  base64.StdEncoding.EncodeToString(pubB),
+        Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+        Nonce:      int(nonce),
+        SensorType: "vital_signs",
+        SensorData: mustJSON(map[string]interface{}{
+            "heart_rate":  60 + mrand.Intn(40),
+            "spo2":        94 + mrand.Intn(5),
+            "temperature": 36.5 + mrand.Float64(),
+            "status":      "stable",
+        }),
+    }
+
+    // Compute TXID
+    tx.TxID = computeTXID(tx)
+
+    // Sign
+    tmp := tx
+    tmp.Signature = ""
+    payload, _ := json.Marshal(tmp)
+    sum := sha256.Sum256(payload)
+    r, s, _ := ecdsa.Sign(crand.Reader, priv, sum[:])
+    tx.Signature = base64.StdEncoding.EncodeToString(padBig32(r, s))
+    return tx
+}
+
+func padBig32(r, s *big.Int) []byte {
+    rb := r.Bytes()
+    sb := s.Bytes()
+    if len(rb) < 32 {
+        rb = append(make([]byte, 32-len(rb)), rb...)
+    }
+    if len(sb) < 32 {
+        sb = append(make([]byte, 32-len(sb)), sb...)
+    }
+    out := make([]byte, 64)
+    copy(out[:32], rb[:32])
+    copy(out[32:], sb[:32])
+    return out
+}
+
+func mustJSON(v interface{}) json.RawMessage {
+    b, _ := json.Marshal(v)
+    return b
 }
 
 func forwardTx(url string, tx BlockchainTx) {
