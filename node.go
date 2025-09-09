@@ -32,6 +32,36 @@ const mdnsServiceTag = "pose-simple-mdns"
 // default pubsub heartbeat topic
 const heartbeatTopic = "pose/heartbeat/1.0.0"
 
+// memberSet tracks peers seen via heartbeat, expiring them after a TTL.
+type memberSet struct {
+    mu   sync.Mutex
+    last map[string]time.Time
+    ttl  time.Duration
+}
+
+func newMemberSet(ttl time.Duration) *memberSet {
+    return &memberSet{last: make(map[string]time.Time), ttl: ttl}
+}
+
+func (m *memberSet) touch(id string) {
+    m.mu.Lock()
+    m.last[id] = time.Now()
+    m.mu.Unlock()
+}
+
+func (m *memberSet) countAndSweep() int {
+    now := time.Now()
+    m.mu.Lock()
+    for id, t := range m.last {
+        if now.Sub(t) > m.ttl {
+            delete(m.last, id)
+        }
+    }
+    n := len(m.last)
+    m.mu.Unlock()
+    return n
+}
+
 // mdnsNotifee reacts to newly discovered peers.
 type mdnsNotifee struct {
     h    host.Host
@@ -149,6 +179,8 @@ func main() {
     mdnsTag := flag.String("mdns-tag", mdnsServiceTag, "mDNS service tag")
     hbTopic := flag.String("topic", heartbeatTopic, "pubsub heartbeat topic")
     hbInterval := flag.Duration("hb", 2*time.Second, "heartbeat publish interval")
+    statsInterval := flag.Duration("stats", 5*time.Second, "stats log interval (0=off)")
+    memberTTL := flag.Duration("ttl", 10*time.Second, "membership entry TTL")
     var bootstraps multiFlag
     flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
     flag.Parse()
@@ -210,7 +242,11 @@ func main() {
         log.Fatalf("pubsub subscribe: %v", err)
     }
 
-    // Reader: print heartbeats from others
+    // Membership tracker
+    members := newMemberSet(*memberTTL)
+    members.touch(h.ID().String()) // include self
+
+    // Reader: print heartbeats from others and refresh membership
     go func() {
         for {
             msg, err := sub.Next(ctx)
@@ -222,6 +258,7 @@ func main() {
             }
             payload := string(msg.Message.GetData())
             log.Printf("pubsub: from=%s msg=%s", msg.ReceivedFrom, strings.TrimSpace(payload))
+            members.touch(msg.ReceivedFrom.String())
         }
     }()
 
@@ -236,9 +273,29 @@ func main() {
             case <-t.C:
                 payload := fmt.Sprintf("heartbeat %s %s", h.ID(), time.Now().UTC().Format(time.RFC3339Nano))
                 _ = topic.Publish(ctx, []byte(payload))
+                // refresh our own membership timestamp
+                members.touch(h.ID().String())
             }
         }
     }()
+
+    // Stats logger: all_nodes and connected_nodes_counter
+    if statsInterval != nil && *statsInterval > 0 {
+        go func() {
+            t := time.NewTicker(*statsInterval)
+            defer t.Stop()
+            for {
+                select {
+                case <-ctx.Done():
+                    return
+                case <-t.C:
+                    all := members.countAndSweep()
+                    connected := len(h.Network().Peers())
+                    log.Printf("stats: all_nodes=%d connected_nodes_counter=%d", all, connected)
+                }
+            }
+        }()
+    }
 
     // Wait for Ctrl+C.
     sig := make(chan os.Signal, 1)
