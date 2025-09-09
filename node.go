@@ -82,9 +82,6 @@ func handleStream(s network.Stream) {
 }
 
 func main() {
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
     // Create a node listening on a random TCP port.
     h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
     if err != nil {
@@ -115,4 +112,3 @@ func main() {
     <-sig
     log.Println("Shutting down...")
 }
-
