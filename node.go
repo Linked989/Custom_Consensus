@@ -16,6 +16,7 @@ import (
     "net/http"
     "os"
     "os/signal"
+    "reflect"
     "strings"
     "sync"
     "sync/atomic"
@@ -585,12 +586,30 @@ func validateCOSETx(b []byte) (string, string, int64, error) {
     case cbor.RawMessage:
         prot = []byte(v)
     case map[int]interface{}:
-        // tolerate map by re-encoding deterministically
+        b, err := encMode.Marshal(v)
+        if err != nil { return "", "", 0, fmt.Errorf("cose: protected marshal: %w", err) }
+        prot = b
+    case map[interface{}]interface{}:
+        b, err := encMode.Marshal(v)
+        if err != nil { return "", "", 0, fmt.Errorf("cose: protected marshal: %w", err) }
+        prot = b
+    case map[uint64]interface{}:
+        b, err := encMode.Marshal(v)
+        if err != nil { return "", "", 0, fmt.Errorf("cose: protected marshal: %w", err) }
+        prot = b
+    case map[int64]interface{}:
         b, err := encMode.Marshal(v)
         if err != nil { return "", "", 0, fmt.Errorf("cose: protected marshal: %w", err) }
         prot = b
     default:
-        return "", "", 0, fmt.Errorf("cose: protected not bstr")
+        // As a last resort, try to re-marshal any map kind via reflection
+        if rv := reflect.ValueOf(arr[0]); rv.IsValid() && rv.Kind() == reflect.Map {
+            b, err := encMode.Marshal(arr[0])
+            if err != nil { return "", "", 0, fmt.Errorf("cose: protected marshal: %w", err) }
+            prot = b
+        } else {
+            return "", "", 0, fmt.Errorf("cose: protected not bstr")
+        }
     }
     // unprotected := arr[1] // ignored
     var payload []byte
