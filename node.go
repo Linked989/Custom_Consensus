@@ -1,6 +1,7 @@
 package main
 
 import (
+    "bytes"
     "bufio"
     "context"
     crand "crypto/rand"
@@ -27,6 +28,7 @@ import (
     "github.com/libp2p/go-libp2p/core/network"
     "github.com/libp2p/go-libp2p/core/peer"
     pubsub "github.com/libp2p/go-libp2p-pubsub"
+    pb "github.com/libp2p/go-libp2p-pubsub/pb"
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
     ma "github.com/multiformats/go-multiaddr"
 )
@@ -273,8 +275,8 @@ func main() {
 
     // ----- PubSub heartbeat -----
     // GossipSub with message-id based on message bytes (COSE), reducing duplicate forwarding
-    ps, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMessageIdFn(func(m *pubsub.Message) string {
-        sum := sha256.Sum256(m.Data)
+    ps, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMessageIdFn(func(m *pb.Message) string {
+        sum := sha256.Sum256(m.GetData())
         return hex.EncodeToString(sum[:])
     }))
     if err != nil {
@@ -387,6 +389,7 @@ func main() {
                 http.Error(w, "POST only", http.StatusMethodNotAllowed)
                 return
             }
+            defer r.Body.Close()
             body, err := io.ReadAll(r.Body)
             if err != nil {
                 http.Error(w, "read error", http.StatusBadRequest)
@@ -508,8 +511,8 @@ var (
 )
 
 func init() {
-    em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired, Time: cbor.TimeRFC3339}.EncMode()
-    dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired, Time: cbor.TimeRFC3339}.DecMode()
+    em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
+    dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
     encMode, decMode = em, dm
 }
 
@@ -719,7 +722,7 @@ func shortPeer(id string) string {
 }
 
 func forwardCOSE(url string, cose []byte) {
-    req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(cose)))
+    req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(cose))
     if err != nil { log.Printf("bridge: build request: %v", err); return }
     req.Header.Set("Content-Type", "application/cbor")
     client := &http.Client{Timeout: 5 * time.Second}
