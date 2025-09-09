@@ -178,15 +178,12 @@ func main() {
     h.SetStreamHandler(protocolID, func(s network.Stream) { handleStream(h, s) })
 
     // mDNS discovery (optional)
-    var svc io.Closer
     if *enableMDNS {
         n := &mdnsNotifee{h: h, seen: make(map[peer.ID]struct{})}
-        // Use modern mDNS API: context-based constructor with options.
-        service, err := mdns.NewMdnsService(ctx, h, 10*time.Second, n, mdns.WithServiceName(*mdnsTag))
-        if err != nil {
+        svc := mdns.NewMdnsService(h, *mdnsTag, n)
+        if err := svc.Start(); err != nil {
             log.Fatalf("mdns start: %v", err)
         }
-        svc = service
         defer svc.Close()
     }
 
