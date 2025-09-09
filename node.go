@@ -1,14 +1,12 @@
 package main
 
 import (
-    "crypto/ecdsa"
-    "crypto/elliptic"
-    crand "crypto/rand"
-    "crypto/sha256"
-    "encoding/asn1"
-    "encoding/base64"
     "bufio"
     "context"
+    crand "crypto/rand"
+    "crypto/sha256"
+    "crypto/ed25519"
+    "encoding/hex"
     "encoding/json"
     "flag"
     "fmt"
@@ -21,8 +19,9 @@ import (
     "sync"
     "sync/atomic"
     "time"
-    "math/big"
+    mrand "math/rand"
 
+    cbor "github.com/fxamacker/cbor/v2"
     libp2p "github.com/libp2p/go-libp2p"
     "github.com/libp2p/go-libp2p/core/host"
     "github.com/libp2p/go-libp2p/core/network"
@@ -30,7 +29,6 @@ import (
     pubsub "github.com/libp2p/go-libp2p-pubsub"
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
     ma "github.com/multiformats/go-multiaddr"
-    mrand "math/rand"
 )
 
 // protocolID identifies our very simple stream type.
@@ -129,6 +127,14 @@ func handleStream(h host.Host, s network.Stream) {
     var pm peerMsg
     if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &pm); err == nil && pm.Type == "hello" {
         log.Printf("recv: hello from=%s peers=%d", s.Conn().RemotePeer(), len(pm.Addrs))
+        // Optional: register announced dev key
+        if pm.Kid != "" && pm.Pub != "" {
+            if kidBytes, err1 := hex.DecodeString(pm.Kid); err1 == nil {
+                if pubBytes, err2 := hex.DecodeString(pm.Pub); err2 == nil && len(pubBytes) == ed25519.PublicKeySize {
+                    registryRegister(kidBytes, ed25519.PublicKey(pubBytes))
+                }
+            }
+        }
         // Try connecting to provided peers.
         connectToAddrs(h, pm.Addrs)
     } else {
@@ -142,6 +148,8 @@ type peerMsg struct {
     Type  string   `json:"type"`
     From  string   `json:"from"`
     Addrs []string `json:"addrs"`
+    Kid   string   `json:"kid,omitempty"` // hex-encoded
+    Pub   string   `json:"pub,omitempty"` // hex-encoded ed25519 pubkey
 }
 
 // localAddrs returns this host's dialable multiaddrs with /p2p/<peerID> suffix.
@@ -153,11 +161,26 @@ func localAddrs(h host.Host) []string {
     return out
 }
 
+var devAnnounce struct { kid []byte; pub ed25519.PublicKey }
+
 func sendHello(h host.Host, s network.Stream) error {
     pm := peerMsg{Type: "hello", From: h.ID().String(), Addrs: localAddrs(h)}
+    if len(devAnnounce.kid) > 0 && len(devAnnounce.pub) == ed25519.PublicKeySize {
+        pm.Kid = hex.EncodeToString(devAnnounce.kid)
+        pm.Pub = hex.EncodeToString(devAnnounce.pub)
+    }
     b, _ := json.Marshal(pm)
     _, err := io.WriteString(s, string(b)+"\n")
     return err
+}
+
+func sendHelloToAllPeers(ctx context.Context, h host.Host) {
+    for _, pid := range h.Network().Peers() {
+        s, err := h.NewStream(ctx, pid, protocolID)
+        if err != nil { continue }
+        _ = sendHello(h, s)
+        _ = s.Close()
+    }
 }
 
 // connectToAddrs attempts to connect to peers described by p2p multiaddrs.
@@ -249,7 +272,11 @@ func main() {
     }
 
     // ----- PubSub heartbeat -----
-    ps, err := pubsub.NewGossipSub(ctx, h)
+    // GossipSub with message-id based on message bytes (COSE), reducing duplicate forwarding
+    ps, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMessageIdFn(func(m *pubsub.Message) string {
+        sum := sha256.Sum256(m.Data)
+        return hex.EncodeToString(sum[:])
+    }))
     if err != nil {
         log.Fatalf("pubsub init: %v", err)
     }
@@ -315,50 +342,44 @@ func main() {
         m  map[string]time.Time
     }{m: make(map[string]time.Time)}
 
-    // Reader: handle inbound tx messages
+    // Reader: handle inbound tx messages (COSE_Sign1 Ed25519)
     go func() {
         for {
             msg, err := txSub.Next(ctx)
             if err != nil {
                 return
             }
-            // Accept from anyone (including self) for simplicity; we'll dedup by txid.
-            var tx BlockchainTx
-            if err := json.Unmarshal(msg.Message.GetData(), &tx); err != nil {
-                log.Printf("tx: bad json: %v", err)
-                continue
-            }
-            if tx.TxID == "" {
-                log.Printf("tx: missing txid")
-                continue
-            }
-            if computeTXID(tx) != tx.TxID {
-                log.Printf("tx: txid mismatch %s", tx.TxID)
-                continue
-            }
-            if err := validateTxSignature(tx); err != nil {
-                log.Printf("tx: invalid sig %s: %v", tx.TxID, err)
+            // Validate COSE Sign1 + basic payload checks and replay
+            txid, devID, seq, err := validateCOSETx(msg.Message.GetData())
+            if err != nil {
+                log.Printf("tx: invalid: %v", err)
                 continue
             }
 
-            // Dedup
+            // Replay protection: seq must increase
+            if !updateLastSeq(devID, seq) {
+                // not strictly invalid, but ignore as replay
+                continue
+            }
+
+            // Dedup by txid
             seenTx.mu.Lock()
-            if _, ok := seenTx.m[tx.TxID]; ok {
+            if _, ok := seenTx.m[txid]; ok {
                 seenTx.mu.Unlock()
                 continue
             }
-            seenTx.m[tx.TxID] = time.Now()
+            seenTx.m[txid] = time.Now()
             seenTx.mu.Unlock()
 
-            log.Printf("tx: accepted %s from %s", tx.TxID, msg.ReceivedFrom)
+            log.Printf("tx: accepted txid=%s dev=%s seq=%d from %s", txid, devID, seq, msg.ReceivedFrom)
             // Optional forward to HTTP bridge (e.g., local block producer)
             if *bridgeURL != "" {
-                go forwardTx(*bridgeURL, tx)
+                go forwardCOSE(*bridgeURL, msg.Message.GetData())
             }
         }
     }()
 
-    // Optional: HTTP ingress -> publish to gossip
+    // Optional: HTTP ingress -> validate -> publish to gossip
     if *httpIn != "" {
         mux := http.NewServeMux()
         mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
@@ -366,24 +387,27 @@ func main() {
                 http.Error(w, "POST only", http.StatusMethodNotAllowed)
                 return
             }
-            var tx BlockchainTx
-            if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
-                http.Error(w, "bad json", http.StatusBadRequest)
+            body, err := io.ReadAll(r.Body)
+            if err != nil {
+                http.Error(w, "read error", http.StatusBadRequest)
                 return
             }
-            if tx.TxID == "" || computeTXID(tx) != tx.TxID {
-                http.Error(w, "bad txid", http.StatusBadRequest)
+            // Validate COSE tx before gossiping
+            txid, devID, seq, err := validateCOSETx(body)
+            if err != nil {
+                http.Error(w, "invalid tx", http.StatusBadRequest)
                 return
             }
-            if err := validateTxSignature(tx); err != nil {
-                http.Error(w, "bad signature", http.StatusBadRequest)
+            // Update replay window for HTTP-ingested txs
+            if !updateLastSeq(devID, seq) {
+                http.Error(w, "replay", http.StatusBadRequest)
                 return
             }
-            b, _ := json.Marshal(tx)
-            if err := txTopic.Publish(ctx, b); err != nil {
+            if err := txTopic.Publish(ctx, body); err != nil {
                 http.Error(w, "publish failed", http.StatusInternalServerError)
                 return
             }
+            log.Printf("http: accepted txid=%s dev=%s seq=%d", txid, devID, seq)
             w.WriteHeader(http.StatusAccepted)
         })
         srv := &http.Server{Addr: *httpIn, Handler: mux}
@@ -396,15 +420,19 @@ func main() {
         defer srv.Shutdown(ctx)
     }
 
-    // Dev synthetic tx generator
+    // Dev synthetic tx generator (COSE Sign1 Ed25519)
     if *devGen {
-        var devPriv *ecdsa.PrivateKey
+        var devPriv ed25519.PrivateKey
+        var devPub ed25519.PublicKey
         var err error
         if *devReuseKey {
-            devPriv, err = ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
-            if err != nil {
-                log.Fatalf("dev: keygen: %v", err)
-            }
+            devPub, devPriv, err = ed25519.GenerateKey(crand.Reader)
+            if err != nil { log.Fatalf("dev: keygen: %v", err) }
+            devAnnounce.kid = kidFromPub(devPub)
+            devAnnounce.pub = devPub
+            registryRegister(devAnnounce.kid, devPub)
+            // Proactively send hello with our dev key to current peers
+            go sendHelloToAllPeers(ctx, h)
         }
         var devNonce uint64
         go func() {
@@ -415,24 +443,24 @@ func main() {
                 case <-ctx.Done():
                     return
                 case <-t.C:
-                    var priv *ecdsa.PrivateKey
+                    var pvt ed25519.PrivateKey
+                    var pub ed25519.PublicKey
                     if *devReuseKey {
-                        priv = devPriv
+                        pvt, pub = devPriv, devPub
                     } else {
                         var err error
-                        priv, err = ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
-                        if err != nil {
-                            log.Printf("dev: keygen: %v", err)
-                            continue
-                        }
+                        pub, pvt, err = ed25519.GenerateKey(crand.Reader)
+                        if err != nil { log.Printf("dev: keygen: %v", err); continue }
                     }
-                    tx := generateDevTx(priv, h, atomic.AddUint64(&devNonce, 1))
-                    b, _ := json.Marshal(tx)
-                    if err := txTopic.Publish(ctx, b); err != nil {
-                        log.Printf("dev: publish failed: %v", err)
-                    } else {
-                        log.Printf("dev: published tx %s", tx.TxID)
-                    }
+                    // kid = first 8 bytes of sha256(pub)
+                    kid := kidFromPub(pub)
+                    // ensure registry has this device key
+                    registryRegister(kid, pub)
+                    // build payload and COSE_Sign1
+                    seq := atomic.AddUint64(&devNonce, 1)
+                    coseBytes, txid, err := buildDevCOSE(pvt, kid, h, seq)
+                    if err != nil { log.Printf("dev: build: %v", err); continue }
+                    if err := txTopic.Publish(ctx, coseBytes); err != nil { log.Printf("dev: publish failed: %v", err) } else { log.Printf("dev: published tx %s", txid) }
                 }
             }
         }()
@@ -472,135 +500,231 @@ func (m *multiFlag) Set(v string) error {
     return nil
 }
 
-// -------- BlockchainTx + Validation (compatible with groups_iot.go) --------
+// -------- COSE Sign1 Ed25519 Utilities --------
 
-type BlockchainTx struct {
-    TxID       string          `json:"txid"`
-    DeviceID   string          `json:"device_id"`
-    PublicKey  string          `json:"public_key"`
-    Timestamp  string          `json:"timestamp"`
-    Nonce      int             `json:"nonce"`
-    SensorType string          `json:"sensor_type"`
-    SensorData json.RawMessage `json:"sensor_data"`
-    Signature  string          `json:"signature"`
+var (
+    encMode cbor.EncMode
+    decMode cbor.DecMode
+)
+
+func init() {
+    em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired, Time: cbor.TimeRFC3339}.EncMode()
+    dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired, Time: cbor.TimeRFC3339}.DecMode()
+    encMode, decMode = em, dm
 }
 
-// computeTXID replicates the producer’s TXID logic.
-func computeTXID(tx BlockchainTx) string {
-    tmp := tx
-    tmp.TxID = ""
-    tmp.Signature = ""
-    b, _ := json.Marshal(tmp)
-    sum := sha256.Sum256(b)
-    return fmt.Sprintf("%x", sum[:])
+// in-memory key registry: kid (hex) -> ed25519 public key
+var keyRegistry = struct {
+    mu sync.RWMutex
+    m  map[string]ed25519.PublicKey
+}{m: make(map[string]ed25519.PublicKey)}
+
+func registryRegister(kid []byte, pub ed25519.PublicKey) {
+    keyRegistry.mu.Lock()
+    keyRegistry.m[hex.EncodeToString(kid)] = pub
+    keyRegistry.mu.Unlock()
 }
 
-func validateTxSignature(tx BlockchainTx) error {
-    // rebuild signing hash (txid present, signature cleared)
-    tmp := tx
-    tmp.Signature = ""
-    payload, _ := json.Marshal(tmp)
-    hash := sha256.Sum256(payload)
+func registryGet(kid []byte) (ed25519.PublicKey, bool) {
+    keyRegistry.mu.RLock()
+    pk, ok := keyRegistry.m[hex.EncodeToString(kid)]
+    keyRegistry.mu.RUnlock()
+    return pk, ok
+}
 
-    // decode public key
-    pubBytes, err := base64.StdEncoding.DecodeString(tx.PublicKey)
-    if err != nil {
-        return err
-    }
-    x, y := elliptic.Unmarshal(elliptic.P256(), pubBytes)
-    if x == nil {
-        return fmt.Errorf("invalid public key")
-    }
-    pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+// last seen sequence per device id
+var devSeq = struct {
+    mu sync.Mutex
+    m  map[string]int64
+}{m: make(map[string]int64)}
 
-    // decode signature
-    sigBytes, err := base64.StdEncoding.DecodeString(tx.Signature)
-    if err != nil {
-        return err
+func updateLastSeq(devID string, seq int64) bool {
+    devSeq.mu.Lock()
+    last := devSeq.m[devID]
+    if seq > last {
+        devSeq.m[devID] = seq
+        devSeq.mu.Unlock()
+        return true
     }
-    var r, s *big.Int
-    switch len(sigBytes) {
-    case 64:
-        r = new(big.Int).SetBytes(sigBytes[:32])
-        s = new(big.Int).SetBytes(sigBytes[32:])
-    default:
-        var esig struct{ R, S *big.Int }
-        if _, err := asn1.Unmarshal(sigBytes, &esig); err != nil {
-            return fmt.Errorf("bad signature format")
+    devSeq.mu.Unlock()
+    return false
+}
+
+func kidFromPub(pub ed25519.PublicKey) []byte {
+    sum := sha256.Sum256(pub)
+    return sum[:8]
+}
+
+// validateCOSETx parses a COSE_Sign1 (tag 18) Ed25519 message, verifies signature,
+// validates the CBOR payload schema and replay, and returns txid/devID/seq.
+func validateCOSETx(b []byte) (string, string, int64, error) {
+    // Decode COSE_Sign1 with or without tag 18
+    var tag cbor.Tag
+    var arr []interface{}
+    if err := decMode.Unmarshal(b, &tag); err == nil && tag.Number == 18 {
+        var ok bool
+        if arr, ok = tag.Content.([]interface{}); !ok {
+            return "", "", 0, fmt.Errorf("cose: bad content")
         }
-        r, s = esig.R, esig.S
+    } else {
+        if err := decMode.Unmarshal(b, &arr); err != nil {
+            return "", "", 0, fmt.Errorf("cose: decode: %w", err)
+        }
     }
-    if !ecdsa.Verify(pub, hash[:], r, s) {
-        return fmt.Errorf("signature mismatch")
+    if len(arr) != 4 {
+        return "", "", 0, fmt.Errorf("cose: array len %d", len(arr))
     }
-    return nil
+    prot, _ := arr[0].([]byte)
+    if prot == nil { return "", "", 0, fmt.Errorf("cose: protected not bstr") }
+    // unprot := arr[1] // ignored
+    payload, _ := arr[2].([]byte)
+    sig, _ := arr[3].([]byte)
+    if payload == nil || sig == nil { return "", "", 0, fmt.Errorf("cose: payload/signature type") }
+
+    // Parse protected header
+    var ph map[int]interface{}
+    if err := decMode.Unmarshal(prot, &ph); err != nil {
+        return "", "", 0, fmt.Errorf("cose: protected map: %w", err)
+    }
+    // alg (1) must be -8 (EdDSA)
+    if alg, ok := ph[1]; !ok || toInt64(alg) != -8 {
+        return "", "", 0, fmt.Errorf("cose: alg != -8")
+    }
+    // kid (4) must be bstr
+    kidv, ok := ph[4]
+    if !ok { return "", "", 0, fmt.Errorf("cose: missing kid") }
+    kid, ok := kidv.([]byte)
+    if !ok { return "", "", 0, fmt.Errorf("cose: kid type") }
+
+    // signature base string: Sig_structure
+    sigStruct := []interface{}{"Signature1", prot, []byte{}, payload}
+    toSign, err := encMode.Marshal(sigStruct)
+    if err != nil { return "", "", 0, fmt.Errorf("cose: sig-struct: %w", err) }
+
+    // Verify signature
+    pub, ok := registryGet(kid)
+    if !ok { return "", "", 0, fmt.Errorf("registry: unknown kid %s", hex.EncodeToString(kid)) }
+    if !ed25519.Verify(pub, toSign, sig) {
+        return "", "", 0, fmt.Errorf("signature mismatch")
+    }
+
+    // Decode payload (canonical CBOR bytes) and validate minimal schema
+    var pl map[int]interface{}
+    if err := decMode.Unmarshal(payload, &pl); err != nil {
+        return "", "", 0, fmt.Errorf("payload: decode: %w", err)
+    }
+    // types
+    if _, ok := pl[0].(int64); !ok && !isUint(pl[0]) { return "", "", 0, fmt.Errorf("payload[0] version int") }
+    if _, ok := pl[1].(string); !ok { return "", "", 0, fmt.Errorf("payload[1] network_id string") }
+    if _, ok := pl[2].(string); !ok { return "", "", 0, fmt.Errorf("payload[2] tx_type string") }
+    devMap, ok := pl[3].(map[int]interface{})
+    if !ok { return "", "", 0, fmt.Errorf("payload[3] device map") }
+    seq := toInt64(pl[4])
+    if seq <= 0 { return "", "", 0, fmt.Errorf("payload[4] seq > 0") }
+    // fee
+    fee, ok := pl[6].(map[int]interface{})
+    if !ok { return "", "", 0, fmt.Errorf("payload[6] fee map") }
+    amt := toInt64(fee[0])
+    denom, _ := fee[1].(string)
+    if amt < 1 || denom != "uCR" { return "", "", 0, fmt.Errorf("fee invalid") }
+    if _, ok := pl[8].(map[int]interface{}); !ok { return "", "", 0, fmt.Errorf("payload[8] map") }
+
+    // device id
+    devID, _ := devMap[0].(string)
+    if devID == "" { return "", "", 0, fmt.Errorf("device id missing") }
+
+    // txid is hash of payload canonical bytes
+    txid := sha256.Sum256(payload)
+    return hex.EncodeToString(txid[:]), devID, seq, nil
 }
 
-// generateDevTx creates a synthetic valid transaction signed with priv.
-func generateDevTx(priv *ecdsa.PrivateKey, h host.Host, nonce uint64) BlockchainTx {
-    // Build fields
-    pubB := elliptic.Marshal(priv.Curve, priv.PublicKey.X, priv.PublicKey.Y)
-    tx := BlockchainTx{
-        DeviceID:   fmt.Sprintf("dev-%s", h.ID()),
-        PublicKey:  base64.StdEncoding.EncodeToString(pubB),
-        Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
-        Nonce:      int(nonce),
-        SensorType: "vital_signs",
-        SensorData: mustJSON(map[string]interface{}{
-            "heart_rate":  60 + mrand.Intn(40),
-            "spo2":        94 + mrand.Intn(5),
-            "temperature": 36.5 + mrand.Float64(),
-            "status":      "stable",
-        }),
+func toInt64(v interface{}) int64 {
+    switch t := v.(type) {
+    case int64:
+        return t
+    case uint64:
+        if t > ^uint64(0)/2 { return int64(^uint64(0)/2) }
+        return int64(t)
+    case int:
+        return int64(t)
+    case uint:
+        return int64(t)
+    case uint32:
+        return int64(t)
+    case int32:
+        return int64(t)
+    default:
+        return 0
     }
-
-    // Compute TXID
-    tx.TxID = computeTXID(tx)
-
-    // Sign
-    tmp := tx
-    tmp.Signature = ""
-    payload, _ := json.Marshal(tmp)
-    sum := sha256.Sum256(payload)
-    r, s, _ := ecdsa.Sign(crand.Reader, priv, sum[:])
-    tx.Signature = base64.StdEncoding.EncodeToString(padBig32(r, s))
-    return tx
 }
 
-func padBig32(r, s *big.Int) []byte {
-    rb := r.Bytes()
-    sb := s.Bytes()
-    if len(rb) < 32 {
-        rb = append(make([]byte, 32-len(rb)), rb...)
+func isUint(v interface{}) bool {
+    switch v.(type) {
+    case uint, uint64, uint32, uint16, uint8:
+        return true
+    default:
+        return false
     }
-    if len(sb) < 32 {
-        sb = append(make([]byte, 32-len(sb)), sb...)
-    }
-    out := make([]byte, 64)
-    copy(out[:32], rb[:32])
-    copy(out[32:], sb[:32])
-    return out
 }
 
-func mustJSON(v interface{}) json.RawMessage {
-    b, _ := json.Marshal(v)
+// buildDevCOSE creates a sample payload and wraps it into a COSE_Sign1 (tag 18) with Ed25519.
+func buildDevCOSE(priv ed25519.PrivateKey, kid []byte, h host.Host, seq uint64) ([]byte, string, error) {
+    did := fmt.Sprintf("did:iot:DEV-%s", shortPeer(h.ID().String()))
+    payload := map[int]interface{}{
+        0: int64(1),
+        1: "iotnet-main",
+        2: "data",
+        3: map[int]interface{}{0: did, 1: "1.0.0", 2: "ed25519:DEV"},
+        4: int64(seq),
+        5: time.Now().UTC(),
+        6: map[int]interface{}{0: int64(25), 1: "uCR"},
+        7: []interface{}{randBytes(7), randBytes(7)},
+        8: map[int]interface{}{
+            0: "urn:example:sensor:v1",
+            1: map[string]interface{}{"temp_c": 21.5 + mrand.Float64(), "humidity": 0.4 + 0.1*mrand.Float64()},
+            2: map[string]interface{}{"gps": []interface{}{52.520008, 13.404954, 8.0}, "site": "plant-berlin-a"},
+            3: randBytes(6),
+        },
+        9: map[int]interface{}{0: "urn:cap:write:sensors/thermo", 1: time.Now().UTC().Add(24 * time.Hour)},
+    }
+    payloadCBOR, err := encMode.Marshal(payload)
+    if err != nil { return nil, "", err }
+    txid := sha256.Sum256(payloadCBOR)
+
+    ph := map[int]interface{}{1: int64(-8), 4: kid}
+    prot, err := encMode.Marshal(ph)
+    if err != nil { return nil, "", err }
+    toSign, err := encMode.Marshal([]interface{}{"Signature1", prot, []byte{}, payloadCBOR})
+    if err != nil { return nil, "", err }
+    sig := ed25519.Sign(priv, toSign)
+
+    arr := []interface{}{cbor.RawMessage(prot), map[int]interface{}{}, payloadCBOR, []byte(sig)}
+    tagged := cbor.Tag{Number: 18, Content: arr}
+    out, err := encMode.Marshal(tagged)
+    if err != nil { return nil, "", err }
+    return out, hex.EncodeToString(txid[:]), nil
+}
+
+func randBytes(n int) []byte {
+    b := make([]byte, n)
+    if _, err := crand.Read(b); err != nil {
+        for i := range b { b[i] = byte(mrand.Intn(256)) }
+    }
     return b
 }
 
-func forwardTx(url string, tx BlockchainTx) {
-    b, _ := json.Marshal(tx)
-    req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(b)))
-    if err != nil {
-        log.Printf("bridge: build request: %v", err)
-        return
-    }
-    req.Header.Set("Content-Type", "application/json")
+func shortPeer(id string) string {
+    if len(id) <= 8 { return id }
+    return id[len(id)-8:]
+}
+
+func forwardCOSE(url string, cose []byte) {
+    req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(cose)))
+    if err != nil { log.Printf("bridge: build request: %v", err); return }
+    req.Header.Set("Content-Type", "application/cbor")
     client := &http.Client{Timeout: 5 * time.Second}
     resp, err := client.Do(req)
-    if err != nil {
-        log.Printf("bridge: send: %v", err)
-        return
-    }
+    if err != nil { log.Printf("bridge: send: %v", err); return }
     io.Copy(io.Discard, resp.Body)
     resp.Body.Close()
 }
