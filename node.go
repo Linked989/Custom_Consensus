@@ -1,6 +1,11 @@
 package main
 
 import (
+    "crypto/ecdsa"
+    "crypto/elliptic"
+    "crypto/sha256"
+    "encoding/asn1"
+    "encoding/base64"
     "bufio"
     "context"
     "encoding/json"
@@ -8,11 +13,13 @@ import (
     "fmt"
     "io"
     "log"
+    "net/http"
     "os"
     "os/signal"
     "strings"
     "sync"
     "time"
+    "math/big"
 
     libp2p "github.com/libp2p/go-libp2p"
     "github.com/libp2p/go-libp2p/core/host"
@@ -31,6 +38,8 @@ const mdnsServiceTag = "pose-simple-mdns"
 
 // default pubsub heartbeat topic
 const heartbeatTopic = "pose/heartbeat/1.0.0"
+// tx gossip topic
+const txTopicDefault = "pose/tx/1.0.0"
 
 // memberSet tracks peers seen via heartbeat, expiring them after a TTL.
 type memberSet struct {
@@ -181,6 +190,10 @@ func main() {
     hbInterval := flag.Duration("hb", 2*time.Second, "heartbeat publish interval")
     statsInterval := flag.Duration("stats", 5*time.Second, "stats log interval (0=off)")
     memberTTL := flag.Duration("ttl", 10*time.Second, "membership entry TTL")
+    // Gossip for blockchain data
+    txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
+    bridgeURL := flag.String("bridge-url", "", "optional HTTP URL to forward validated txs (e.g., http://localhost:1337/tx)")
+    httpIn := flag.String("http", "", "optional HTTP listen addr to accept POST /tx and publish to gossip (e.g., :14000)")
     var bootstraps multiFlag
     flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
     flag.Parse()
@@ -279,6 +292,103 @@ func main() {
         }
     }()
 
+    // ----- Transaction gossip -----
+    txTopic, err := ps.Join(*txTopicName)
+    if err != nil {
+        log.Fatalf("join tx topic: %v", err)
+    }
+    txSub, err := txTopic.Subscribe()
+    if err != nil {
+        log.Fatalf("subscribe tx: %v", err)
+    }
+
+    // Seen set for txids (basic dedup/metrics)
+    seenTx := struct {
+        mu sync.Mutex
+        m  map[string]time.Time
+    }{m: make(map[string]time.Time)}
+
+    // Reader: handle inbound tx messages
+    go func() {
+        for {
+            msg, err := txSub.Next(ctx)
+            if err != nil {
+                return
+            }
+            // Accept from anyone (including self) for simplicity; we'll dedup by txid.
+            var tx BlockchainTx
+            if err := json.Unmarshal(msg.Message.GetData(), &tx); err != nil {
+                log.Printf("tx: bad json: %v", err)
+                continue
+            }
+            if tx.TxID == "" {
+                log.Printf("tx: missing txid")
+                continue
+            }
+            if computeTXID(tx) != tx.TxID {
+                log.Printf("tx: txid mismatch %s", tx.TxID)
+                continue
+            }
+            if err := validateTxSignature(tx); err != nil {
+                log.Printf("tx: invalid sig %s: %v", tx.TxID, err)
+                continue
+            }
+
+            // Dedup
+            seenTx.mu.Lock()
+            if _, ok := seenTx.m[tx.TxID]; ok {
+                seenTx.mu.Unlock()
+                continue
+            }
+            seenTx.m[tx.TxID] = time.Now()
+            seenTx.mu.Unlock()
+
+            log.Printf("tx: accepted %s from %s", tx.TxID, msg.ReceivedFrom)
+            // Optional forward to HTTP bridge (e.g., local block producer)
+            if *bridgeURL != "" {
+                go forwardTx(*bridgeURL, tx)
+            }
+        }
+    }()
+
+    // Optional: HTTP ingress -> publish to gossip
+    if *httpIn != "" {
+        mux := http.NewServeMux()
+        mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
+            if r.Method != http.MethodPost {
+                http.Error(w, "POST only", http.StatusMethodNotAllowed)
+                return
+            }
+            var tx BlockchainTx
+            if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
+                http.Error(w, "bad json", http.StatusBadRequest)
+                return
+            }
+            if tx.TxID == "" || computeTXID(tx) != tx.TxID {
+                http.Error(w, "bad txid", http.StatusBadRequest)
+                return
+            }
+            if err := validateTxSignature(tx); err != nil {
+                http.Error(w, "bad signature", http.StatusBadRequest)
+                return
+            }
+            b, _ := json.Marshal(tx)
+            if err := txTopic.Publish(ctx, b); err != nil {
+                http.Error(w, "publish failed", http.StatusInternalServerError)
+                return
+            }
+            w.WriteHeader(http.StatusAccepted)
+        })
+        srv := &http.Server{Addr: *httpIn, Handler: mux}
+        go func() {
+            log.Printf("HTTP tx ingress listening on %s/tx", *httpIn)
+            if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+                log.Printf("http ingress error: %v", err)
+            }
+        }()
+        defer srv.Shutdown(ctx)
+    }
+
     // Stats logger: all_nodes and connected_nodes_counter
     if statsInterval != nil && *statsInterval > 0 {
         go func() {
@@ -311,4 +421,86 @@ func (m *multiFlag) String() string { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error {
     *m = append(*m, v)
     return nil
+}
+
+// -------- BlockchainTx + Validation (compatible with groups_iot.go) --------
+
+type BlockchainTx struct {
+    TxID       string          `json:"txid"`
+    DeviceID   string          `json:"device_id"`
+    PublicKey  string          `json:"public_key"`
+    Timestamp  string          `json:"timestamp"`
+    Nonce      int             `json:"nonce"`
+    SensorType string          `json:"sensor_type"`
+    SensorData json.RawMessage `json:"sensor_data"`
+    Signature  string          `json:"signature"`
+}
+
+// computeTXID replicates the producer’s TXID logic.
+func computeTXID(tx BlockchainTx) string {
+    tmp := tx
+    tmp.TxID = ""
+    tmp.Signature = ""
+    b, _ := json.Marshal(tmp)
+    sum := sha256.Sum256(b)
+    return fmt.Sprintf("%x", sum[:])
+}
+
+func validateTxSignature(tx BlockchainTx) error {
+    // rebuild signing hash (txid present, signature cleared)
+    tmp := tx
+    tmp.Signature = ""
+    payload, _ := json.Marshal(tmp)
+    hash := sha256.Sum256(payload)
+
+    // decode public key
+    pubBytes, err := base64.StdEncoding.DecodeString(tx.PublicKey)
+    if err != nil {
+        return err
+    }
+    x, y := elliptic.Unmarshal(elliptic.P256(), pubBytes)
+    if x == nil {
+        return fmt.Errorf("invalid public key")
+    }
+    pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+
+    // decode signature
+    sigBytes, err := base64.StdEncoding.DecodeString(tx.Signature)
+    if err != nil {
+        return err
+    }
+    var r, s *big.Int
+    switch len(sigBytes) {
+    case 64:
+        r = new(big.Int).SetBytes(sigBytes[:32])
+        s = new(big.Int).SetBytes(sigBytes[32:])
+    default:
+        var esig struct{ R, S *big.Int }
+        if _, err := asn1.Unmarshal(sigBytes, &esig); err != nil {
+            return fmt.Errorf("bad signature format")
+        }
+        r, s = esig.R, esig.S
+    }
+    if !ecdsa.Verify(pub, hash[:], r, s) {
+        return fmt.Errorf("signature mismatch")
+    }
+    return nil
+}
+
+func forwardTx(url string, tx BlockchainTx) {
+    b, _ := json.Marshal(tx)
+    req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(b)))
+    if err != nil {
+        log.Printf("bridge: build request: %v", err)
+        return
+    }
+    req.Header.Set("Content-Type", "application/json")
+    client := &http.Client{Timeout: 5 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        log.Printf("bridge: send: %v", err)
+        return
+    }
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
 }
