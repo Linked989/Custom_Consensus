@@ -577,12 +577,40 @@ func validateCOSETx(b []byte) (string, string, int64, error) {
     if len(arr) != 4 {
         return "", "", 0, fmt.Errorf("cose: array len %d", len(arr))
     }
-    prot, _ := arr[0].([]byte)
-    if prot == nil { return "", "", 0, fmt.Errorf("cose: protected not bstr") }
-    // unprot := arr[1] // ignored
-    payload, _ := arr[2].([]byte)
-    sig, _ := arr[3].([]byte)
-    if payload == nil || sig == nil { return "", "", 0, fmt.Errorf("cose: payload/signature type") }
+    // protected header can arrive as []byte or cbor.RawMessage, sometimes even a map (non‑strict encoders)
+    var prot []byte
+    switch v := arr[0].(type) {
+    case []byte:
+        prot = v
+    case cbor.RawMessage:
+        prot = []byte(v)
+    case map[int]interface{}:
+        // tolerate map by re-encoding deterministically
+        b, err := encMode.Marshal(v)
+        if err != nil { return "", "", 0, fmt.Errorf("cose: protected marshal: %w", err) }
+        prot = b
+    default:
+        return "", "", 0, fmt.Errorf("cose: protected not bstr")
+    }
+    // unprotected := arr[1] // ignored
+    var payload []byte
+    switch v := arr[2].(type) {
+    case []byte:
+        payload = v
+    case cbor.RawMessage:
+        payload = []byte(v)
+    default:
+        return "", "", 0, fmt.Errorf("cose: payload not bstr")
+    }
+    var sig []byte
+    switch v := arr[3].(type) {
+    case []byte:
+        sig = v
+    case cbor.RawMessage:
+        sig = []byte(v)
+    default:
+        return "", "", 0, fmt.Errorf("cose: signature not bstr")
+    }
 
     // Parse protected header
     var ph map[int]interface{}
