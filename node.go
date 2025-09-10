@@ -14,6 +14,7 @@ import (
     "time"
 
     pubsub "github.com/libp2p/go-libp2p-pubsub"
+    "github.com/libp2p/go-libp2p/core/network"
     "pose/internal/dev"
     "pose/internal/gossip"
     "pose/internal/httpapi"
@@ -81,7 +82,7 @@ func main() {
     }
 
     // Hello streams (handled in discovery dialing; no handler payload here)
-    h.SetStreamHandler(p2p.ProtocolID, func(s io.ReadWriteCloser) { _ = s.Close() })
+    h.SetStreamHandler(p2p.ProtocolID, func(s network.Stream) { _ = s.Close() })
 
     if *enableMDNS {
         n := &p2p.MDNSNotifee{H: h}
