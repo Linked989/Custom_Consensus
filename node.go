@@ -31,7 +31,7 @@ import (
     pubsub "github.com/libp2p/go-libp2p-pubsub"
     pb "github.com/libp2p/go-libp2p-pubsub/pb"
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-    pnet "github.com/libp2p/go-libp2p/p2p/net/pnet"
+    pnet "github.com/libp2p/go-libp2p/p2p/security/pnet"
     ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -261,9 +261,9 @@ func main() {
 
     // Optional: Private network PSK (swarm key)
     if *swarmKeyPath != "" {
-        psk, err := loadSwarmKey(*swarmKeyPath)
+        pskBytes, err := loadSwarmKey(*swarmKeyPath)
         if err != nil { log.Fatalf("pnet: load swarm.key: %v", err) }
-        lpOpts = append(lpOpts, libp2p.PrivateNetwork(psk))
+        lpOpts = append(lpOpts, libp2p.PrivateNetwork(pnet.PSK(pskBytes)))
         log.Printf("pnet: private network enabled (swarm key)")
     }
 
@@ -854,7 +854,7 @@ func generateSwarmKey(path string) error {
 
 // loadSwarmKey reads a swarm.key file and returns a pnet.PSK.
 // Accepts libp2p's standard 3-line format or a raw 32-byte file or a single-line hex string.
-func loadSwarmKey(path string) (pnet.PSK, error) {
+func loadSwarmKey(path string) ([]byte, error) {
     data, err := os.ReadFile(path)
     if err != nil {
         return nil, err
@@ -872,11 +872,11 @@ func loadSwarmKey(path string) (pnet.PSK, error) {
         if err != nil {
             return nil, fmt.Errorf("swarm.key hex decode: %w", err)
         }
-        return pnet.PSK(b), nil
+        return b, nil
     }
     // Fallback: raw 32-byte file
     if len(data) == 32 {
-        return pnet.PSK(data), nil
+        return data, nil
     }
     return nil, fmt.Errorf("unsupported swarm.key format")
 }
