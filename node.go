@@ -31,6 +31,7 @@ import (
     pubsub "github.com/libp2p/go-libp2p-pubsub"
     pb "github.com/libp2p/go-libp2p-pubsub/pb"
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+    pnet "github.com/libp2p/go-libp2p/p2p/net/pnet"
     ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -227,6 +228,10 @@ func main() {
     devGen := flag.Bool("dev-gen-tx", false, "enable built-in synthetic tx generator")
     devInterval := flag.Duration("dev-interval", 500*time.Millisecond, "interval between dev tx publishes")
     devReuseKey := flag.Bool("dev-reuse-key", true, "reuse a single dev private key (device) per node")
+    // LAN binding and private network
+    bindIP := flag.String("bind", "", "IPv4 to bind (default all interfaces, e.g., 192.168.0.10)")
+    swarmKeyPath := flag.String("pnet", "", "path to swarm.key for libp2p private network")
+    genSwarmKey := flag.String("gen-swarm-key", "", "generate a new swarm.key at the given path and exit")
     var bootstraps multiFlag
     flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
     flag.Parse()
@@ -235,12 +240,36 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    // Create a node listening on a random TCP port.
-    listen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", *listenPort)
-    if *listenPort == 0 {
-        listen = "/ip4/0.0.0.0/tcp/0"
+    // Optional: generate a swarm.key and exit
+    if *genSwarmKey != "" {
+        if err := generateSwarmKey(*genSwarmKey); err != nil {
+            log.Fatalf("gen-swarm-key: %v", err)
+        }
+        log.Printf("swarm.key written to %s", *genSwarmKey)
+        return
     }
-    h, err := libp2p.New(libp2p.ListenAddrStrings(listen))
+
+    // Create a node listening on a specific interface (default all)
+    ip := "0.0.0.0"
+    if *bindIP != "" { ip = *bindIP }
+    listen := fmt.Sprintf("/ip4/%s/tcp/%d", ip, *listenPort)
+    if *listenPort == 0 { listen = fmt.Sprintf("/ip4/%s/tcp/0", ip) }
+
+    // Collect libp2p options
+    var lpOpts []libp2p.Option
+    lpOpts = append(lpOpts, libp2p.ListenAddrStrings(listen))
+
+    // Optional: Private network PSK (swarm key)
+    if *swarmKeyPath != "" {
+        keyData, err := os.ReadFile(*swarmKeyPath)
+        if err != nil { log.Fatalf("pnet: read swarm.key: %v", err) }
+        psk, err := pnet.DecodeV1PSK(bytes.NewReader(keyData))
+        if err != nil { log.Fatalf("pnet: decode swarm.key: %v", err) }
+        lpOpts = append(lpOpts, libp2p.PrivateNetwork(psk))
+        log.Printf("pnet: private network enabled (swarm key)")
+    }
+
+    h, err := libp2p.New(lpOpts...)
     if err != nil {
         log.Fatalf("create host: %v", err)
     }
@@ -807,4 +836,20 @@ func forwardCOSE(url string, cose []byte) {
     if err != nil { log.Printf("bridge: send: %v", err); return }
     io.Copy(io.Discard, resp.Body)
     resp.Body.Close()
+}
+
+// generateSwarmKey creates a libp2p swarm.key file (PSK v1, base16) at the given path.
+func generateSwarmKey(path string) error {
+    // 32 random bytes
+    b := make([]byte, 32)
+    if _, err := crand.Read(b); err != nil {
+        return fmt.Errorf("random: %w", err)
+    }
+    hexKey := strings.ToLower(hex.EncodeToString(b))
+    content := []byte("/key/swarm/psk/1.0.0/\n/base16/\n" + hexKey + "\n")
+    // write with 0600 permissions
+    if err := os.WriteFile(path, content, 0o600); err != nil {
+        return err
+    }
+    return nil
 }
