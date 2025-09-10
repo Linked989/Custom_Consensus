@@ -7,7 +7,6 @@ import (
     "crypto/sha256"
     "encoding/hex"
     "fmt"
-    "strings"
     "sync"
     "time"
 
@@ -231,6 +230,15 @@ func toInt64(v interface{}) int64 {
     }
 }
 
+func isUint(v interface{}) bool {
+    switch v.(type) {
+    case uint, uint64, uint32, uint16, uint8:
+        return true
+    default:
+        return false
+    }
+}
+
 func shortPeer(id string) string {
     if len(id) <= 8 { return id }
     return id[len(id)-8:]
@@ -246,4 +254,3 @@ func randBytes(n int) []byte {
 
 // Optional no-op to satisfy linters when importing context
 var _ = context.Background
-
