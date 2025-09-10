@@ -261,10 +261,8 @@ func main() {
 
     // Optional: Private network PSK (swarm key)
     if *swarmKeyPath != "" {
-        keyData, err := os.ReadFile(*swarmKeyPath)
-        if err != nil { log.Fatalf("pnet: read swarm.key: %v", err) }
-        psk, err := pnet.DecodeV1PSK(bytes.NewReader(keyData))
-        if err != nil { log.Fatalf("pnet: decode swarm.key: %v", err) }
+        psk, err := loadSwarmKey(*swarmKeyPath)
+        if err != nil { log.Fatalf("pnet: load swarm.key: %v", err) }
         lpOpts = append(lpOpts, libp2p.PrivateNetwork(psk))
         log.Printf("pnet: private network enabled (swarm key)")
     }
@@ -852,4 +850,33 @@ func generateSwarmKey(path string) error {
         return err
     }
     return nil
+}
+
+// loadSwarmKey reads a swarm.key file and returns a pnet.PSK.
+// Accepts libp2p's standard 3-line format or a raw 32-byte file or a single-line hex string.
+func loadSwarmKey(path string) (pnet.PSK, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, err
+    }
+    s := strings.TrimSpace(string(data))
+    lines := strings.Split(s, "\n")
+    var keyHex string
+    if len(lines) >= 3 && strings.HasPrefix(lines[0], "/key/swarm/psk/") {
+        keyHex = strings.TrimSpace(lines[2])
+    } else if len(lines) == 1 && len(lines[0]) >= 64 { // single-line hex
+        keyHex = strings.TrimSpace(lines[0])
+    }
+    if keyHex != "" {
+        b, err := hex.DecodeString(keyHex)
+        if err != nil {
+            return nil, fmt.Errorf("swarm.key hex decode: %w", err)
+        }
+        return pnet.PSK(b), nil
+    }
+    // Fallback: raw 32-byte file
+    if len(data) == 32 {
+        return pnet.PSK(data), nil
+    }
+    return nil, fmt.Errorf("unsupported swarm.key format")
 }
