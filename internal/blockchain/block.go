@@ -391,6 +391,83 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
 	return nil
 }
 
+// StartBlockBuilderFromPool builds blocks by draining transactions from a local mempool.
+// It aligns the initial height/prev to the current persisted tip for the given chainID.
+func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.Pool, blkTopic *pubsub.Topic, chainID string, interval time.Duration, maxTxs int) error {
+    // internal staging channel fed from the mempool
+    mem := make(chan []byte, 4096)
+    go func() {
+        ticker := time.NewTicker(200 * time.Millisecond)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-ticker.C:
+                batch := pool.PopBatch(maxTxs)
+                for _, b := range batch {
+                    select { case mem <- b: default: }
+                }
+            }
+        }
+    }()
+
+    // initialize from current chain tip if available
+    ch := getChain(chainID)
+    ch.mu.Lock()
+    var height int64 = ch.TipHeight + 1
+    prev := append([]byte(nil), ch.TipHash...)
+    ch.mu.Unlock()
+    if height <= 0 { height = 1 }
+
+    go func() {
+        ticker := time.NewTicker(interval)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-ticker.C:
+                // drain up to maxTxs
+                var batch [][]byte
+                for i := 0; i < maxTxs; i++ {
+                    select {
+                    case b := <-mem:
+                        batch = append(batch, b)
+                    default:
+                    }
+                }
+                if len(batch) == 0 {
+                    continue
+                }
+                // build block
+                blk := Block{Version: 1, ChainID: chainID, Height: height, PrevHash: prev, Timestamp: time.Now().UTC()}
+                for _, tx := range batch {
+                    txid, _, _, _ := coseutil.ValidateCOSETx(tx)
+                    blk.TxIDs = append(blk.TxIDs, txid)
+                    blk.Txs = append(blk.Txs, tx)
+                }
+                if err := Sign(h, &blk); err != nil {
+                    log.Printf("block: sign: %v", err)
+                    continue
+                }
+                // publish
+                data, err := encMode.Marshal(blk)
+                if err != nil {
+                    log.Printf("block: marshal: %v", err)
+                    continue
+                }
+                if err := blkTopic.Publish(ctx, data); err != nil {
+                    log.Printf("block: publish: %v", err)
+                }
+                prev = blk.Hash
+                height++
+            }
+        }
+    }()
+    return nil
+}
+
 // StartBlockSubscriber subscribes to blockTopic and validates blocks.
 func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string) (*pubsub.Topic, error) {
 	topic, err := ps.Join(blockTopicName)
