@@ -18,7 +18,6 @@ import (
 	"pose/internal/p2p"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/network"
 )
 
 const mdnsServiceTag = "pose-simple-mdns"
@@ -91,8 +90,8 @@ func main() {
 		log.Printf("Listen: %s/p2p/%s", a, h.ID())
 	}
 
-    // Hello stream handler: register announced device keys and peer addrs
-    p2p.RegisterHelloHandler(h)
+	// Hello stream handler: register announced device keys and peer addrs
+	p2p.RegisterHelloHandler(h)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
