@@ -5,6 +5,7 @@ import (
     "context"
     "crypto/sha256"
     "errors"
+    "encoding/hex"
     "log"
     "sync"
     "time"
@@ -117,6 +118,8 @@ type Chain struct {
     ChainID   string
     TipHeight int64
     TipHash   []byte
+    known     map[string]int64         // hex(hash) -> height
+    waiting   map[string][]*Block      // hex(prevHash) -> children blocks waiting on this prev
 }
 
 var chains = struct{ mu sync.Mutex; m map[string]*Chain }{m: make(map[string]*Chain)}
@@ -126,10 +129,36 @@ func getChain(id string) *Chain {
     defer chains.mu.Unlock()
     c := chains.m[id]
     if c == nil {
-        c = &Chain{ChainID: id}
+        c = &Chain{ChainID: id, known: make(map[string]int64), waiting: make(map[string][]*Block)}
         chains.m[id] = c
     }
     return c
+}
+
+// recordKnown marks a block hash as known at a given height.
+func (c *Chain) recordKnown(hash []byte, height int64) {
+    c.known[hex.EncodeToString(hash)] = height
+}
+
+func (c *Chain) isKnown(hash []byte) (int64, bool) {
+    h, ok := c.known[hex.EncodeToString(hash)]
+    return h, ok
+}
+
+// queueChild stores a block that depends on prev until prev is processed.
+func (c *Chain) queueChild(prev []byte, b *Block) {
+    key := hex.EncodeToString(prev)
+    c.waiting[key] = append(c.waiting[key], b)
+}
+
+// popChildren returns and clears queued children for a given parent hash.
+func (c *Chain) popChildren(parent []byte) []*Block {
+    key := hex.EncodeToString(parent)
+    lst := c.waiting[key]
+    if len(lst) > 0 {
+        delete(c.waiting, key)
+    }
+    return lst
 }
 
 // StartBlockBuilder consumes txs from txTopic, builds blocks every interval with up to maxTxs, and publishes to blockTopic.
@@ -207,28 +236,52 @@ func StartBlockSubscriber(ctx context.Context, ps *pubsub.PubSub, blockTopicName
             }
             if !ok { log.Printf("block: contains invalid txs"); continue }
 
-            // chain checks: prev hash and height
+            // chain checks with out-of-order tolerance
             ch := getChain(blk.ChainID)
             ch.mu.Lock()
-            valid := false
-            if ch.TipHeight == 0 {
-                // expect genesis prev to be empty and height to start at 1
-                if blk.Height == 1 && len(blk.PrevHash) == 0 {
-                    valid = true
+            // helper to accept a block and cascade any queued descendants
+            var accept func(b *Block)
+            accept = func(b *Block) {
+                // record known block
+                ch.recordKnown(b.Hash, b.Height)
+                // tip update if this extends or is higher
+                // basic rule: if prev is current tip and height == tip+1 OR height > tip, move tip
+                if (ch.TipHeight == 0 && b.Height == 1 && len(b.PrevHash) == 0) ||
+                    (b.Height == ch.TipHeight+1 && bytes.Equal(b.PrevHash, ch.TipHash)) ||
+                    (b.Height > ch.TipHeight) {
+                    ch.TipHeight = b.Height
+                    ch.TipHash = append(ch.TipHash[:0], b.Hash...)
                 }
-            } else if blk.Height == ch.TipHeight+1 && bytes.Equal(blk.PrevHash, ch.TipHash) {
-                valid = true
+                // process any waiting children
+                children := ch.popChildren(b.Hash)
+                for _, c := range children {
+                    // ensure c links to a known parent height
+                    if ph, ok := ch.isKnown(c.PrevHash); ok && c.Height == ph+1 {
+                        accept(c)
+                    } else {
+                        // requeue if still not linkable due to race
+                        ch.queueChild(c.PrevHash, c)
+                    }
+                }
             }
-            if valid {
-                ch.TipHeight = blk.Height
-                ch.TipHash = append(ch.TipHash[:0], blk.Hash...)
-            }
-            ch.mu.Unlock()
-            if !valid {
-                log.Printf("block: rejected out-of-order or prev mismatch (height=%d)", blk.Height)
+
+            // decide to accept now or queue
+            if blk.Height == 1 && len(blk.PrevHash) == 0 {
+                accept(&blk)
+                log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
+                ch.mu.Unlock()
                 continue
             }
-            log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
+            if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
+                accept(&blk)
+                log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
+                ch.mu.Unlock()
+                continue
+            }
+            // If prev is not yet known, queue and wait for parent to arrive
+            ch.queueChild(blk.PrevHash, &blk)
+            log.Printf("block: queued height=%d waiting for parent", blk.Height)
+            ch.mu.Unlock()
         }
     }()
     return topic, nil
