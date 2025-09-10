@@ -16,6 +16,7 @@ import (
     "github.com/libp2p/go-libp2p/core/host"
 
     "pose/internal/coseutil"
+    "pose/internal/mempool"
 )
 
 // InitPubSub sets up GossipSub with a content-based message ID.
@@ -94,6 +95,28 @@ func StartTxGossip(ctx context.Context, ps *pubsub.PubSub, topicName string, bri
     return topic, nil
 }
 
+// StartTxGossipToPool is like StartTxGossip but inserts validated txs into the provided mempool.
+func StartTxGossipToPool(ctx context.Context, ps *pubsub.PubSub, topicName string, bridgeURL string, pool *mempool.Pool) (*pubsub.Topic, error) {
+    topic, err := ps.Join(topicName); if err != nil { return nil, err }
+    sub, err := topic.Subscribe(); if err != nil { return nil, err }
+    // seen is still used to avoid re-processing duplicates excessively
+    seen := struct{ Mu sync.Mutex; M map[string]time.Time }{M: make(map[string]time.Time)}
+    go func() {
+        for {
+            msg, err := sub.Next(ctx); if err != nil { return }
+            // Validate and add to mempool
+            e, err := pool.AddValidatedCOSE(msg.Message.GetData())
+            if err != nil { continue }
+            // Dedup notice for logs only
+            seen.Mu.Lock(); if _, ok := seen.M[e.TxID]; ok { seen.Mu.Unlock(); continue }
+            seen.M[e.TxID] = time.Now(); seen.Mu.Unlock()
+            log.Printf("tx: accepted txid=%s dev=%s seq=%d from %s", e.TxID, e.DevID, e.Seq, msg.ReceivedFrom)
+            if bridgeURL != "" { go forwardCOSE(bridgeURL, msg.Message.GetData()) }
+        }
+    }()
+    return topic, nil
+}
+
 func forwardCOSE(url string, cose []byte) {
     req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(cose)))
     if err != nil { return }
@@ -102,4 +125,3 @@ func forwardCOSE(url string, cose []byte) {
     resp, err := cli.Do(req); if err != nil { return }
     io.Copy(io.Discard, resp.Body); resp.Body.Close()
 }
-

@@ -17,6 +17,7 @@ import (
     "pose/internal/dev"
     "pose/internal/gossip"
     "pose/internal/httpapi"
+    "pose/internal/mempool"
     "pose/internal/p2p"
 )
 
@@ -39,6 +40,8 @@ func main() {
     produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
     blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
     blockMax := flag.Int("block-max", 100, "max txs per block")
+    memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
+    memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
     bridgeURL := flag.String("bridge-url", "", "optional HTTP URL to forward validated txs (e.g., http://localhost:1337/tx)")
     httpIn := flag.String("http", "", "optional HTTP listen addr to accept POST /tx and publish to gossip (e.g., :14000)")
     // Dev generator
@@ -104,10 +107,13 @@ func main() {
 
     ps, err := gossip.InitPubSub(ctx, h)
     if err != nil { log.Fatalf("pubsub init: %v", err) }
+    // Local mempool
+    pool := mempool.New(*memCapacity, *memTTL)
+
     members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
         m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL)
         if err != nil { return nil, nil, err }
-        t, err := gossip.StartTxGossip(ctx, ps, *txTopicName, *bridgeURL)
+        t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool)
         if err != nil { return nil, nil, err }
         return m, t, nil
     }()
@@ -125,10 +131,10 @@ func main() {
     // Block gossip: subscribe always; optionally produce
     // enable block sync protocol
     blockchain.RegisterBlockSync(h)
-    blkTopic, err := blockchain.StartBlockSubscriber(ctx, h, ps, *blockTopicName)
+    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool)
     if err != nil { log.Fatalf("block sub: %v", err) }
     if *produceBlocks {
-        if err := blockchain.StartBlockBuilder(ctx, h, txTopic, blkTopic, "iotnet-main", *blockInterval, *blockMax); err != nil { log.Fatalf("block builder: %v", err) }
+        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, "iotnet-main", *blockInterval, *blockMax); err != nil { log.Fatalf("block builder: %v", err) }
     }
 
     if statsInterval != nil && *statsInterval > 0 {

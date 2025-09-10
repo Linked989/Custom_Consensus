@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"pose/internal/coseutil"
+    "pose/internal/mempool"
 )
 
 var (
@@ -435,18 +436,18 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 			var accept = func(b *Block) { ch.acceptBlockLocked(b) }
 
 			// decide to accept now or queue
-			if blk.Height == 1 && len(blk.PrevHash) == 0 {
-				accept(&blk)
-				log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
-				ch.mu.Unlock()
-				continue
-			}
-			if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
-				accept(&blk)
-				log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
-				ch.mu.Unlock()
-				continue
-			}
+            if blk.Height == 1 && len(blk.PrevHash) == 0 {
+                accept(&blk)
+                log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
+                ch.mu.Unlock()
+                continue
+            }
+            if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
+                accept(&blk)
+                log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
+                ch.mu.Unlock()
+                continue
+            }
 			// If prev is not yet known, queue and attempt on-demand fetch from peers
 			ch.queueChild(blk.PrevHash, &blk)
 			go fetchAndInjectParent(ctx, h, blk.ChainID, blk.PrevHash)
@@ -481,7 +482,28 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 			}
 		}
 	}()
-	return topic, nil
+    return topic, nil
+}
+
+// StartBlockSubscriberWithMempool wires block acceptance to mempool cleanup by txid.
+func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, pool *mempool.Pool) (*pubsub.Topic, error) {
+    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName)
+    if err != nil { return nil, err }
+    // Subscribe again just to observe accepted blocks and prune mempool.
+    sub, err := topic.Subscribe()
+    if err != nil { return nil, err }
+    go func() {
+        for {
+            msg, err := sub.Next(ctx); if err != nil { return }
+            var blk Block
+            if decMode.Unmarshal(msg.Message.GetData(), &blk) != nil { continue }
+            if Verify(&blk) != nil { continue }
+            // Remove txs from local mempool (best-effort)
+            removed := pool.RemoveTxIDs(blk.TxIDs)
+            if removed > 0 { log.Printf("mempool: removed %d txs included in block height=%d", removed, blk.Height) }
+        }
+    }()
+    return topic, nil
 }
 
 // -------- Block sync over libp2p streams --------
