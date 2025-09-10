@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +25,7 @@ import (
 	"pose/internal/coseutil"
 	"pose/internal/merkle"
     "pose/internal/mempool"
+    "pose/internal/logx"
 )
 
 var (

@@ -18,11 +18,9 @@ func Configure(level, format string) {
     default: lvl = slog.LevelInfo
     }
     opts := &slog.HandlerOptions{Level: lvl, ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-        if a.Key == slog.TimeKey {
-            // Compact time
-            if t, ok := a.Value.Time(); ok {
-                a.Value = slog.StringValue(t.Format("15:04:05.000"))
-            }
+        if a.Key == slog.TimeKey && a.Value.Kind() == slog.KindTime {
+            t := a.Value.Time()
+            a.Value = slog.StringValue(t.Format("15:04:05.000"))
         }
         return a
     }}
@@ -39,4 +37,3 @@ func Debug(msg string, args ...any) { slog.Default().Debug(msg, args...) }
 func Info(msg string, args ...any)  { slog.Default().Info(msg, args...) }
 func Warn(msg string, args ...any)  { slog.Default().Warn(msg, args...) }
 func Error(msg string, args ...any) { slog.Default().Error(msg, args...) }
-
