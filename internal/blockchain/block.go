@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"pose/internal/coseutil"
+	"pose/internal/merkle"
     "pose/internal/mempool"
 )
 
@@ -62,17 +63,18 @@ func sanitize(s string) string {
 
 // Block is a simple canonical structure for demonstration.
 type Block struct {
-	Version     int64     `cbor:"0,keyasint"`
-	ChainID     string    `cbor:"1,keyasint"`
-	Height      int64     `cbor:"2,keyasint"`
-	PrevHash    []byte    `cbor:"3,keyasint"`
-	Timestamp   time.Time `cbor:"4,keyasint"`
-	ProducerID  string    `cbor:"5,keyasint"`
-	ProducerPub []byte    `cbor:"6,keyasint"`
-	TxIDs       []string  `cbor:"7,keyasint"`
-	Txs         [][]byte  `cbor:"8,keyasint"`
-	Hash        []byte    `cbor:"9,keyasint"`
-	Signature   []byte    `cbor:"10,keyasint"`
+    Version     int64     `cbor:"0,keyasint"`
+    ChainID     string    `cbor:"1,keyasint"`
+    Height      int64     `cbor:"2,keyasint"`
+    PrevHash    []byte    `cbor:"3,keyasint"`
+    Timestamp   time.Time `cbor:"4,keyasint"`
+    ProducerID  string    `cbor:"5,keyasint"`
+    ProducerPub []byte    `cbor:"6,keyasint"`
+    TxIDs       []string  `cbor:"7,keyasint"`
+    Txs         [][]byte  `cbor:"8,keyasint"`
+    Hash        []byte    `cbor:"9,keyasint"`
+    Signature   []byte    `cbor:"10,keyasint"`
+    TxRoot      []byte    `cbor:"11,keyasint"`
 }
 
 // hashForSign returns the hash over the block fields excluding Hash and Signature.
@@ -121,22 +123,29 @@ func Sign(h host.Host, b *Block) error {
 
 // Verify checks the hash and signature; also checks ProducerID matches the producer pubkey's peer ID.
 func Verify(b *Block) error {
-	// hash
-	hash, err := hashForSign(b)
-	if err != nil {
-		return err
-	}
-	if len(b.Hash) == 0 || len(b.Signature) == 0 {
-		return errors.New("missing block hash/signature")
-	}
-	if !bytes.Equal(hash, b.Hash) {
-		return errors.New("hash mismatch")
-	}
-	// pubkey
-	pub, err := crypto.UnmarshalPublicKey(b.ProducerPub)
-	if err != nil {
-		return err
-	}
+    // hash
+    hash, err := hashForSign(b)
+    if err != nil {
+        return err
+    }
+    if len(b.Hash) == 0 || len(b.Signature) == 0 {
+        return errors.New("missing block hash/signature")
+    }
+    if !bytes.Equal(hash, b.Hash) {
+        return errors.New("hash mismatch")
+    }
+    // merkle root over txids
+    var leaves [][]byte
+    for _, hx := range b.TxIDs { if bb, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, bb) } }
+    want := merkle.ComputeRoot(leaves)
+    if (len(want) == 0 && len(b.TxIDs) > 0) || !bytes.Equal(want, b.TxRoot) {
+        return errors.New("txroot mismatch")
+    }
+    // pubkey
+    pub, err := crypto.UnmarshalPublicKey(b.ProducerPub)
+    if err != nil {
+        return err
+    }
 	ok, err := pub.Verify(b.Hash, b.Signature)
 	if err != nil || !ok {
 		return errors.New("signature verify failed")
@@ -363,17 +372,21 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
 				if len(batch) == 0 {
 					continue
 				}
-				// build block
-				blk := Block{Version: 1, ChainID: chainID, Height: height, PrevHash: prev, Timestamp: time.Now().UTC()}
-				for _, tx := range batch {
-					txid, _, _, _ := coseutil.ValidateCOSETx(tx)
-					blk.TxIDs = append(blk.TxIDs, txid)
-					blk.Txs = append(blk.Txs, tx)
-				}
-				if err := Sign(h, &blk); err != nil {
-					log.Printf("block: sign: %v", err)
-					continue
-				}
+                // build block
+                blk := Block{Version: 1, ChainID: chainID, Height: height, PrevHash: prev, Timestamp: time.Now().UTC()}
+                for _, tx := range batch {
+                    txid, _, _, _ := coseutil.ValidateCOSETx(tx)
+                    blk.TxIDs = append(blk.TxIDs, txid)
+                    blk.Txs = append(blk.Txs, tx)
+                }
+                // compute Merkle root over txids (hex -> bytes)
+                var leaves [][]byte
+                for _, hx := range blk.TxIDs { if b, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, b) } }
+                blk.TxRoot = merkle.ComputeRoot(leaves)
+                if err := Sign(h, &blk); err != nil {
+                    log.Printf("block: sign: %v", err)
+                    continue
+                }
 				// publish
 				data, err := encMode.Marshal(blk)
 				if err != nil {
@@ -447,6 +460,10 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                     blk.TxIDs = append(blk.TxIDs, txid)
                     blk.Txs = append(blk.Txs, tx)
                 }
+                // compute Merkle root over txids (hex -> bytes)
+                var leaves [][]byte
+                for _, hx := range blk.TxIDs { if b, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, b) } }
+                blk.TxRoot = merkle.ComputeRoot(leaves)
                 if err := Sign(h, &blk); err != nil {
                     log.Printf("block: sign: %v", err)
                     continue
@@ -612,8 +629,8 @@ func RegisterBlockSync(h host.Host) {
 		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &req); err != nil {
 			return
 		}
-		switch req.Type {
-		case "tip":
+    switch req.Type {
+    case "tip":
 			ch := getChain(req.ChainID)
 			ch.mu.Lock()
 			th, thash := ch.TipHeight, hex.EncodeToString(ch.TipHash)
@@ -621,7 +638,7 @@ func RegisterBlockSync(h host.Host) {
 			resp := tipResp{Ok: true, TipHeight: th, TipHash: thash}
 			b, _ := json.Marshal(resp)
 			s.Write(append(b, '\n'))
-		case "get":
+    case "get":
 			// read from disk
 			path := filepath.Join(blocksDir(req.ChainID), strings.ToLower(req.Hash)+".cbor")
 			by, err := os.ReadFile(path)
@@ -632,9 +649,34 @@ func RegisterBlockSync(h host.Host) {
 			}
 			b, _ := json.Marshal(getResp{Ok: true, Block: base64.StdEncoding.EncodeToString(by)})
 			s.Write(append(b, '\n'))
-		default:
-			return
-		}
+    case "txproof":
+        // Re-parse as tx proof request
+        var tpr struct{ Type, ChainID, BlockHash, TxID string }
+        if json.Unmarshal([]byte(strings.TrimSpace(line)), &tpr) != nil { return }
+        // Load block file
+        path := filepath.Join(blocksDir(tpr.ChainID), strings.ToLower(tpr.BlockHash)+".cbor")
+        by, err := os.ReadFile(path)
+        if err != nil {
+            b,_ := json.Marshal(map[string]any{"ok":false, "error":"block not found"}); s.Write(append(b,'\n')); return
+        }
+        var blk Block
+        if decMode.Unmarshal(by, &blk) != nil { b,_:=json.Marshal(map[string]any{"ok":false, "error":"bad block"}); s.Write(append(b,'\n')); return }
+        // Find index
+        idx := -1
+        for i, id := range blk.TxIDs { if strings.EqualFold(id, tpr.TxID) { idx = i; break } }
+        if idx < 0 { b,_:=json.Marshal(map[string]any{"ok":false, "error":"tx not in block"}); s.Write(append(b,'\n')); return }
+        // Build proof
+        leaves := make([][]byte, 0, len(blk.TxIDs))
+        for _, hx := range blk.TxIDs { bb, err := hex.DecodeString(hx); if err != nil { b,_:=json.Marshal(map[string]any{"ok":false, "error":"bad txid"}); s.Write(append(b,'\n')); return }; leaves = append(leaves, bb) }
+        proof, root, err := merkle.ComputeProof(leaves, idx)
+        if err != nil { b,_:=json.Marshal(map[string]any{"ok":false, "error":err.Error()}); s.Write(append(b,'\n')); return }
+        phex := make([]string, len(proof))
+        for i := range proof { phex[i] = hex.EncodeToString(proof[i]) }
+        resp := map[string]any{"ok":true, "index":idx, "proof":phex, "tx_root":hex.EncodeToString(root)}
+        b,_ := json.Marshal(resp); s.Write(append(b,'\n'))
+    default:
+        return
+    }
 	})
 }
 
