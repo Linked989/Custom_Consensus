@@ -1,0 +1,145 @@
+package p2p
+
+import (
+    "context"
+    "encoding/hex"
+    "encoding/json"
+    "io"
+    "log"
+    "sync"
+    "time"
+
+    "crypto/ed25519"
+
+    libp2p "github.com/libp2p/go-libp2p"
+    "github.com/libp2p/go-libp2p/core/host"
+    "github.com/libp2p/go-libp2p/core/network"
+    "github.com/libp2p/go-libp2p/core/peer"
+    pnet "github.com/libp2p/go-libp2p/core/pnet"
+    mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+)
+
+// ProtocolID for hello streams.
+const ProtocolID = "/pose/simple/1.0.0"
+
+// PeerMsg is exchanged over the hello stream for peer gossip and device key announce.
+type PeerMsg struct {
+    Type  string   `json:"type"`
+    From  string   `json:"from"`
+    Addrs []string `json:"addrs"`
+    Kid   string   `json:"kid,omitempty"` // hex ed25519 key id (prefix)
+    Pub   string   `json:"pub,omitempty"` // hex ed25519 public key
+}
+
+// Global announce for dev key.
+var devAnnounce struct{ kid []byte; pub ed25519.PublicKey }
+
+func SetDevAnnouncement(kid []byte, pub ed25519.PublicKey) {
+    devAnnounce.kid, devAnnounce.pub = kid, pub
+}
+
+// NewHost creates a libp2p host with optional private network PSK.
+func NewHost(listenAddr string, psk []byte) (host.Host, error) {
+    var opts []libp2p.Option
+    opts = append(opts, libp2p.ListenAddrStrings(listenAddr))
+    if len(psk) > 0 {
+        opts = append(opts, libp2p.PrivateNetwork(pnet.PSK(psk)))
+    }
+    return libp2p.New(opts...)
+}
+
+// MDNSNotifee connects to discovered peers and sends hello.
+type MDNSNotifee struct {
+    H    host.Host
+    Mu   sync.Mutex
+    Seen map[peer.ID]struct{}
+}
+
+func (m *MDNSNotifee) HandlePeerFound(pi peer.AddrInfo) {
+    if pi.ID == m.H.ID() {
+        return
+    }
+    m.Mu.Lock()
+    if m.Seen == nil {
+        m.Seen = make(map[peer.ID]struct{})
+    }
+    if _, ok := m.Seen[pi.ID]; ok {
+        m.Mu.Unlock()
+        return
+    }
+    m.Seen[pi.ID] = struct{}{}
+    m.Mu.Unlock()
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    if err := m.H.Connect(ctx, pi); err != nil {
+        log.Printf("mdns: connect %s: %v", pi.ID, err)
+        return
+    }
+    s, err := m.H.NewStream(ctx, pi.ID, ProtocolID)
+    if err != nil {
+        log.Printf("mdns: stream %s: %v", pi.ID, err)
+        return
+    }
+    defer s.Close()
+    _ = SendHello(m.H, s)
+}
+
+// SetupMDNS starts mDNS discovery service.
+func SetupMDNS(h host.Host, tag string, n *MDNSNotifee) (io.Closer, error) {
+    svc := mdns.NewMdnsService(h, tag, n)
+    if err := svc.Start(); err != nil {
+        return nil, err
+    }
+    return svc, nil
+}
+
+// SendHello writes a JSON hello message on the stream.
+func SendHello(h host.Host, s network.Stream) error {
+    pm := PeerMsg{Type: "hello", From: h.ID().String(), Addrs: LocalAddrs(h)}
+    if len(devAnnounce.kid) > 0 && len(devAnnounce.pub) == ed25519.PublicKeySize {
+        pm.Kid = hex.EncodeToString(devAnnounce.kid)
+        pm.Pub = hex.EncodeToString(devAnnounce.pub)
+    }
+    b, _ := json.Marshal(pm)
+    _, err := s.Write(append(b, '\n'))
+    return err
+}
+
+// SendHelloToAllPeers announces to all connected peers.
+func SendHelloToAllPeers(ctx context.Context, h host.Host) {
+    for _, pid := range h.Network().Peers() {
+        s, err := h.NewStream(ctx, pid, ProtocolID)
+        if err != nil {
+            continue
+        }
+        _ = SendHello(h, s)
+        _ = s.Close()
+    }
+}
+
+// LocalAddrs returns this host's multiaddrs with /p2p suffix.
+func LocalAddrs(h host.Host) []string {
+    var out []string
+    for _, a := range h.Addrs() {
+        out = append(out, a.String()+"/p2p/"+h.ID().String())
+    }
+    return out
+}
+
+// ConnectToAddrs dials peers from multiaddr strings.
+func ConnectToAddrs(h host.Host, addrs []string) {
+    for _, as := range addrs {
+        pi, err := peer.AddrInfoFromString(as)
+        if err != nil || pi.ID == h.ID() {
+            continue
+        }
+        if len(h.Network().ConnsToPeer(pi.ID)) > 0 {
+            continue
+        }
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        _ = h.Connect(ctx, *pi)
+        cancel()
+    }
+}
+
