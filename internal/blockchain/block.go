@@ -183,6 +183,34 @@ func (c *Chain) popChildren(parent []byte) []*Block {
     return lst
 }
 
+// waitingKeys returns a snapshot of waiting parent hashes (hex strings).
+func (c *Chain) waitingKeys() []string {
+    keys := make([]string, 0, len(c.waiting))
+    for k := range c.waiting { keys = append(keys, k) }
+    return keys
+}
+
+// acceptBlockLocked records, persists, updates tip and cascades children. Caller must hold c.mu.
+func (c *Chain) acceptBlockLocked(b *Block) {
+    c.recordKnown(b.Hash, b.Height)
+    if (c.TipHeight == 0 && b.Height == 1 && len(b.PrevHash) == 0) ||
+        (b.Height == c.TipHeight+1 && bytes.Equal(b.PrevHash, c.TipHash)) ||
+        (b.Height > c.TipHeight) {
+        c.TipHeight = b.Height
+        c.TipHash = append(c.TipHash[:0], b.Hash...)
+    }
+    _ = c.saveBlock(b)
+    _ = c.saveIndex()
+    children := c.popChildren(b.Hash)
+    for _, child := range children {
+        if ph, ok := c.isKnown(child.PrevHash); ok && child.Height == ph+1 {
+            c.acceptBlockLocked(child)
+        } else {
+            c.queueChild(child.PrevHash, child)
+        }
+    }
+}
+
 // persistence
 func (c *Chain) saveBlock(b *Block) error {
     if dataDir == "" { return nil }
@@ -297,33 +325,7 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
             ch := getChain(blk.ChainID)
             ch.mu.Lock()
             // helper to accept a block and cascade any queued descendants
-            var accept func(b *Block)
-            accept = func(b *Block) {
-                // record known block
-                ch.recordKnown(b.Hash, b.Height)
-                // tip update if this extends or is higher
-                // basic rule: if prev is current tip and height == tip+1 OR height > tip, move tip
-                if (ch.TipHeight == 0 && b.Height == 1 && len(b.PrevHash) == 0) ||
-                    (b.Height == ch.TipHeight+1 && bytes.Equal(b.PrevHash, ch.TipHash)) ||
-                    (b.Height > ch.TipHeight) {
-                    ch.TipHeight = b.Height
-                    ch.TipHash = append(ch.TipHash[:0], b.Hash...)
-                }
-                // persist
-                _ = ch.saveBlock(b)
-                _ = ch.saveIndex()
-                // process any waiting children
-                children := ch.popChildren(b.Hash)
-                for _, c := range children {
-                    // ensure c links to a known parent height
-                    if ph, ok := ch.isKnown(c.PrevHash); ok && c.Height == ph+1 {
-                        accept(c)
-                    } else {
-                        // requeue if still not linkable due to race
-                        ch.queueChild(c.PrevHash, c)
-                    }
-                }
-            }
+            var accept = func(b *Block) { ch.acceptBlockLocked(b) }
 
             // decide to accept now or queue
             if blk.Height == 1 && len(blk.PrevHash) == 0 {
@@ -343,6 +345,33 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
             go fetchAndInjectParent(ctx, h, blk.ChainID, blk.PrevHash)
             log.Printf("block: queued height=%d waiting for parent", blk.Height)
             ch.mu.Unlock()
+        }
+    }()
+
+    // Retry loop: periodically try fetching missing parents for queued blocks
+    go func() {
+        ticker := time.NewTicker(2 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-ticker.C:
+                ch := getChain("") // not used; we'll iterate all chains
+                chains.mu.Lock()
+                for _, c := range chains.m {
+                    c.mu.Lock()
+                    keys := c.waitingKeys()
+                    // Copy to avoid holding lock during network fetch
+                    c.mu.Unlock()
+                    for _, kh := range keys {
+                        if parent, err := hex.DecodeString(kh); err == nil {
+                            go fetchAndInjectParent(ctx, h, c.ChainID, parent)
+                        }
+                    }
+                }
+                chains.mu.Unlock()
+            }
         }
     }()
     return topic, nil
@@ -408,17 +437,13 @@ func fetchAndInjectParent(ctx context.Context, h host.Host, chainID string, pare
         var blk Block
         if decMode.Unmarshal(raw, &blk) != nil { continue }
         if Verify(&blk) != nil { continue }
-        // inject by publishing to local processing path: call accept flow directly
+        // inject by calling accept flow directly
         ch := getChain(blk.ChainID)
         ch.mu.Lock()
-        // minimal re-use of accept
-        // if parent known and height aligns, accept; else queue
-        if blk.Height == 1 && len(blk.PrevHash)==0 { /* handled by subscriber path too */ }
-        if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
-            // record & persist
-            ch.recordKnown(blk.Hash, blk.Height)
-            if blk.Height > ch.TipHeight { ch.TipHeight = blk.Height; ch.TipHash = append(ch.TipHash[:0], blk.Hash...) }
-            _ = ch.saveBlock(&blk); _ = ch.saveIndex()
+        if blk.Height == 1 && len(blk.PrevHash)==0 {
+            ch.acceptBlockLocked(&blk)
+        } else if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
+            ch.acceptBlockLocked(&blk)
         } else {
             ch.queueChild(blk.PrevHash, &blk)
         }
