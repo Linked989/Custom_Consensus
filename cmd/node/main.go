@@ -47,8 +47,8 @@ func main() {
 	logHeartbeats := flag.Bool("log-heartbeats", false, "log every heartbeat message")
 	logTx := flag.Bool("log-tx", false, "log every accepted tx from gossip")
 	logDev := flag.Bool("log-dev", false, "log dev tx publishes")
-	// logBlockQueue := flag.Bool("log-block-queue", false, "log when blocks are queued waiting for parent")
-	// logPrune := flag.Bool("log-mempool-prune", true, "log mempool pruning due to accepted blocks")
+	logBlockQueue := flag.Bool("log-block-queue", false, "log when blocks are queued waiting for parent")
+	logPrune := flag.Bool("log-mempool-prune", true, "log mempool pruning due to accepted blocks")
 	bridgeURL := flag.String("bridge-url", "", "optional HTTP URL to forward validated txs (e.g., http://localhost:1337/tx)")
 	httpIn := flag.String("http", "", "optional HTTP listen addr to accept POST /tx and publish to gossip (e.g., :14000)")
 	// Dev generator
