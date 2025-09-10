@@ -128,14 +128,9 @@ func getChain(id string) *Chain {
 }
 
 // StartBlockBuilder consumes txs from txTopic, builds blocks every interval with up to maxTxs, and publishes to blockTopic.
-func StartBlockBuilder(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID, txTopicName, blockTopicName string, interval time.Duration, maxTxs int) error {
-    // subscribe to txs
-    txTopic, err := ps.Join(txTopicName)
-    if err != nil { return err }
+func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, blkTopic *pubsub.Topic, chainID string, interval time.Duration, maxTxs int) error {
+    // subscribe to txs on existing topic
     txSub, err := txTopic.Subscribe()
-    if err != nil { return err }
-    // block topic
-    blkTopic, err := ps.Join(blockTopicName)
     if err != nil { return err }
 
     // mempool
@@ -188,11 +183,11 @@ func StartBlockBuilder(ctx context.Context, h host.Host, ps *pubsub.PubSub, chai
 }
 
 // StartBlockSubscriber subscribes to blockTopic and validates blocks.
-func StartBlockSubscriber(ctx context.Context, ps *pubsub.PubSub, blockTopicName string) error {
+func StartBlockSubscriber(ctx context.Context, ps *pubsub.PubSub, blockTopicName string) (*pubsub.Topic, error) {
     topic, err := ps.Join(blockTopicName)
-    if err != nil { return err }
+    if err != nil { return nil, err }
     sub, err := topic.Subscribe()
-    if err != nil { return err }
+    if err != nil { return nil, err }
     go func() {
         for {
             msg, err := sub.Next(ctx)
@@ -231,5 +226,5 @@ func StartBlockSubscriber(ctx context.Context, ps *pubsub.PubSub, blockTopicName
             log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
         }
     }()
-    return nil
+    return topic, nil
 }

@@ -119,9 +119,10 @@ func main() {
     }
 
     // Block gossip: subscribe always; optionally produce
-    if err := blockchain.StartBlockSubscriber(ctx, ps, *blockTopicName); err != nil { log.Fatalf("block sub: %v", err) }
+    blkTopic, err := blockchain.StartBlockSubscriber(ctx, ps, *blockTopicName)
+    if err != nil { log.Fatalf("block sub: %v", err) }
     if *produceBlocks {
-        if err := blockchain.StartBlockBuilder(ctx, h, ps, "iotnet-main", *txTopicName, *blockTopicName, *blockInterval, *blockMax); err != nil { log.Fatalf("block builder: %v", err) }
+        if err := blockchain.StartBlockBuilder(ctx, h, txTopic, blkTopic, "iotnet-main", *blockInterval, *blockMax); err != nil { log.Fatalf("block builder: %v", err) }
     }
 
     if statsInterval != nil && *statsInterval > 0 {
@@ -177,4 +178,3 @@ func loadSwarmKey(path string) ([]byte, error) {
     if len(data) == 32 { return data, nil }
     return nil, fmt.Errorf("unsupported swarm.key format")
 }
-
