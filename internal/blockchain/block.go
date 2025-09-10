@@ -57,19 +57,24 @@ func hashForSign(b *Block) ([]byte, error) {
 
 // Sign fills Hash and Signature using the host's private key.
 func Sign(h host.Host, b *Block) error {
-    hash, err := hashForSign(b)
-    if err != nil { return err }
-    b.Hash = hash
+    // Ensure producer identity fields are populated BEFORE hashing
     priv := h.Peerstore().PrivKey(h.ID())
     if priv == nil { return errors.New("missing host private key") }
-    sig, err := priv.Sign(hash)
-    if err != nil { return err }
-    b.Signature = sig
     pub := priv.GetPublic()
     pubBytes, err := crypto.MarshalPublicKey(pub)
     if err != nil { return err }
     b.ProducerPub = pubBytes
     b.ProducerID = h.ID().String()
+
+    // Compute hash over the finalized header/body (excluding Hash/Signature)
+    hash, err := hashForSign(b)
+    if err != nil { return err }
+    b.Hash = hash
+
+    // Sign the block hash
+    sig, err := priv.Sign(hash)
+    if err != nil { return err }
+    b.Signature = sig
     return nil
 }
 
