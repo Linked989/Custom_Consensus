@@ -2,18 +2,25 @@ package blockchain
 
 import (
     "bytes"
+    "bufio"
     "context"
     "crypto/sha256"
     "errors"
     "encoding/hex"
+    "encoding/base64"
+    "encoding/json"
     "log"
     "sync"
     "time"
+    "os"
+    "path/filepath"
+    "strings"
 
     cbor "github.com/fxamacker/cbor/v2"
     crypto "github.com/libp2p/go-libp2p/core/crypto"
     "github.com/libp2p/go-libp2p/core/host"
     "github.com/libp2p/go-libp2p/core/peer"
+    "github.com/libp2p/go-libp2p/core/network"
     pubsub "github.com/libp2p/go-libp2p-pubsub"
 
     "pose/internal/coseutil"
@@ -22,6 +29,7 @@ import (
 var (
     encMode cbor.EncMode
     decMode cbor.DecMode
+    dataDir string
 )
 
 func init() {
@@ -29,6 +37,18 @@ func init() {
     dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
     encMode, decMode = em, dm
 }
+
+// SetDataDir configures on-disk storage location for blocks and indices.
+func SetDataDir(dir string) error {
+    if dir == "" { dir = ".data" }
+    dataDir = dir
+    return os.MkdirAll(dir, 0o755)
+}
+
+func chainDir(chainID string) string { return filepath.Join(dataDir, sanitize(chainID)) }
+func blocksDir(chainID string) string { return filepath.Join(chainDir(chainID), "blocks") }
+func indexPath(chainID string) string { return filepath.Join(chainDir(chainID), "index.json") }
+func sanitize(s string) string { return strings.Map(func(r rune) rune { if r=='/'||r=='\\' { return '-' }; return r }, s) }
 
 // Block is a simple canonical structure for demonstration.
 type Block struct {
@@ -131,6 +151,8 @@ func getChain(id string) *Chain {
     if c == nil {
         c = &Chain{ChainID: id, known: make(map[string]int64), waiting: make(map[string][]*Block)}
         chains.m[id] = c
+        // Try load index from disk
+        _ = c.loadIndex()
     }
     return c
 }
@@ -159,6 +181,41 @@ func (c *Chain) popChildren(parent []byte) []*Block {
         delete(c.waiting, key)
     }
     return lst
+}
+
+// persistence
+func (c *Chain) saveBlock(b *Block) error {
+    if dataDir == "" { return nil }
+    if err := os.MkdirAll(blocksDir(c.ChainID), 0o755); err != nil { return err }
+    by, err := encMode.Marshal(b)
+    if err != nil { return err }
+    fname := filepath.Join(blocksDir(c.ChainID), hex.EncodeToString(b.Hash)+".cbor")
+    return os.WriteFile(fname, by, 0o644)
+}
+
+func (c *Chain) saveIndex() error {
+    if dataDir == "" { return nil }
+    idx := struct{
+        ChainID string `json:"chain_id"`
+        TipHeight int64 `json:"tip_height"`
+        TipHash string `json:"tip_hash"`
+        Known map[string]int64 `json:"known"`
+    }{ChainID: c.ChainID, TipHeight: c.TipHeight, TipHash: hex.EncodeToString(c.TipHash), Known: c.known}
+    by, _ := json.MarshalIndent(idx, "", "  ")
+    if err := os.MkdirAll(chainDir(c.ChainID), 0o755); err != nil { return err }
+    return os.WriteFile(indexPath(c.ChainID), by, 0o644)
+}
+
+func (c *Chain) loadIndex() error {
+    p := indexPath(c.ChainID)
+    by, err := os.ReadFile(p)
+    if err != nil { return err }
+    var idx struct{ ChainID string; TipHeight int64; TipHash string; Known map[string]int64 }
+    if err := json.Unmarshal(by, &idx); err != nil { return err }
+    c.TipHeight = idx.TipHeight
+    if idx.TipHash != "" { if h, _ := hex.DecodeString(idx.TipHash); len(h)>0 { c.TipHash = h } }
+    for k,v := range idx.Known { c.known[k]=v }
+    return nil
 }
 
 // StartBlockBuilder consumes txs from txTopic, builds blocks every interval with up to maxTxs, and publishes to blockTopic.
@@ -217,7 +274,7 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
 }
 
 // StartBlockSubscriber subscribes to blockTopic and validates blocks.
-func StartBlockSubscriber(ctx context.Context, ps *pubsub.PubSub, blockTopicName string) (*pubsub.Topic, error) {
+func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string) (*pubsub.Topic, error) {
     topic, err := ps.Join(blockTopicName)
     if err != nil { return nil, err }
     sub, err := topic.Subscribe()
@@ -252,6 +309,9 @@ func StartBlockSubscriber(ctx context.Context, ps *pubsub.PubSub, blockTopicName
                     ch.TipHeight = b.Height
                     ch.TipHash = append(ch.TipHash[:0], b.Hash...)
                 }
+                // persist
+                _ = ch.saveBlock(b)
+                _ = ch.saveIndex()
                 // process any waiting children
                 children := ch.popChildren(b.Hash)
                 for _, c := range children {
@@ -278,11 +338,92 @@ func StartBlockSubscriber(ctx context.Context, ps *pubsub.PubSub, blockTopicName
                 ch.mu.Unlock()
                 continue
             }
-            // If prev is not yet known, queue and wait for parent to arrive
+            // If prev is not yet known, queue and attempt on-demand fetch from peers
             ch.queueChild(blk.PrevHash, &blk)
+            go fetchAndInjectParent(ctx, h, blk.ChainID, blk.PrevHash)
             log.Printf("block: queued height=%d waiting for parent", blk.Height)
             ch.mu.Unlock()
         }
     }()
     return topic, nil
+}
+
+// -------- Block sync over libp2p streams --------
+
+const blockSyncProto = "/pose/blocksync/1.0.0"
+
+type syncReq struct {
+    Type    string `json:"type"` // "tip" or "get"
+    ChainID string `json:"chain_id"`
+    Hash    string `json:"hash,omitempty"` // hex
+}
+type tipResp struct { Ok bool `json:"ok"`; TipHeight int64 `json:"tip_height"`; TipHash string `json:"tip_hash"` }
+type getResp struct { Ok bool `json:"ok"`; Block string `json:"block,omitempty"` } // base64
+
+// RegisterBlockSync sets stream handler for block sync RPCs.
+func RegisterBlockSync(h host.Host) {
+    h.SetStreamHandler(blockSyncProto, func(s network.Stream) {
+        defer s.Close()
+        r := bufio.NewReader(s)
+        line, _ := r.ReadString('\n')
+        var req syncReq
+        if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &req); err != nil { return }
+        switch req.Type {
+        case "tip":
+            ch := getChain(req.ChainID)
+            ch.mu.Lock(); th, thash := ch.TipHeight, hex.EncodeToString(ch.TipHash); ch.mu.Unlock()
+            resp := tipResp{Ok: true, TipHeight: th, TipHash: thash}
+            b,_ := json.Marshal(resp); s.Write(append(b,'\n'))
+        case "get":
+            // read from disk
+            path := filepath.Join(blocksDir(req.ChainID), strings.ToLower(req.Hash)+".cbor")
+            by, err := os.ReadFile(path)
+            if err != nil { b,_:=json.Marshal(getResp{Ok:false}); s.Write(append(b,'\n')); return }
+            b,_ := json.Marshal(getResp{Ok:true, Block: base64.StdEncoding.EncodeToString(by)})
+            s.Write(append(b,'\n'))
+        default:
+            return
+        }
+    })
+}
+
+// fetchAndInjectParent attempts to fetch a missing parent block from connected peers and inject it into local processing.
+func fetchAndInjectParent(ctx context.Context, h host.Host, chainID string, parentHash []byte) {
+    hashHex := hex.EncodeToString(parentHash)
+    for _, pid := range h.Network().Peers() {
+        // request
+        s, err := h.NewStream(ctx, pid, blockSyncProto)
+        if err != nil { continue }
+        req := syncReq{Type:"get", ChainID: chainID, Hash: hashHex}
+        b,_ := json.Marshal(req)
+        s.Write(append(b,'\n'))
+        r := bufio.NewReader(s)
+        line, err := r.ReadString('\n')
+        s.Close()
+        if err != nil { continue }
+        var resp getResp
+        if json.Unmarshal([]byte(strings.TrimSpace(line)), &resp) != nil || !resp.Ok { continue }
+        raw, err := base64.StdEncoding.DecodeString(resp.Block); if err != nil { continue }
+        // decode + verify + process
+        var blk Block
+        if decMode.Unmarshal(raw, &blk) != nil { continue }
+        if Verify(&blk) != nil { continue }
+        // inject by publishing to local processing path: call accept flow directly
+        ch := getChain(blk.ChainID)
+        ch.mu.Lock()
+        // minimal re-use of accept
+        // if parent known and height aligns, accept; else queue
+        if blk.Height == 1 && len(blk.PrevHash)==0 { /* handled by subscriber path too */ }
+        if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
+            // record & persist
+            ch.recordKnown(blk.Hash, blk.Height)
+            if blk.Height > ch.TipHeight { ch.TipHeight = blk.Height; ch.TipHash = append(ch.TipHash[:0], blk.Hash...) }
+            _ = ch.saveBlock(&blk); _ = ch.saveIndex()
+        } else {
+            ch.queueChild(blk.PrevHash, &blk)
+        }
+        ch.mu.Unlock()
+        // stop after first success
+        return
+    }
 }

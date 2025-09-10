@@ -49,6 +49,7 @@ func main() {
     bindIP := flag.String("bind", "", "IPv4 to bind (default all interfaces, e.g., 192.168.0.10)")
     swarmKeyPath := flag.String("pnet", "", "path to swarm.key for libp2p private network")
     genSwarmKey := flag.String("gen-swarm-key", "", "generate a new swarm.key at the given path and exit")
+    dataDir := flag.String("data-dir", ".data", "directory for block/index storage")
     var bootstraps multiFlag
     flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
     flag.Parse()
@@ -74,6 +75,9 @@ func main() {
         if err != nil { log.Fatalf("pnet: load swarm.key: %v", err) }
         log.Printf("pnet: private network enabled (swarm key)")
     }
+
+    // set data dir before services start
+    if err := blockchain.SetDataDir(*dataDir); err != nil { log.Fatalf("data dir: %v", err) }
 
     h, err := p2p.NewHost(listen, psk)
     if err != nil { log.Fatalf("create host: %v", err) }
@@ -119,7 +123,9 @@ func main() {
     }
 
     // Block gossip: subscribe always; optionally produce
-    blkTopic, err := blockchain.StartBlockSubscriber(ctx, ps, *blockTopicName)
+    // enable block sync protocol
+    blockchain.RegisterBlockSync(h)
+    blkTopic, err := blockchain.StartBlockSubscriber(ctx, h, ps, *blockTopicName)
     if err != nil { log.Fatalf("block sub: %v", err) }
     if *produceBlocks {
         if err := blockchain.StartBlockBuilder(ctx, h, txTopic, blkTopic, "iotnet-main", *blockInterval, *blockMax); err != nil { log.Fatalf("block builder: %v", err) }
