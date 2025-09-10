@@ -31,7 +31,7 @@ import (
     pubsub "github.com/libp2p/go-libp2p-pubsub"
     pb "github.com/libp2p/go-libp2p-pubsub/pb"
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-    pnet "github.com/libp2p/go-libp2p/p2p/security/pnet"
+    pnet "github.com/libp2p/go-libp2p/p2p/net/pnet"
     ma "github.com/multiformats/go-multiaddr"
 )
 
