@@ -1,6 +1,7 @@
 package p2p
 
 import (
+    "bufio"
     "context"
     "encoding/hex"
     "encoding/json"
@@ -8,6 +9,7 @@ import (
     "log"
     "sync"
     "time"
+    "strings"
 
     "crypto/ed25519"
 
@@ -17,6 +19,8 @@ import (
     "github.com/libp2p/go-libp2p/core/peer"
     pnet "github.com/libp2p/go-libp2p/core/pnet"
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+
+    "pose/internal/coseutil"
 )
 
 // ProtocolID for hello streams.
@@ -118,6 +122,31 @@ func SendHelloToAllPeers(ctx context.Context, h host.Host) {
     }
 }
 
+// RegisterHelloHandler sets a stream handler that parses hello messages,
+// registers announced device keys, and optionally dials additional addrs.
+func RegisterHelloHandler(h host.Host) {
+    h.SetStreamHandler(ProtocolID, func(s network.Stream) {
+        defer s.Close()
+        r := bufio.NewReader(s)
+        line, _ := r.ReadString('\n')
+        var pm PeerMsg
+        if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &pm); err == nil && pm.Type == "hello" {
+            if pm.Kid != "" && pm.Pub != "" {
+                if kidBytes, err1 := hex.DecodeString(pm.Kid); err1 == nil {
+                    if pubBytes, err2 := hex.DecodeString(pm.Pub); err2 == nil && len(pubBytes) == ed25519.PublicKeySize {
+                        coseutil.RegistryRegister(kidBytes, ed25519.PublicKey(pubBytes))
+                    }
+                }
+            }
+            if len(pm.Addrs) > 0 {
+                ConnectToAddrs(h, pm.Addrs)
+            }
+        }
+        // best-effort ack
+        _, _ = io.WriteString(s, "ack\n")
+    })
+}
+
 // LocalAddrs returns this host's multiaddrs with /p2p suffix.
 func LocalAddrs(h host.Host) []string {
     var out []string
@@ -142,4 +171,3 @@ func ConnectToAddrs(h host.Host, addrs []string) {
         cancel()
     }
 }
-

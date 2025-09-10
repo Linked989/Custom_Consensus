@@ -91,8 +91,8 @@ func main() {
 		log.Printf("Listen: %s/p2p/%s", a, h.ID())
 	}
 
-	// Hello streams (handled in discovery dialing; no handler payload here)
-	h.SetStreamHandler(p2p.ProtocolID, func(s network.Stream) { _ = s.Close() })
+    // Hello stream handler: register announced device keys and peer addrs
+    p2p.RegisterHelloHandler(h)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
