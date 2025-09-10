@@ -4,7 +4,6 @@ import (
     "context"
     "crypto/ed25519"
     crand "crypto/rand"
-    "log"
     "sync/atomic"
     "time"
 
@@ -13,16 +12,17 @@ import (
 
     "pose/internal/coseutil"
     "pose/internal/p2p"
+    "pose/internal/logx"
 )
 
 // StartDevGenerator publishes synthetic COSE txs periodically.
-func StartDevGenerator(ctx context.Context, h host.Host, topic *pubsub.Topic, reuseKey bool, interval time.Duration) {
+func StartDevGenerator(ctx context.Context, h host.Host, topic *pubsub.Topic, reuseKey bool, interval time.Duration, logDev bool) {
     var devPriv ed25519.PrivateKey
     var devPub ed25519.PublicKey
     var err error
     if reuseKey {
         devPub, devPriv, err = ed25519.GenerateKey(crand.Reader)
-        if err != nil { log.Printf("dev: keygen: %v", err); return }
+        if err != nil { logx.Error("dev keygen", "err", err); return }
         kid := coseutil.KidFromPub(devPub)
         coseutil.RegistryRegister(kid, devPub)
         p2p.SetDevAnnouncement(kid, devPub)
@@ -42,10 +42,9 @@ func StartDevGenerator(ctx context.Context, h host.Host, topic *pubsub.Topic, re
                 b, txid, err := coseutil.BuildDevCOSE(p, kid, h, atomic.AddUint64(&nonce, 1))
                 if err != nil { continue }
                 if err := topic.Publish(ctx, b); err == nil {
-                    log.Printf("dev: published tx %s", txid)
+                    if logDev { logx.Debug("dev published", "txid", txid) }
                 }
             }
         }
     }()
 }
-

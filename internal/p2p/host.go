@@ -6,7 +6,6 @@ import (
     "encoding/hex"
     "encoding/json"
     "io"
-    "log"
     "sync"
     "time"
     "strings"
@@ -21,6 +20,7 @@ import (
     mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 
     "pose/internal/coseutil"
+    "pose/internal/logx"
 )
 
 // ProtocolID for hello streams.
@@ -77,12 +77,12 @@ func (m *MDNSNotifee) HandlePeerFound(pi peer.AddrInfo) {
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
     if err := m.H.Connect(ctx, pi); err != nil {
-        log.Printf("mdns: connect %s: %v", pi.ID, err)
+        logx.Debug("mdns connect failed", "peer", pi.ID.String(), "err", err)
         return
     }
     s, err := m.H.NewStream(ctx, pi.ID, ProtocolID)
     if err != nil {
-        log.Printf("mdns: stream %s: %v", pi.ID, err)
+        logx.Debug("mdns stream failed", "peer", pi.ID.String(), "err", err)
         return
     }
     defer s.Close()

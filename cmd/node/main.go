@@ -19,6 +19,7 @@ import (
     "pose/internal/httpapi"
     "pose/internal/mempool"
     "pose/internal/p2p"
+    "pose/internal/logx"
 )
 
 const mdnsServiceTag = "pose-simple-mdns"
@@ -42,6 +43,12 @@ func main() {
     blockMax := flag.Int("block-max", 100, "max txs per block")
     memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
     memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
+    // Logging toggles
+    logHeartbeats := flag.Bool("log-heartbeats", false, "log every heartbeat message")
+    logTx := flag.Bool("log-tx", false, "log every accepted tx from gossip")
+    logDev := flag.Bool("log-dev", false, "log dev tx publishes")
+    logBlockQueue := flag.Bool("log-block-queue", false, "log when blocks are queued waiting for parent")
+    logPrune := flag.Bool("log-mempool-prune", true, "log mempool pruning due to accepted blocks")
     bridgeURL := flag.String("bridge-url", "", "optional HTTP URL to forward validated txs (e.g., http://localhost:1337/tx)")
     httpIn := flag.String("http", "", "optional HTTP listen addr to accept POST /tx and publish to gossip (e.g., :14000)")
     // Dev generator
@@ -53,16 +60,22 @@ func main() {
     swarmKeyPath := flag.String("pnet", "", "path to swarm.key for libp2p private network")
     genSwarmKey := flag.String("gen-swarm-key", "", "generate a new swarm.key at the given path and exit")
     dataDir := flag.String("data-dir", ".data", "directory for block/index storage")
+    // Logging
+    logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
+    logFormat := flag.String("log-format", "text", "log format: text|json")
     var bootstraps multiFlag
     flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
     flag.Parse()
+
+    // Configure logging first
+    logx.Configure(*logLevel, *logFormat)
 
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
     if *genSwarmKey != "" {
-        if err := generateSwarmKey(*genSwarmKey); err != nil { log.Fatalf("gen-swarm-key: %v", err) }
-        log.Printf("swarm.key written to %s", *genSwarmKey)
+        if err := generateSwarmKey(*genSwarmKey); err != nil { logx.Error("gen-swarm-key", "err", err); os.Exit(1) }
+        logx.Info("swarm.key written", "path", *genSwarmKey)
         return
     }
 
@@ -75,20 +88,20 @@ func main() {
     if *swarmKeyPath != "" {
         var err error
         psk, err = loadSwarmKey(*swarmKeyPath)
-        if err != nil { log.Fatalf("pnet: load swarm.key: %v", err) }
-        log.Printf("pnet: private network enabled (swarm key)")
+        if err != nil { logx.Error("pnet load", "err", err); os.Exit(1) }
+        logx.Info("pnet enabled")
     }
 
     // set data dir before services start
-    if err := blockchain.SetDataDir(*dataDir); err != nil { log.Fatalf("data dir: %v", err) }
+    if err := blockchain.SetDataDir(*dataDir); err != nil { logx.Error("data dir", "err", err); os.Exit(1) }
 
     h, err := p2p.NewHost(listen, psk)
-    if err != nil { log.Fatalf("create host: %v", err) }
+    if err != nil { logx.Error("create host", "err", err); os.Exit(1) }
     defer h.Close()
 
-    log.Printf("Node ID: %s", h.ID())
+    logx.Info("node", "id", h.ID().String())
     for _, a := range h.Addrs() {
-        log.Printf("Listen: %s/p2p/%s", a, h.ID())
+        logx.Info("listen", "addr", a.String()+"/p2p/"+h.ID().String())
     }
 
     // Hello stream handler: register announced device keys and peer addrs
@@ -97,7 +110,7 @@ func main() {
     if *enableMDNS {
         n := &p2p.MDNSNotifee{H: h}
         svc, err := p2p.SetupMDNS(h, *mdnsTag, n)
-        if err != nil { log.Fatalf("mdns start: %v", err) }
+        if err != nil { logx.Error("mdns start", "err", err); os.Exit(1) }
         defer svc.Close()
     }
 
@@ -106,18 +119,18 @@ func main() {
     }
 
     ps, err := gossip.InitPubSub(ctx, h)
-    if err != nil { log.Fatalf("pubsub init: %v", err) }
+    if err != nil { logx.Error("pubsub init", "err", err); os.Exit(1) }
     // Local mempool
     pool := mempool.New(*memCapacity, *memTTL)
 
     members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
-        m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL)
+        m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)
         if err != nil { return nil, nil, err }
-        t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool)
+        t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool, *logTx)
         if err != nil { return nil, nil, err }
         return m, t, nil
     }()
-    if err != nil { log.Fatalf("gossip start: %v", err) }
+    if err != nil { logx.Error("gossip start", "err", err); os.Exit(1) }
 
     if *httpIn != "" {
         srv := httpapi.StartHTTPIngress(ctx, *httpIn, txTopic)
@@ -125,16 +138,16 @@ func main() {
     }
 
     if *devGen {
-        dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval)
+        dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
     }
 
     // Block gossip: subscribe always; optionally produce
     // enable block sync protocol
     blockchain.RegisterBlockSync(h)
-    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool)
-    if err != nil { log.Fatalf("block sub: %v", err) }
+    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool, *logPrune, *logBlockQueue)
+    if err != nil { logx.Error("block sub", "err", err); os.Exit(1) }
     if *produceBlocks {
-        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, "iotnet-main", *blockInterval, *blockMax); err != nil { log.Fatalf("block builder: %v", err) }
+        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, "iotnet-main", *blockInterval, *blockMax); err != nil { logx.Error("block builder", "err", err); os.Exit(1) }
     }
 
     if statsInterval != nil && *statsInterval > 0 {
@@ -144,7 +157,7 @@ func main() {
                 select { case <-ctx.Done(): return; case <-t.C:
                     all := members.CountAndSweep()
                     connected := len(h.Network().Peers())
-                    log.Printf("stats: all_nodes=%d connected_nodes_counter=%d", all, connected)
+                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
                 }
             }
         }()
@@ -153,7 +166,7 @@ func main() {
     sig := make(chan os.Signal, 1)
     signal.Notify(sig, os.Interrupt)
     <-sig
-    log.Println("Shutting down...")
+    logx.Info("shutting down")
 }
 
 // multiFlag allows repeating -bootstrap flags.

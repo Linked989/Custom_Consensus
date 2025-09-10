@@ -5,7 +5,6 @@ import (
     "crypto/sha256"
     "encoding/hex"
     "io"
-    "log"
     "net/http"
     "strings"
     "sync"
@@ -17,6 +16,7 @@ import (
 
     "pose/internal/coseutil"
     "pose/internal/mempool"
+    "pose/internal/logx"
 )
 
 // InitPubSub sets up GossipSub with a content-based message ID.
@@ -50,7 +50,7 @@ func (m *MemberSet) CountAndSweep() int {
 }
 
 // StartHeartbeat joins a topic, subscribes, logs, and publishes periodic heartbeats.
-func StartHeartbeat(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, interval, ttl time.Duration) (*MemberSet, *pubsub.Topic, error) {
+func StartHeartbeat(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, interval, ttl time.Duration, logHeartbeats bool) (*MemberSet, *pubsub.Topic, error) {
     topic, err := ps.Join(topicName); if err != nil { return nil, nil, err }
     sub, err := topic.Subscribe(); if err != nil { return nil, nil, err }
     members := NewMemberSet(ttl); members.Touch(h.ID().String())
@@ -58,7 +58,7 @@ func StartHeartbeat(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicNa
         for {
             msg, err := sub.Next(ctx); if err != nil { return }
             if msg.ReceivedFrom == h.ID() { continue }
-            log.Printf("pubsub: from=%s msg=%s", msg.ReceivedFrom, strings.TrimSpace(string(msg.Message.GetData())))
+            if logHeartbeats { logx.Debug("heartbeat", "from", msg.ReceivedFrom.String(), "msg", strings.TrimSpace(string(msg.Message.GetData()))) }
             members.Touch(msg.ReceivedFrom.String())
         }
     }()
@@ -84,11 +84,11 @@ func StartTxGossip(ctx context.Context, ps *pubsub.PubSub, topicName string, bri
         for {
             msg, err := sub.Next(ctx); if err != nil { return }
             txid, devID, seq, err := coseutil.ValidateCOSETx(msg.Message.GetData())
-            if err != nil { log.Printf("tx: invalid: %v", err); continue }
+            if err != nil { logx.Debug("tx invalid", "err", err); continue }
             if !coseutil.UpdateLastSeq(devID, seq) { continue }
             seen.Mu.Lock(); if _, ok := seen.M[txid]; ok { seen.Mu.Unlock(); continue }
             seen.M[txid] = time.Now(); seen.Mu.Unlock()
-            log.Printf("tx: accepted txid=%s dev=%s seq=%d from %s", txid, devID, seq, msg.ReceivedFrom)
+            logx.Info("tx accepted", "txid", txid, "dev", devID, "seq", seq, "from", msg.ReceivedFrom.String())
             if bridgeURL != "" { go forwardCOSE(bridgeURL, msg.Message.GetData()) }
         }
     }()
@@ -96,7 +96,7 @@ func StartTxGossip(ctx context.Context, ps *pubsub.PubSub, topicName string, bri
 }
 
 // StartTxGossipToPool is like StartTxGossip but inserts validated txs into the provided mempool.
-func StartTxGossipToPool(ctx context.Context, ps *pubsub.PubSub, topicName string, bridgeURL string, pool *mempool.Pool) (*pubsub.Topic, error) {
+func StartTxGossipToPool(ctx context.Context, ps *pubsub.PubSub, topicName string, bridgeURL string, pool *mempool.Pool, logTx bool) (*pubsub.Topic, error) {
     topic, err := ps.Join(topicName); if err != nil { return nil, err }
     sub, err := topic.Subscribe(); if err != nil { return nil, err }
     // seen is still used to avoid re-processing duplicates excessively
@@ -110,7 +110,7 @@ func StartTxGossipToPool(ctx context.Context, ps *pubsub.PubSub, topicName strin
             // Dedup notice for logs only
             seen.Mu.Lock(); if _, ok := seen.M[e.TxID]; ok { seen.Mu.Unlock(); continue }
             seen.M[e.TxID] = time.Now(); seen.Mu.Unlock()
-            log.Printf("tx: accepted txid=%s dev=%s seq=%d from %s", e.TxID, e.DevID, e.Seq, msg.ReceivedFrom)
+            if logTx { logx.Info("tx accepted", "txid", e.TxID, "dev", e.DevID, "seq", e.Seq, "from", msg.ReceivedFrom.String()) }
             if bridgeURL != "" { go forwardCOSE(bridgeURL, msg.Message.GetData()) }
         }
     }()

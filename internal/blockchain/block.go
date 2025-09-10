@@ -384,18 +384,13 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
                 for _, hx := range blk.TxIDs { if b, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, b) } }
                 blk.TxRoot = merkle.ComputeRoot(leaves)
                 if err := Sign(h, &blk); err != nil {
-                    log.Printf("block: sign: %v", err)
+                    logx.Error("block sign", "err", err)
                     continue
                 }
 				// publish
 				data, err := encMode.Marshal(blk)
-				if err != nil {
-					log.Printf("block: marshal: %v", err)
-					continue
-				}
-				if err := blkTopic.Publish(ctx, data); err != nil {
-					log.Printf("block: publish: %v", err)
-				}
+				if err != nil { logx.Error("block marshal", "err", err); continue }
+				if err := blkTopic.Publish(ctx, data); err != nil { logx.Error("block publish", "err", err) }
 				prev = blk.Hash
 				height++
 			}
@@ -465,18 +460,13 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                 for _, hx := range blk.TxIDs { if b, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, b) } }
                 blk.TxRoot = merkle.ComputeRoot(leaves)
                 if err := Sign(h, &blk); err != nil {
-                    log.Printf("block: sign: %v", err)
+                    logx.Error("block sign", "err", err)
                     continue
                 }
                 // publish
                 data, err := encMode.Marshal(blk)
-                if err != nil {
-                    log.Printf("block: marshal: %v", err)
-                    continue
-                }
-                if err := blkTopic.Publish(ctx, data); err != nil {
-                    log.Printf("block: publish: %v", err)
-                }
+                if err != nil { logx.Error("block marshal", "err", err); continue }
+                if err := blkTopic.Publish(ctx, data); err != nil { logx.Error("block publish", "err", err) }
                 prev = blk.Hash
                 height++
             }
@@ -501,15 +491,9 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 			if err != nil {
 				return
 			}
-			var blk Block
-			if err := decMode.Unmarshal(msg.Message.GetData(), &blk); err != nil {
-				log.Printf("block: bad cbor: %v", err)
-				continue
-			}
-			if err := Verify(&blk); err != nil {
-				log.Printf("block: invalid: %v", err)
-				continue
-			}
+            var blk Block
+            if err := decMode.Unmarshal(msg.Message.GetData(), &blk); err != nil { logx.Warn("block bad cbor", "err", err); continue }
+            if err := Verify(&blk); err != nil { logx.Warn("block invalid", "err", err); continue }
 			// re-validate txs (basic)
 			ok := true
 			for _, tx := range blk.Txs {
@@ -518,10 +502,7 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 					break
 				}
 			}
-			if !ok {
-				log.Printf("block: contains invalid txs")
-				continue
-			}
+            if !ok { logx.Warn("block contains invalid txs"); continue }
 
 			// chain checks with out-of-order tolerance
 			ch := getChain(blk.ChainID)
@@ -532,20 +513,20 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 			// decide to accept now or queue
             if blk.Height == 1 && len(blk.PrevHash) == 0 {
                 accept(&blk)
-                log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
+                logx.Info("block accepted", "height", blk.Height, "txs", len(blk.Txs), "producer", blk.ProducerID)
                 ch.mu.Unlock()
                 continue
             }
             if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
                 accept(&blk)
-                log.Printf("block: accepted height=%d txs=%d producer=%s", blk.Height, len(blk.Txs), blk.ProducerID)
+                logx.Info("block accepted", "height", blk.Height, "txs", len(blk.Txs), "producer", blk.ProducerID)
                 ch.mu.Unlock()
                 continue
             }
 			// If prev is not yet known, queue and attempt on-demand fetch from peers
 			ch.queueChild(blk.PrevHash, &blk)
 			go fetchAndInjectParent(ctx, h, blk.ChainID, blk.PrevHash)
-			log.Printf("block: queued height=%d waiting for parent", blk.Height)
+            logx.Debug("block queued", "height", blk.Height)
 			ch.mu.Unlock()
 		}
 	}()
@@ -594,7 +575,7 @@ func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsu
             if Verify(&blk) != nil { continue }
             // Remove txs from local mempool (best-effort)
             removed := pool.RemoveTxIDs(blk.TxIDs)
-            if removed > 0 { log.Printf("mempool: removed %d txs included in block height=%d", removed, blk.Height) }
+            if removed > 0 { logx.Info("mempool pruned", "removed", removed, "height", blk.Height) }
         }
     }()
     return topic, nil

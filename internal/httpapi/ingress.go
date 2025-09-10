@@ -3,12 +3,12 @@ package httpapi
 import (
     "context"
     "io"
-    "log"
     "net/http"
 
     pubsub "github.com/libp2p/go-libp2p-pubsub"
 
     "pose/internal/coseutil"
+    "pose/internal/logx"
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
@@ -22,15 +22,12 @@ func StartHTTPIngress(ctx context.Context, addr string, txTopic *pubsub.Topic) *
         if err != nil { http.Error(w, "invalid tx", http.StatusBadRequest); return }
         if !coseutil.UpdateLastSeq(devID, seq) { http.Error(w, "replay", http.StatusBadRequest); return }
         if err := txTopic.Publish(ctx, body); err != nil { http.Error(w, "publish failed", http.StatusInternalServerError); return }
-        log.Printf("http: accepted txid=%s dev=%s seq=%d", txid, devID, seq)
+        logx.Info("http accepted", "txid", txid, "dev", devID, "seq", seq)
         w.WriteHeader(http.StatusAccepted)
     })
     srv := &http.Server{Addr: addr, Handler: mux}
     go func() {
-        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Printf("http ingress error: %v", err)
-        }
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { logx.Error("http ingress", "err", err) }
     }()
     return srv
 }
-
