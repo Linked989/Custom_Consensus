@@ -72,6 +72,8 @@ func main() {
 
 	// Configure logging first
 	logx.Configure(*logLevel, *logFormat)
+    // Configure P2P chain handshake
+    p2p.SetChainID(*chainID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -164,10 +166,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *httpIn != "" {
-		srv := httpapi.StartHTTPIngress(ctx, *httpIn, txTopic)
-		defer srv.Shutdown(ctx)
-	}
+    if *httpIn != "" {
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID)
+        defer srv.Shutdown(ctx)
+    }
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)

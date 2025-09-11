@@ -33,10 +33,15 @@ type PeerMsg struct {
     Addrs []string `json:"addrs"`
     Kid   string   `json:"kid,omitempty"` // hex ed25519 key id (prefix)
     Pub   string   `json:"pub,omitempty"` // hex ed25519 public key
+    Chain string   `json:"chain,omitempty"` // chain/network id
 }
 
 // Global announce for dev key.
 var devAnnounce struct{ kid []byte; pub ed25519.PublicKey }
+var expectedChain string
+
+// SetChainID configures the chain/network id to announce and accept.
+func SetChainID(id string) { expectedChain = id }
 
 func SetDevAnnouncement(kid []byte, pub ed25519.PublicKey) {
     devAnnounce.kid, devAnnounce.pub = kid, pub
@@ -100,7 +105,7 @@ func SetupMDNS(h host.Host, tag string, n *MDNSNotifee) (io.Closer, error) {
 
 // SendHello writes a JSON hello message on the stream.
 func SendHello(h host.Host, s network.Stream) error {
-    pm := PeerMsg{Type: "hello", From: h.ID().String(), Addrs: LocalAddrs(h)}
+    pm := PeerMsg{Type: "hello", From: h.ID().String(), Addrs: LocalAddrs(h), Chain: expectedChain}
     if len(devAnnounce.kid) > 0 && len(devAnnounce.pub) == ed25519.PublicKeySize {
         pm.Kid = hex.EncodeToString(devAnnounce.kid)
         pm.Pub = hex.EncodeToString(devAnnounce.pub)
@@ -131,6 +136,13 @@ func RegisterHelloHandler(h host.Host) {
         line, _ := r.ReadString('\n')
         var pm PeerMsg
         if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &pm); err == nil && pm.Type == "hello" {
+            // Drop peers on chain mismatch (if they supplied a chain id)
+            if pm.Chain != "" && expectedChain != "" && pm.Chain != expectedChain {
+                _ = s.Close()
+                // best-effort: close peer connections
+                _ = h.Network().ClosePeer(s.Conn().RemotePeer())
+                return
+            }
             if pm.Kid != "" && pm.Pub != "" {
                 if kidBytes, err1 := hex.DecodeString(pm.Kid); err1 == nil {
                     if pubBytes, err2 := hex.DecodeString(pm.Pub); err2 == nil && len(pubBytes) == ed25519.PublicKeySize {

@@ -4,15 +4,21 @@ import (
     "context"
     "io"
     "net/http"
+    "encoding/json"
+    "strconv"
+    "strings"
 
     pubsub "github.com/libp2p/go-libp2p-pubsub"
+    "github.com/libp2p/go-libp2p/core/host"
 
     "pose/internal/coseutil"
     "pose/internal/logx"
+    "pose/internal/blockchain"
+    "pose/internal/mempool"
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
-func StartHTTPIngress(ctx context.Context, addr string, txTopic *pubsub.Topic) *http.Server {
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string) *http.Server {
     mux := http.NewServeMux()
     mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
@@ -24,6 +30,59 @@ func StartHTTPIngress(ctx context.Context, addr string, txTopic *pubsub.Topic) *
         if err := txTopic.Publish(ctx, body); err != nil { http.Error(w, "publish failed", http.StatusInternalServerError); return }
         logx.Info("http accepted", "txid", txid, "dev", devID, "seq", seq)
         w.WriteHeader(http.StatusAccepted)
+    })
+    // GET /status
+    mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+        th, thash := blockchain.GetTip(chainID)
+        peers := h.Network().Peers()
+        out := map[string]any{"chain_id": chainID, "tip_height": th, "tip_hash": thash, "peers": len(peers), "mempool": pool.Len()}
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(out)
+    })
+    // GET /block/{hash}
+    mux.HandleFunc("/block/", func(w http.ResponseWriter, r *http.Request) {
+        hash := strings.TrimPrefix(r.URL.Path, "/block/")
+        if hash == "" { http.NotFound(w, r); return }
+        if blk, ok := blockchain.LoadBlockByHash(chainID, hash); ok {
+            out := map[string]any{
+                "version": blk.Version,
+                "chain_id": blk.ChainID,
+                "height": blk.Height,
+                "prev_hash": hash,
+                "timestamp": blk.Timestamp,
+                "producer_id": blk.ProducerID,
+                "tx_root": blk.TxRoot,
+                "hash": hash,
+                "txids": blk.TxIDs,
+            }
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(out)
+            return
+        }
+        http.NotFound(w, r)
+    })
+    // GET /block/height/{h}
+    mux.HandleFunc("/block/height/", func(w http.ResponseWriter, r *http.Request) {
+        hs := strings.TrimPrefix(r.URL.Path, "/block/height/")
+        hgt, err := strconv.ParseInt(hs, 10, 64)
+        if err != nil { http.Error(w, "bad height", http.StatusBadRequest); return }
+        if hash, ok := blockchain.GetHashByHeight(chainID, hgt); ok {
+            http.Redirect(w, r, "/block/"+hash, http.StatusTemporaryRedirect)
+            return
+        }
+        http.NotFound(w, r)
+    })
+    // GET /tx/{txid}
+    mux.HandleFunc("/tx/", func(w http.ResponseWriter, r *http.Request) {
+        txid := strings.TrimPrefix(r.URL.Path, "/tx/")
+        if txid == "" { http.NotFound(w, r); return }
+        if hash, height, ok := blockchain.GetBlockByTxID(chainID, txid); ok {
+            out := map[string]any{"txid": txid, "block_hash": hash, "height": height}
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(out)
+            return
+        }
+        http.NotFound(w, r)
     })
     srv := &http.Server{Addr: addr, Handler: mux}
     go func() {

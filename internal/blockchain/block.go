@@ -331,6 +331,29 @@ func (c *Chain) loadIndex() error {
 	return nil
 }
 
+// Public helpers for HTTP API
+func GetTip(chainID string) (int64, string) {
+    ch := getChain(chainID)
+    ch.mu.Lock(); defer ch.mu.Unlock()
+    return ch.TipHeight, hex.EncodeToString(ch.TipHash)
+}
+
+func LoadBlockByHash(chainID, hashHex string) (*Block, bool) {
+    p := filepath.Join(blocksDir(chainID), strings.ToLower(hashHex)+".cbor")
+    by, err := os.ReadFile(p)
+    if err != nil { return nil, false }
+    var blk Block
+    if err := decMode.Unmarshal(by, &blk); err != nil { return nil, false }
+    return &blk, true
+}
+
+func GetHashByHeight(chainID string, height int64) (string, bool) {
+    ch := getChain(chainID)
+    ch.mu.Lock(); defer ch.mu.Unlock()
+    for h, ht := range ch.known { if ht == height { return h, true } }
+    return "", false
+}
+
 // loadBlockTimestamp reads a stored block and returns its timestamp.
 func loadBlockTimestamp(chainID string, hashHex string) (time.Time, bool) {
     p := filepath.Join(blocksDir(chainID), strings.ToLower(hashHex)+".cbor")
