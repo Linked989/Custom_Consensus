@@ -23,11 +23,13 @@ type Pool struct {
     order    []string          // FIFO of txids
     capacity int
     ttl      time.Duration
+    capBytes int
+    curBytes int
 }
 
-// New creates a new mempool with max capacity and a TTL for entries.
-func New(capacity int, ttl time.Duration) *Pool {
-    return &Pool{entries: make(map[string]*Entry), capacity: capacity, ttl: ttl}
+// New creates a new mempool with max capacity, TTL for entries, and optional byte cap.
+func New(capacity int, ttl time.Duration, capBytes int) *Pool {
+    return &Pool{entries: make(map[string]*Entry), capacity: capacity, ttl: ttl, capBytes: capBytes}
 }
 
 // Len returns current number of transactions in the pool.
@@ -52,15 +54,33 @@ func (p *Pool) AddValidatedCOSE(b []byte) (*Entry, error) {
     if _, ok := p.entries[txid]; ok {
         return nil, errors.New("duplicate")
     }
+    // if bytes cap configured and single tx exceeds it, reject
+    if p.capBytes > 0 && len(b) > p.capBytes {
+        return nil, errors.New("too_large")
+    }
     // evict oldest if full
-    if p.capacity > 0 && len(p.entries) >= p.capacity {
+    for p.capacity > 0 && len(p.entries) >= p.capacity {
         oldest := p.order[0]
+        if e := p.entries[oldest]; e != nil { p.curBytes -= len(e.Bytes) }
         delete(p.entries, oldest)
         p.order = p.order[1:]
+    }
+    // evict to satisfy bytes cap
+    if p.capBytes > 0 {
+        for p.curBytes+len(b) > p.capBytes && len(p.order) > 0 {
+            oldest := p.order[0]
+            if e := p.entries[oldest]; e != nil { p.curBytes -= len(e.Bytes) }
+            delete(p.entries, oldest)
+            p.order = p.order[1:]
+        }
+        if p.curBytes+len(b) > p.capBytes {
+            return nil, errors.New("mempool_full")
+        }
     }
     e := &Entry{TxID: txid, DevID: devID, Seq: seq, Bytes: b, Added: time.Now()}
     p.entries[txid] = e
     p.order = append(p.order, txid)
+    p.curBytes += len(b)
     return e, nil
 }
 
@@ -77,6 +97,7 @@ func (p *Pool) PopBatch(max int) [][]byte {
         txid := p.order[i]
         if e, ok := p.entries[txid]; ok {
             out = append(out, e.Bytes)
+            p.curBytes -= len(e.Bytes)
             delete(p.entries, txid)
         }
     }
@@ -93,16 +114,15 @@ func (p *Pool) RemoveTxIDs(ids []string) int {
     rm := make(map[string]struct{}, len(ids))
     for _, id := range ids { rm[id] = struct{}{} }
     for id := range rm {
-        if _, ok := p.entries[id]; ok {
+        if e, ok := p.entries[id]; ok {
+            p.curBytes -= len(e.Bytes)
             delete(p.entries, id)
             removed++
         }
     }
     if removed > 0 {
         // rebuild order without removed ids
-        newOrder := new([]string)
-        no := *newOrder
-        no = no[:0]
+        no := make([]string, 0, len(p.order))
         for _, id := range p.order {
             if _, drop := rm[id]; !drop {
                 no = append(no, id)
@@ -126,6 +146,7 @@ func (p *Pool) sweepLocked() {
         if e == nil { i++; continue }
         if now.Sub(e.Added) <= p.ttl { break }
         delete(p.entries, txid)
+        p.curBytes -= len(e.Bytes)
         i++
     }
     if i > 0 { p.order = p.order[i:] }

@@ -43,8 +43,9 @@ func main() {
 	blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
 	blockMax := flag.Int("block-max", 100, "max txs per block")
 	blockBytesMax := flag.Int("block-bytes-max", 0, "max total tx bytes per block (0 = unlimited)")
-	memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
-	memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
+    memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
+    memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
+    memBytesCap := flag.Int("mempool-bytes-cap", 0, "mempool max total bytes (0 = unlimited)")
 	// Logging toggles
 	logHeartbeats := flag.Bool("log-heartbeats", false, "log every heartbeat message")
 	logTx := flag.Bool("log-tx", false, "log every accepted tx from gossip")
@@ -145,7 +146,7 @@ func main() {
 		os.Exit(1)
 	}
 	// Local mempool
-	pool := mempool.New(*memCapacity, *memTTL)
+    pool := mempool.New(*memCapacity, *memTTL, *memBytesCap)
 
 	members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
 		m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)
