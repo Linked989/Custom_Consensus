@@ -173,7 +173,7 @@ func main() {
 	// Block gossip: subscribe always; optionally produce
 	// enable block sync protocol
 	blockchain.RegisterBlockSync(h)
-	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool)
+    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool, *logPrune, *logBlockQueue)
 	if err != nil {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
