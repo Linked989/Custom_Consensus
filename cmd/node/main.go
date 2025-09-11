@@ -41,6 +41,7 @@ func main() {
 	produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
 	blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
 	blockMax := flag.Int("block-max", 100, "max txs per block")
+	blockBytesMax := flag.Int("block-bytes-max", 0, "max total tx bytes per block (0 = unlimited)")
 	memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
 	memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
 	// Logging toggles
@@ -173,13 +174,13 @@ func main() {
 	// Block gossip: subscribe always; optionally produce
 	// enable block sync protocol
 	blockchain.RegisterBlockSync(h)
-	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool, *logPrune, *logBlockQueue)
+	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax)
 	if err != nil {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
 	if *produceBlocks {
-		if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, "iotnet-main", *blockInterval, *blockMax); err != nil {
+		if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, "iotnet-main", *blockInterval, *blockMax, *blockBytesMax); err != nil {
 			logx.Error("block builder", "err", err)
 			os.Exit(1)
 		}

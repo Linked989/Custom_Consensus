@@ -179,12 +179,13 @@ func peerIDFromKey(pub crypto.PubKey) (string, error) {
 // ------ In-memory chain state ------
 
 type Chain struct {
-	mu        sync.Mutex
-	ChainID   string
-	TipHeight int64
-	TipHash   []byte
-	known     map[string]int64    // hex(hash) -> height
-	waiting   map[string][]*Block // hex(prevHash) -> children blocks waiting on this prev
+    mu        sync.Mutex
+    ChainID   string
+    TipHeight int64
+    TipHash   []byte
+    known     map[string]int64    // hex(hash) -> height
+    waiting   map[string][]*Block // hex(prevHash) -> children blocks waiting on this prev
+    txIndex   map[string]txRef    // txid -> (block hash, height)
 }
 
 var chains = struct {
@@ -196,12 +197,13 @@ func getChain(id string) *Chain {
 	chains.mu.Lock()
 	defer chains.mu.Unlock()
 	c := chains.m[id]
-	if c == nil {
-		c = &Chain{ChainID: id, known: make(map[string]int64), waiting: make(map[string][]*Block)}
-		chains.m[id] = c
-		// Try load index from disk
-		_ = c.loadIndex()
-	}
+    if c == nil {
+        c = &Chain{ChainID: id, known: make(map[string]int64), waiting: make(map[string][]*Block), txIndex: make(map[string]txRef)}
+        chains.m[id] = c
+        // Try load index from disk
+        _ = c.loadIndex()
+        _ = c.loadTxIndex()
+    }
 	return c
 }
 
@@ -242,15 +244,23 @@ func (c *Chain) waitingKeys() []string {
 
 // acceptBlockLocked records, persists, updates tip and cascades children. Caller must hold c.mu.
 func (c *Chain) acceptBlockLocked(b *Block) {
-	c.recordKnown(b.Hash, b.Height)
+    c.recordKnown(b.Hash, b.Height)
 	if (c.TipHeight == 0 && b.Height == 1 && len(b.PrevHash) == 0) ||
 		(b.Height == c.TipHeight+1 && bytes.Equal(b.PrevHash, c.TipHash)) ||
 		(b.Height > c.TipHeight) {
 		c.TipHeight = b.Height
 		c.TipHash = append(c.TipHash[:0], b.Hash...)
 	}
-	_ = c.saveBlock(b)
-	_ = c.saveIndex()
+    _ = c.saveBlock(b)
+    _ = c.saveIndex()
+    // update tx index
+    bh := hex.EncodeToString(b.Hash)
+    for _, txid := range b.TxIDs {
+        if _, exists := c.txIndex[txid]; !exists {
+            c.txIndex[txid] = txRef{BlockHash: bh, Height: b.Height}
+        }
+    }
+    _ = c.saveTxIndex()
 	children := c.popChildren(b.Hash)
 	for _, child := range children {
 		if ph, ok := c.isKnown(child.PrevHash); ok && child.Height == ph+1 {
@@ -319,6 +329,35 @@ func (c *Chain) loadIndex() error {
 		c.known[k] = v
 	}
 	return nil
+}
+
+// ---- Tx index persistence ----
+type txRef struct { BlockHash string `json:"block_hash"`; Height int64 `json:"height"` }
+
+func txIndexPath(chainID string) string { return filepath.Join(chainDir(chainID), "txindex.json") }
+
+func (c *Chain) saveTxIndex() error {
+    if dataDir == "" { return nil }
+    by, _ := json.MarshalIndent(c.txIndex, "", "  ")
+    if err := os.MkdirAll(chainDir(c.ChainID), 0o755); err != nil { return err }
+    return os.WriteFile(txIndexPath(c.ChainID), by, 0o644)
+}
+
+func (c *Chain) loadTxIndex() error {
+    p := txIndexPath(c.ChainID)
+    by, err := os.ReadFile(p)
+    if err != nil { return err }
+    var m map[string]txRef
+    if err := json.Unmarshal(by, &m); err != nil { return err }
+    for k, v := range m { c.txIndex[k] = v }
+    return nil
+}
+
+func GetBlockByTxID(chainID string, txid string) (hash string, height int64, ok bool) {
+    ch := getChain(chainID)
+    ch.mu.Lock(); defer ch.mu.Unlock()
+    if r, found := ch.txIndex[txid]; found { return r.BlockHash, r.Height, true }
+    return "", 0, false
 }
 
 // StartBlockBuilder consumes txs from txTopic, builds blocks every interval with up to maxTxs, and publishes to blockTopic.
@@ -401,7 +440,7 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
 
 // StartBlockBuilderFromPool builds blocks by draining transactions from a local mempool.
 // It aligns the initial height/prev to the current persisted tip for the given chainID.
-func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.Pool, blkTopic *pubsub.Topic, chainID string, interval time.Duration, maxTxs int) error {
+func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.Pool, blkTopic *pubsub.Topic, chainID string, interval time.Duration, maxTxs int, maxBytes int) error {
     // internal staging channel fed from the mempool
     mem := make(chan []byte, 4096)
     go func() {
@@ -448,13 +487,20 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                 if len(batch) == 0 {
                     continue
                 }
-                // build block
+                // build block with limits (count, bytes)
                 blk := Block{Version: 1, ChainID: chainID, Height: height, PrevHash: prev, Timestamp: time.Now().UTC()}
+                var total int
                 for _, tx := range batch {
+                    if maxBytes > 0 && total+len(tx) > maxBytes {
+                        break
+                    }
                     txid, _, _, _ := coseutil.ValidateCOSETx(tx)
                     blk.TxIDs = append(blk.TxIDs, txid)
                     blk.Txs = append(blk.Txs, tx)
+                    total += len(tx)
+                    if maxTxs > 0 && len(blk.Txs) >= maxTxs { break }
                 }
+                if len(blk.Txs) == 0 { continue }
                 // compute Merkle root over txids (hex -> bytes)
                 var leaves [][]byte
                 for _, hx := range blk.TxIDs { if b, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, b) } }
@@ -476,7 +522,7 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
 }
 
 // StartBlockSubscriber subscribes to blockTopic and validates blocks.
-func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, logQueue bool) (*pubsub.Topic, error) {
+func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
 	topic, err := ps.Join(blockTopicName)
 	if err != nil {
 		return nil, err
@@ -494,6 +540,21 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
             var blk Block
             if err := decMode.Unmarshal(msg.Message.GetData(), &blk); err != nil { logx.Warn("block bad cbor", "err", err); continue }
             if err := Verify(&blk); err != nil { logx.Warn("block invalid", "err", err); continue }
+            // Block limits: count and bytes
+            if maxTxs > 0 && len(blk.Txs) > maxTxs { logx.Warn("block too many txs", "count", len(blk.Txs), "max", maxTxs); continue }
+            if maxBytes > 0 {
+                total := 0
+                for _, b := range blk.Txs { total += len(b) }
+                if total > maxBytes { logx.Warn("block too many bytes", "bytes", total, "max", maxBytes); continue }
+            }
+            // Dedup txids
+            seen := make(map[string]struct{}, len(blk.TxIDs))
+            dup := false
+            for _, id := range blk.TxIDs {
+                if _, ok := seen[id]; ok { dup = true; break }
+                seen[id] = struct{}{}
+            }
+            if dup { logx.Warn("block duplicate txid"); continue }
 			// re-validate txs (basic)
 			ok := true
 			for _, tx := range blk.Txs {
@@ -561,8 +622,8 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 }
 
 // StartBlockSubscriberWithMempool wires block acceptance to mempool cleanup by txid.
-func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, pool *mempool.Pool, logPrune bool, logQueue bool) (*pubsub.Topic, error) {
-    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName, logQueue)
+func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, pool *mempool.Pool, logPrune bool, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
+    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName, logQueue, maxTxs, maxBytes)
     if err != nil { return nil, err }
     // Subscribe again just to observe accepted blocks and prune mempool.
     sub, err := topic.Subscribe()
