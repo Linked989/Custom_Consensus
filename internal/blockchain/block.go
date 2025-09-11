@@ -476,7 +476,7 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
 }
 
 // StartBlockSubscriber subscribes to blockTopic and validates blocks.
-func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string) (*pubsub.Topic, error) {
+func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, logQueue bool) (*pubsub.Topic, error) {
 	topic, err := ps.Join(blockTopicName)
 	if err != nil {
 		return nil, err
@@ -526,7 +526,7 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 			// If prev is not yet known, queue and attempt on-demand fetch from peers
 			ch.queueChild(blk.PrevHash, &blk)
 			go fetchAndInjectParent(ctx, h, blk.ChainID, blk.PrevHash)
-            logx.Debug("block queued", "height", blk.Height)
+            if logQueue { logx.Debug("block queued", "height", blk.Height) }
 			ch.mu.Unlock()
 		}
 	}()
@@ -561,8 +561,8 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 }
 
 // StartBlockSubscriberWithMempool wires block acceptance to mempool cleanup by txid.
-func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, pool *mempool.Pool) (*pubsub.Topic, error) {
-    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName)
+func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, pool *mempool.Pool, logPrune bool, logQueue bool) (*pubsub.Topic, error) {
+    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName, logQueue)
     if err != nil { return nil, err }
     // Subscribe again just to observe accepted blocks and prune mempool.
     sub, err := topic.Subscribe()
@@ -575,7 +575,7 @@ func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsu
             if Verify(&blk) != nil { continue }
             // Remove txs from local mempool (best-effort)
             removed := pool.RemoveTxIDs(blk.TxIDs)
-            if removed > 0 { logx.Info("mempool pruned", "removed", removed, "height", blk.Height) }
+            if logPrune && removed > 0 { logx.Info("mempool pruned", "removed", removed, "height", blk.Height) }
         }
     }()
     return topic, nil
