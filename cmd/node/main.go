@@ -36,7 +36,8 @@ func main() {
 	statsInterval := flag.Duration("stats", 5*time.Second, "stats log interval (0=off)")
 	memberTTL := flag.Duration("ttl", 10*time.Second, "membership entry TTL")
 	// Gossip
-	txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
+    chainID := flag.String("chain-id", "iotnet-main", "chain/network id")
+    txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
 	blockTopicName := flag.String("block-topic", "pose/block/1.0.0", "pubsub topic for blocks")
 	produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
 	blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
@@ -174,17 +175,17 @@ func main() {
 	// Block gossip: subscribe always; optionally produce
 	// enable block sync protocol
 	blockchain.RegisterBlockSync(h)
-	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax)
+    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax)
 	if err != nil {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
-	if *produceBlocks {
-		if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, "iotnet-main", *blockInterval, *blockMax, *blockBytesMax); err != nil {
-			logx.Error("block builder", "err", err)
-			os.Exit(1)
-		}
-	}
+    if *produceBlocks {
+        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax); err != nil {
+            logx.Error("block builder", "err", err)
+            os.Exit(1)
+        }
+    }
 
 	if statsInterval != nil && *statsInterval > 0 {
 		go func() {

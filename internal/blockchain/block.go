@@ -331,6 +331,16 @@ func (c *Chain) loadIndex() error {
 	return nil
 }
 
+// loadBlockTimestamp reads a stored block and returns its timestamp.
+func loadBlockTimestamp(chainID string, hashHex string) (time.Time, bool) {
+    p := filepath.Join(blocksDir(chainID), strings.ToLower(hashHex)+".cbor")
+    by, err := os.ReadFile(p)
+    if err != nil { return time.Time{}, false }
+    var blk Block
+    if err := decMode.Unmarshal(by, &blk); err != nil { return time.Time{}, false }
+    return blk.Timestamp, true
+}
+
 // ---- Tx index persistence ----
 type txRef struct { BlockHash string `json:"block_hash"`; Height int64 `json:"height"` }
 
@@ -522,7 +532,7 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
 }
 
 // StartBlockSubscriber subscribes to blockTopic and validates blocks.
-func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
+func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, expectedChain string, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
 	topic, err := ps.Join(blockTopicName)
 	if err != nil {
 		return nil, err
@@ -539,6 +549,8 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 			}
             var blk Block
             if err := decMode.Unmarshal(msg.Message.GetData(), &blk); err != nil { logx.Warn("block bad cbor", "err", err); continue }
+            // Chain ID check
+            if blk.ChainID != expectedChain { logx.Warn("block wrong chain", "got", blk.ChainID, "want", expectedChain); continue }
             if err := Verify(&blk); err != nil { logx.Warn("block invalid", "err", err); continue }
             // Block limits: count and bytes
             if maxTxs > 0 && len(blk.Txs) > maxTxs { logx.Warn("block too many txs", "count", len(blk.Txs), "max", maxTxs); continue }
@@ -555,6 +567,14 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
                 seen[id] = struct{}{}
             }
             if dup { logx.Warn("block duplicate txid"); continue }
+            // Optional timestamp monotonicity: check against parent if known on disk
+            if len(blk.PrevHash) > 0 {
+                prevTS, ok := loadBlockTimestamp(expectedChain, hex.EncodeToString(blk.PrevHash))
+                if ok && blk.Timestamp.Before(prevTS) {
+                    logx.Warn("block timestamp before parent", "height", blk.Height)
+                    continue
+                }
+            }
 			// re-validate txs (basic)
 			ok := true
 			for _, tx := range blk.Txs {
@@ -622,8 +642,8 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 }
 
 // StartBlockSubscriberWithMempool wires block acceptance to mempool cleanup by txid.
-func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, pool *mempool.Pool, logPrune bool, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
-    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName, logQueue, maxTxs, maxBytes)
+func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, expectedChain string, pool *mempool.Pool, logPrune bool, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
+    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName, expectedChain, logQueue, maxTxs, maxBytes)
     if err != nil { return nil, err }
     // Subscribe again just to observe accepted blocks and prune mempool.
     sub, err := topic.Subscribe()
