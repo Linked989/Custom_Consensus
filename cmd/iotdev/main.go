@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,26 +40,28 @@ type device struct {
 }
 
 func main() {
-    // Flags
-    base := flag.String("base", "http://localhost:14000", "gateway base URL (no trailing slash)")
-    chain := flag.String("chain", "iotnet-main", "chain/network id")
-    n := flag.Int("devices", 5, "number of simulated devices")
-    interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
-    jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
-    once := flag.Bool("once", false, "send just one reading per device then exit")
-    list := flag.Bool("list", false, "list devices connected to the node and exit")
-    flag.Parse()
+	// Flags
+	base := flag.String("base", "http://localhost:14000", "gateway base URL (no trailing slash)")
+	chain := flag.String("chain", "iotnet-main", "chain/network id")
+	n := flag.Int("devices", 5, "number of simulated devices")
+	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
+	jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
+	once := flag.Bool("once", false, "send just one reading per device then exit")
+	list := flag.Bool("list", false, "list devices connected to the node and exit")
+	flag.Parse()
 
 	// Context and signals
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-    if *list {
-        if err := listDevices(*base); err != nil { log.Fatalf("list: %v", err) }
-        return
-    }
+	if *list {
+		if err := listDevices(*base); err != nil {
+			log.Fatalf("list: %v", err)
+		}
+		return
+	}
 
-    // Create devices and register
+	// Create devices and register
 	devs := make([]device, *n)
 	for i := 0; i < *n; i++ {
 		pub, priv, err := ed25519.GenerateKey(crand.Reader)
@@ -141,12 +144,16 @@ func registerDevice(base string, d device) error {
 }
 
 func listDevices(base string) error {
-    resp, err := http.Get(strings.TrimRight(base, "/") + "/iot/devices")
-    if err != nil { return err }
-    defer resp.Body.Close()
-    if resp.StatusCode >= 300 { return fmt.Errorf("status %s", resp.Status) }
-    io.Copy(os.Stdout, resp.Body)
-    return nil
+	resp, err := http.Get(strings.TrimRight(base, "/") + "/iot/devices")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status %s", resp.Status)
+	}
+	io.Copy(os.Stdout, resp.Body)
+	return nil
 }
 
 func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID string, seq uint64) ([]byte, string, error) {
