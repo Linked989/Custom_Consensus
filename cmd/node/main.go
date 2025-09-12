@@ -71,6 +71,7 @@ func main() {
     listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
     listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
     cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
+    cellMax := flag.Int("cell-max-devices", 0, "maximum devices to include in a Cell (0 = unlimited)")
 	var bootstraps multiFlag
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
 	flag.Parse()
@@ -141,7 +142,7 @@ func main() {
 	devReg := iot.NewRegistry(*chainID)
 	iot.RegisterIotHandler(h, devReg)
     // Cell manager (uses registry)
-	cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin)
+    cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin, *cellMax)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
