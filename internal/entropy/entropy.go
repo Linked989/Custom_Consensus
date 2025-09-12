@@ -1,6 +1,7 @@
 package entropy
 
 import (
+    "errors"
     "math"
 
     cbor "github.com/fxamacker/cbor/v2"
@@ -8,6 +9,8 @@ import (
     "pose/internal/cell"
     "pose/internal/mempool"
 )
+
+var errInvalid = errors.New("invalid data")
 
 // ComputeCellEntropy computes a Shannon entropy score over only the IoT data
 // section (payload[8]) of transactions from devices that belong to the given cell.
@@ -67,7 +70,7 @@ func extractDataPart(b []byte) ([]byte, error) {
 }
 
 func dataFromArray(arr []interface{}) ([]byte, error) {
-    if len(arr) != 4 { return nil, cbor.ErrInvalidData }
+    if len(arr) != 4 { return nil, errInvalid }
     var payload []byte
     switch v := arr[2].(type) {
     case []byte:
@@ -75,7 +78,7 @@ func dataFromArray(arr []interface{}) ([]byte, error) {
     case cbor.RawMessage:
         payload = []byte(v)
     default:
-        return nil, cbor.ErrInvalidData
+        return nil, errInvalid
     }
     // Decode payload into a map, extract key 8, and re-encode just that value
     var pl map[int]interface{}
@@ -90,10 +93,10 @@ func dataFromArray(arr []interface{}) ([]byte, error) {
         if v, ok := any[int(8)]; ok {
             return cbor.Marshal(v)
         }
-        return nil, cbor.ErrInvalidData
+        return nil, errInvalid
     }
     if v, ok := pl[8]; ok {
         return cbor.Marshal(v)
     }
-    return nil, cbor.ErrInvalidData
+    return nil, errInvalid
 }
