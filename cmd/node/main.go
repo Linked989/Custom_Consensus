@@ -14,6 +14,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
 	"pose/internal/blockchain"
+	"pose/internal/cell"
 	"pose/internal/dev"
 	"pose/internal/gossip"
 	"pose/internal/httpapi"
@@ -37,16 +38,16 @@ func main() {
 	statsInterval := flag.Duration("stats", 5*time.Second, "stats log interval (0=off)")
 	memberTTL := flag.Duration("ttl", 10*time.Second, "membership entry TTL")
 	// Gossip
-    chainID := flag.String("chain-id", "iotnet-main", "chain/network id")
-    txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
+	chainID := flag.String("chain-id", "iotnet-main", "chain/network id")
+	txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
 	blockTopicName := flag.String("block-topic", "pose/block/1.0.0", "pubsub topic for blocks")
 	produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
 	blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
 	blockMax := flag.Int("block-max", 100, "max txs per block")
 	blockBytesMax := flag.Int("block-bytes-max", 0, "max total tx bytes per block (0 = unlimited)")
-    memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
-    memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
-    memBytesCap := flag.Int("mempool-bytes-cap", 0, "mempool max total bytes (0 = unlimited)")
+	memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
+	memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
+	memBytesCap := flag.Int("mempool-bytes-cap", 0, "mempool max total bytes (0 = unlimited)")
 	// Logging toggles
 	logHeartbeats := flag.Bool("log-heartbeats", false, "log every heartbeat message")
 	logTx := flag.Bool("log-tx", false, "log every accepted tx from gossip")
@@ -67,16 +68,16 @@ func main() {
 	// Logging
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
-    listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
-    listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
+	listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
+	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
 	var bootstraps multiFlag
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
 	flag.Parse()
 
 	// Configure logging first
 	logx.Configure(*logLevel, *logFormat)
-    // Configure P2P chain handshake
-    p2p.SetChainID(*chainID)
+	// Configure P2P chain handshake
+	p2p.SetChainID(*chainID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -110,16 +111,16 @@ func main() {
 		logx.Info("pnet enabled")
 	}
 
-    // set data dir before services start
-    if err := blockchain.SetDataDir(*dataDir); err != nil {
-        logx.Error("data dir", "err", err)
-        os.Exit(1)
-    }
-    // also use same dir for IoT registry
-    if err := iot.SetDataDir(*dataDir); err != nil {
-        logx.Error("iot data dir", "err", err)
-        os.Exit(1)
-    }
+	// set data dir before services start
+	if err := blockchain.SetDataDir(*dataDir); err != nil {
+		logx.Error("data dir", "err", err)
+		os.Exit(1)
+	}
+	// also use same dir for IoT registry
+	if err := iot.SetDataDir(*dataDir); err != nil {
+		logx.Error("iot data dir", "err", err)
+		os.Exit(1)
+	}
 
 	h, err := p2p.NewHost(listen, psk)
 	if err != nil {
@@ -135,13 +136,13 @@ func main() {
 
 	// Hello stream handler: register announced device keys and peer addrs
 	p2p.RegisterHelloHandler(h)
-    // IoT registry and libp2p device registration protocol
-    devReg := iot.NewRegistry(*chainID)
-    iot.RegisterIotHandler(h, devReg)
-    // Cell manager (uses registry)
-    cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
-    // Note: flags are already parsed; read env override or use default value
-    cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin)
+	// IoT registry and libp2p device registration protocol
+	devReg := iot.NewRegistry(*chainID)
+	iot.RegisterIotHandler(h, devReg)
+	// Cell manager (uses registry)
+	cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
+	// Note: flags are already parsed; read env override or use default value
+	cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
@@ -163,7 +164,7 @@ func main() {
 		os.Exit(1)
 	}
 	// Local mempool
-    pool := mempool.New(*memCapacity, *memTTL, *memBytesCap)
+	pool := mempool.New(*memCapacity, *memTTL, *memBytesCap)
 
 	members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
 		m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)
@@ -181,10 +182,10 @@ func main() {
 		os.Exit(1)
 	}
 
-    if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
-        defer srv.Shutdown(ctx)
-    }
+	if *httpIn != "" {
+		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
+		defer srv.Shutdown(ctx)
+	}
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
@@ -193,55 +194,55 @@ func main() {
 	// Block gossip: subscribe always; optionally produce
 	// enable block sync protocol
 	blockchain.RegisterBlockSync(h)
-    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax)
+	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax)
 	if err != nil {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
-    if *produceBlocks {
-        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax); err != nil {
-            logx.Error("block builder", "err", err)
-            os.Exit(1)
-        }
-    }
+	if *produceBlocks {
+		if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax); err != nil {
+			logx.Error("block builder", "err", err)
+			os.Exit(1)
+		}
+	}
 
-    if statsInterval != nil && *statsInterval > 0 {
-        go func() {
-            t := time.NewTicker(*statsInterval)
-            defer t.Stop()
-            for {
-                select {
-                case <-ctx.Done():
-                    return
-                case <-t.C:
-                    all := members.CountAndSweep()
-                    connected := len(h.Network().Peers())
-                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
-                    // Try to form a cell when threshold is met
-                    if c := cellMgr.TryForm(devReg); c != nil {
-                        logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
-                    }
-                }
-            }
-        }()
-    }
+	if statsInterval != nil && *statsInterval > 0 {
+		go func() {
+			t := time.NewTicker(*statsInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					all := members.CountAndSweep()
+					connected := len(h.Network().Peers())
+					logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
+					// Try to form a cell when threshold is met
+					if c := cellMgr.TryForm(devReg); c != nil {
+						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
+					}
+				}
+			}
+		}()
+	}
 
-    // Periodically list IoT devices if requested
-    if *listIot && listIotInterval != nil && *listIotInterval > 0 {
-        go func() {
-            t := time.NewTicker(*listIotInterval)
-            defer t.Stop()
-            for {
-                select {
-                case <-ctx.Done():
-                    return
-                case <-t.C:
-                    devs := devReg.List()
-                    logx.Info("iot devices", "count", len(devs), "devices", devs)
-                }
-            }
-        }()
-    }
+	// Periodically list IoT devices if requested
+	if *listIot && listIotInterval != nil && *listIotInterval > 0 {
+		go func() {
+			t := time.NewTicker(*listIotInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					devs := devReg.List()
+					logx.Info("iot devices", "count", len(devs), "devices", devs)
+				}
+			}
+		}()
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
