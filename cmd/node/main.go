@@ -67,6 +67,8 @@ func main() {
 	// Logging
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
+    listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
+    listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
 	var bootstraps multiFlag
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
 	flag.Parse()
@@ -199,22 +201,39 @@ func main() {
         }
     }
 
-	if statsInterval != nil && *statsInterval > 0 {
-		go func() {
-			t := time.NewTicker(*statsInterval)
-			defer t.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.C:
-					all := members.CountAndSweep()
-					connected := len(h.Network().Peers())
-					logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
-				}
-			}
-		}()
-	}
+    if statsInterval != nil && *statsInterval > 0 {
+        go func() {
+            t := time.NewTicker(*statsInterval)
+            defer t.Stop()
+            for {
+                select {
+                case <-ctx.Done():
+                    return
+                case <-t.C:
+                    all := members.CountAndSweep()
+                    connected := len(h.Network().Peers())
+                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
+                }
+            }
+        }()
+    }
+
+    // Periodically list IoT devices if requested
+    if *listIot && listIotInterval != nil && *listIotInterval > 0 {
+        go func() {
+            t := time.NewTicker(*listIotInterval)
+            defer t.Stop()
+            for {
+                select {
+                case <-ctx.Done():
+                    return
+                case <-t.C:
+                    devs := devReg.List()
+                    logx.Info("iot devices", "count", len(devs), "devices", devs)
+                }
+            }
+        }()
+    }
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
