@@ -4,6 +4,8 @@ import (
     "bufio"
     "encoding/hex"
     "encoding/json"
+    "os"
+    "path/filepath"
     "strings"
     "sync"
     "time"
@@ -50,7 +52,9 @@ type Registry struct {
 }
 
 func NewRegistry(chainID string) *Registry {
-    return &Registry{chainID: chainID, byID: make(map[string]Device)}
+    r := &Registry{chainID: chainID, byID: make(map[string]Device)}
+    _ = r.load()
+    return r
 }
 
 // List returns a snapshot of registered devices.
@@ -68,6 +72,7 @@ func (r *Registry) Upsert(d Device) {
     if ok { d.FirstSeen = prev.FirstSeen } else if d.FirstSeen.IsZero() { d.FirstSeen = time.Now() }
     if d.LastSeen.IsZero() { d.LastSeen = time.Now() }
     r.byID[d.DeviceID] = d
+    _ = r.saveLocked()
 }
 
 // RegisterIotHandler installs a libp2p handler that accepts IoT hello messages.
@@ -103,3 +108,27 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
     })
 }
 
+// ---- persistence ----
+var dataDir string
+
+// SetDataDir configures the root directory where devices.json will be stored.
+func SetDataDir(dir string) error { dataDir = dir; return os.MkdirAll(dir, 0o755) }
+
+func (r *Registry) path() string { return filepath.Join(dataDir, r.chainID, "devices.json") }
+
+func (r *Registry) saveLocked() error {
+    if dataDir == "" { return nil }
+    if err := os.MkdirAll(filepath.Dir(r.path()), 0o755); err != nil { return err }
+    by, _ := json.MarshalIndent(r.byID, "", "  ")
+    return os.WriteFile(r.path(), by, 0o644)
+}
+
+func (r *Registry) load() error {
+    if dataDir == "" { return nil }
+    by, err := os.ReadFile(r.path())
+    if err != nil { return err }
+    var m map[string]Device
+    if err := json.Unmarshal(by, &m); err != nil { return err }
+    r.byID = m
+    return nil
+}

@@ -108,11 +108,16 @@ func main() {
 		logx.Info("pnet enabled")
 	}
 
-	// set data dir before services start
-	if err := blockchain.SetDataDir(*dataDir); err != nil {
-		logx.Error("data dir", "err", err)
-		os.Exit(1)
-	}
+    // set data dir before services start
+    if err := blockchain.SetDataDir(*dataDir); err != nil {
+        logx.Error("data dir", "err", err)
+        os.Exit(1)
+    }
+    // also use same dir for IoT registry
+    if err := iot.SetDataDir(*dataDir); err != nil {
+        logx.Error("iot data dir", "err", err)
+        os.Exit(1)
+    }
 
 	h, err := p2p.NewHost(listen, psk)
 	if err != nil {
