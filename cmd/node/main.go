@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"time"
+    "sync"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
@@ -22,6 +23,7 @@ import (
 	"pose/internal/logx"
 	"pose/internal/mempool"
 	"pose/internal/p2p"
+    "pose/internal/entropy"
 )
 
 const mdnsServiceTag = "pose-simple-mdns"
@@ -207,6 +209,7 @@ func main() {
 	}
 
 	if statsInterval != nil && *statsInterval > 0 {
+		var entropyOnce sync.Once
 		go func() {
 			t := time.NewTicker(*statsInterval)
 			defer t.Stop()
@@ -221,6 +224,13 @@ func main() {
 					// Try to form a cell when threshold is met
 					if c := cellMgr.TryForm(devReg); c != nil {
 						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
+						entropyOnce.Do(func() {
+							// tiny delay to accumulate a few tx samples
+							time.Sleep(1 * time.Second)
+							entries := pool.Snapshot()
+							score, used := entropy.ComputeCellEntropy(c, entries)
+							logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", fmt.Sprintf("%.4f", score))
+						})
 					}
 				}
 			}

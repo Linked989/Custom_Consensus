@@ -39,6 +39,17 @@ func (p *Pool) Len() int {
     return len(p.entries)
 }
 
+// Snapshot returns a copy of all current entries.
+func (p *Pool) Snapshot() []*Entry {
+    p.mu.Lock(); defer p.mu.Unlock()
+    p.sweepLocked()
+    out := make([]*Entry, 0, len(p.entries))
+    for _, e := range p.entries {
+        out = append(out, e)
+    }
+    return out
+}
+
 // AddValidatedCOSE validates a COSE tx, applies replay rules, and inserts it if new.
 func (p *Pool) AddValidatedCOSE(b []byte) (*Entry, error) {
     txid, devID, seq, err := coseutil.ValidateCOSETx(b)
