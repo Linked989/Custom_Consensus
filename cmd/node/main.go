@@ -68,8 +68,9 @@ func main() {
 	// Logging
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
-	listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
-	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
+    listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
+    listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
+    cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
 	var bootstraps multiFlag
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
 	flag.Parse()
@@ -139,9 +140,7 @@ func main() {
 	// IoT registry and libp2p device registration protocol
 	devReg := iot.NewRegistry(*chainID)
 	iot.RegisterIotHandler(h, devReg)
-	// Cell manager (uses registry)
-	cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
-	// Note: flags are already parsed; read env override or use default value
+    // Cell manager (uses registry)
 	cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin)
 
 	if *enableMDNS {
