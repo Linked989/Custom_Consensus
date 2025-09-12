@@ -7,6 +7,8 @@ import (
     "encoding/json"
     "strconv"
     "strings"
+    "crypto/ed25519"
+    "encoding/hex"
 
     pubsub "github.com/libp2p/go-libp2p-pubsub"
     "github.com/libp2p/go-libp2p/core/host"
@@ -38,6 +40,17 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         out := map[string]any{"chain_id": chainID, "tip_height": th, "tip_hash": thash, "peers": len(peers), "mempool": pool.Len()}
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(out)
+    })
+    // POST /keys/register {kid: hex, pub: hex}
+    mux.HandleFunc("/keys/register", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
+        var req struct{ Kid string `json:"kid"`; Pub string `json:"pub"` }
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "bad json", http.StatusBadRequest); return }
+        kid, err1 := hex.DecodeString(req.Kid)
+        pub, err2 := hex.DecodeString(req.Pub)
+        if err1 != nil || err2 != nil || len(pub) != ed25519.PublicKeySize || len(kid) == 0 { http.Error(w, "bad key", http.StatusBadRequest); return }
+        coseutil.RegistryRegister(kid, ed25519.PublicKey(pub))
+        w.WriteHeader(http.StatusNoContent)
     })
     // GET /block/{hash}
     mux.HandleFunc("/block/", func(w http.ResponseWriter, r *http.Request) {
