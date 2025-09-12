@@ -28,8 +28,11 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         body, err := io.ReadAll(r.Body); if err != nil { http.Error(w, "read error", http.StatusBadRequest); return }
         txid, devID, seq, err := coseutil.ValidateCOSETx(body)
         if err != nil { http.Error(w, "invalid tx", http.StatusBadRequest); return }
-        if !coseutil.UpdateLastSeq(devID, seq) { http.Error(w, "replay", http.StatusBadRequest); return }
+        // Do NOT update the replay window here; let mempool admission own it to avoid
+        // marking this seq as used before local pubsub delivers to our subscriber.
         if err := txTopic.Publish(ctx, body); err != nil { http.Error(w, "publish failed", http.StatusInternalServerError); return }
+        // Best-effort: insert locally as well (duplicate will be ignored by mempool)
+        if pool != nil { _, _ = pool.AddValidatedCOSE(body) }
         logx.Info("http accepted", "txid", txid, "dev", devID, "seq", seq)
         w.WriteHeader(http.StatusAccepted)
     })
