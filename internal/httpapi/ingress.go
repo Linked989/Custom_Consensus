@@ -21,6 +21,7 @@ import (
     "pose/internal/mempool"
     "pose/internal/iot"
     "pose/internal/cell"
+    "pose/internal/entropy"
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
@@ -109,6 +110,23 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         st := cellMgr.Status()
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(st)
+    })
+    // GET /cell/entropy: recompute entropy now and return summary + per-device breakdown
+    mux.HandleFunc("/cell/entropy", func(w http.ResponseWriter, r *http.Request) {
+        st := cellMgr.Status()
+        resp := map[string]any{
+            "cell_active": st.Active,
+            "cell_id": st.ID,
+            "devices": len(st.Devices),
+        }
+        entries := pool.Snapshot()
+        score, used := entropy.ComputeCellEntropy(st, entries)
+        per := entropy.ComputePerDeviceEntropy(st, entries)
+        resp["entropy_bits_per_byte"] = score
+        resp["tx_samples"] = used
+        resp["per_device"] = per
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(resp)
     })
     // GET /iot/devices
     mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {

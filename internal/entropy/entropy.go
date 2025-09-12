@@ -12,6 +12,12 @@ import (
 
 var errInvalid = errors.New("invalid data")
 
+// Stat represents an entropy result with the number of tx samples used.
+type Stat struct {
+    Entropy float64 `json:"entropy_bits_per_byte"`
+    Samples int     `json:"tx_samples"`
+}
+
 // ComputeCellEntropy computes a Shannon entropy score over only the IoT data
 // section (payload[8]) of transactions from devices that belong to the given cell.
 // If no applicable bytes are available, returns 0.
@@ -34,6 +40,31 @@ func ComputeCellEntropy(c *cell.Cell, entries []*mempool.Entry) (float64, int) {
     }
     if len(all) == 0 { return 0, 0 }
     return shannon(all), count
+}
+
+// ComputePerDeviceEntropy computes entropy per device (for devices in the cell)
+// using only each device's IoT data sections.
+func ComputePerDeviceEntropy(c *cell.Cell, entries []*mempool.Entry) map[string]Stat {
+    out := make(map[string]Stat)
+    if c == nil || !c.Active || len(entries) == 0 {
+        return out
+    }
+    ids := make(map[string]struct{}, len(c.Devices))
+    for _, d := range c.Devices { ids[d.DeviceID] = struct{}{} }
+
+    byDev := make(map[string][]byte, len(c.Devices))
+    cnt := make(map[string]int, len(c.Devices))
+    for _, e := range entries {
+        if _, ok := ids[e.DevID]; !ok { continue }
+        if dataPart, err := extractDataPart(e.Bytes); err == nil && len(dataPart) > 0 {
+            byDev[e.DevID] = append(byDev[e.DevID], dataPart...)
+            cnt[e.DevID]++
+        }
+    }
+    for dev, bytes := range byDev {
+        out[dev] = Stat{Entropy: shannon(bytes), Samples: cnt[dev]}
+    }
+    return out
 }
 
 // shannon computes Shannon entropy (bits per byte) for the given bytes.
