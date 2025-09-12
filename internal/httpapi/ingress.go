@@ -104,11 +104,6 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         }
         http.NotFound(w, r)
     })
-    // GET /iot/devices
-    mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(devReg.List())
-    })
     // GET /cell/status
     mux.HandleFunc("/cell/status", func(w http.ResponseWriter, r *http.Request) {
         st := cellMgr.Status()
