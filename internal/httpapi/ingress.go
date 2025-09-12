@@ -20,10 +20,11 @@ import (
     "pose/internal/blockchain"
     "pose/internal/mempool"
     "pose/internal/iot"
+    "pose/internal/cell"
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry) *http.Server {
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager) *http.Server {
     mux := http.NewServeMux()
     mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
@@ -102,6 +103,17 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
             return
         }
         http.NotFound(w, r)
+    })
+    // GET /iot/devices
+    mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(devReg.List())
+    })
+    // GET /cell/status
+    mux.HandleFunc("/cell/status", func(w http.ResponseWriter, r *http.Request) {
+        st := cellMgr.Status()
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(st)
     })
     // GET /iot/devices
     mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {

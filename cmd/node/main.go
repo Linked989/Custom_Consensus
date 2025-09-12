@@ -138,6 +138,10 @@ func main() {
     // IoT registry and libp2p device registration protocol
     devReg := iot.NewRegistry(*chainID)
     iot.RegisterIotHandler(h, devReg)
+    // Cell manager (uses registry)
+    cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
+    // Note: flags are already parsed; read env override or use default value
+    cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
@@ -178,7 +182,7 @@ func main() {
 	}
 
     if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg)
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
         defer srv.Shutdown(ctx)
     }
 
@@ -213,6 +217,10 @@ func main() {
                     all := members.CountAndSweep()
                     connected := len(h.Network().Peers())
                     logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
+                    // Try to form a cell when threshold is met
+                    if c := cellMgr.TryForm(devReg); c != nil {
+                        logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
+                    }
                 }
             }
         }()
