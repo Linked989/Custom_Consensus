@@ -117,6 +117,36 @@ func ValidateCOSETx(b []byte) (string, string, int64, error) {
     return hex.EncodeToString(txid[:]), devID, seq, nil
 }
 
+// ExtractKid returns the key id (kid) from a COSE_Sign1 message without verifying it.
+func ExtractKid(b []byte) ([]byte, error) {
+    var tag cbor.Tag
+    var arr []interface{}
+    if err := decMode.Unmarshal(b, &tag); err == nil && tag.Number == 18 {
+        var ok bool
+        if arr, ok = tag.Content.([]interface{}); !ok { return nil, fmt.Errorf("cose: bad content") }
+    } else {
+        if err := decMode.Unmarshal(b, &arr); err != nil { return nil, err }
+    }
+    if len(arr) != 4 { return nil, fmt.Errorf("cose: array len %d", len(arr)) }
+    var prot []byte
+    switch v := arr[0].(type) {
+    case []byte:
+        prot = v
+    case cbor.RawMessage:
+        prot = []byte(v)
+    case map[int]interface{}, map[uint64]interface{}, map[int64]interface{}, map[interface{}]interface{}:
+        b2, err := encMode.Marshal(v); if err != nil { return nil, err }
+        prot = b2
+    default:
+        return nil, fmt.Errorf("cose: protected not bstr")
+    }
+    var ph map[int]interface{}
+    if err := decMode.Unmarshal(prot, &ph); err != nil { return nil, err }
+    kidv, ok := ph[4]; if !ok { return nil, fmt.Errorf("cose: missing kid") }
+    kid, ok := kidv.([]byte); if !ok { return nil, fmt.Errorf("cose: kid type") }
+    return kid, nil
+}
+
 // BuildDevCOSE creates a synthetic payload and wraps it into COSE_Sign1 tag(18).
 func BuildDevCOSE(priv ed25519.PrivateKey, kid []byte, h host.Host, seq uint64) ([]byte, string, error) {
     did := "did:iot:DEV-" + shortPeer(h.ID().String())

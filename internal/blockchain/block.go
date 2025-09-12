@@ -598,14 +598,21 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
                     continue
                 }
             }
-			// re-validate txs (basic)
-			ok := true
-			for _, tx := range blk.Txs {
-				if _, _, _, err := coseutil.ValidateCOSETx(tx); err != nil {
-					ok = false
-					break
-				}
-			}
+            // re-validate txs (basic) with on-demand key fetch
+            ok := true
+            for _, tx := range blk.Txs {
+                if _, _, _, err := coseutil.ValidateCOSETx(tx); err != nil {
+                    if strings.Contains(err.Error(), "unknown kid") {
+                        if kid, kerr := coseutil.ExtractKid(tx); kerr == nil {
+                            if fetchAndRegisterKey(ctx, h, kid) {
+                                if _, _, _, err2 := coseutil.ValidateCOSETx(tx); err2 == nil { continue }
+                            }
+                        }
+                    }
+                    ok = false
+                    break
+                }
+            }
             if !ok { logx.Warn("block contains invalid txs"); continue }
 
 			// chain checks with out-of-order tolerance
@@ -759,6 +766,15 @@ func RegisterBlockSync(h host.Host) {
         for i := range proof { phex[i] = hex.EncodeToString(proof[i]) }
         resp := map[string]any{"ok":true, "index":idx, "proof":phex, "tx_root":hex.EncodeToString(root)}
         b,_ := json.Marshal(resp); s.Write(append(b,'\n'))
+    case "getkey":
+        var kreq struct{ Type, Kid string }
+        if json.Unmarshal([]byte(strings.TrimSpace(line)), &kreq) != nil { return }
+        kb, err := hex.DecodeString(kreq.Kid); if err != nil { return }
+        if pub, ok := coseutil.RegistryGet(kb); ok {
+            resp := map[string]any{"ok": true, "kid": strings.ToLower(kreq.Kid), "pub": hex.EncodeToString(pub)}
+            b, _ := json.Marshal(resp); s.Write(append(b, '\n')); return
+        }
+        b, _ := json.Marshal(map[string]any{"ok": false}); s.Write(append(b, '\n'))
     default:
         return
     }
@@ -813,4 +829,26 @@ func fetchAndInjectParent(ctx context.Context, h host.Host, chainID string, pare
 		// stop after first success
 		return
 	}
+}
+
+// fetchAndRegisterKey requests a key from peers and registers it locally.
+func fetchAndRegisterKey(ctx context.Context, h host.Host, kid []byte) bool {
+    hexKid := hex.EncodeToString(kid)
+    for _, pid := range h.Network().Peers() {
+        s, err := h.NewStream(ctx, pid, blockSyncProto)
+        if err != nil { continue }
+        req := map[string]string{"type":"getkey", "kid": strings.ToLower(hexKid)}
+        by, _ := json.Marshal(req)
+        s.Write(append(by, '\n'))
+        r := bufio.NewReader(s)
+        line, err := r.ReadString('\n')
+        s.Close()
+        if err != nil { continue }
+        var resp struct{ Ok bool; Kid string; Pub string }
+        if json.Unmarshal([]byte(strings.TrimSpace(line)), &resp) != nil || !resp.Ok { continue }
+        pub, err := hex.DecodeString(resp.Pub); if err != nil { continue }
+        coseutil.RegistryRegister(kid, ed25519.PublicKey(pub))
+        return true
+    }
+    return false
 }
