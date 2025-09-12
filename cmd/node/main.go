@@ -17,6 +17,7 @@ import (
 	"pose/internal/dev"
 	"pose/internal/gossip"
 	"pose/internal/httpapi"
+	"pose/internal/iot"
 	"pose/internal/logx"
 	"pose/internal/mempool"
 	"pose/internal/p2p"
@@ -127,6 +128,9 @@ func main() {
 
 	// Hello stream handler: register announced device keys and peer addrs
 	p2p.RegisterHelloHandler(h)
+    // IoT registry and libp2p device registration protocol
+    devReg := iot.NewRegistry(*chainID)
+    iot.RegisterIotHandler(h, devReg)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
@@ -167,7 +171,7 @@ func main() {
 	}
 
     if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID)
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg)
         defer srv.Shutdown(ctx)
     }
 

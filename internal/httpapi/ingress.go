@@ -9,6 +9,8 @@ import (
     "strings"
     "crypto/ed25519"
     "encoding/hex"
+    "crypto/sha256"
+    "time"
 
     pubsub "github.com/libp2p/go-libp2p-pubsub"
     "github.com/libp2p/go-libp2p/core/host"
@@ -17,10 +19,11 @@ import (
     "pose/internal/logx"
     "pose/internal/blockchain"
     "pose/internal/mempool"
+    "pose/internal/iot"
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string) *http.Server {
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry) *http.Server {
     mux := http.NewServeMux()
     mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
@@ -99,6 +102,35 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
             return
         }
         http.NotFound(w, r)
+    })
+    // GET /iot/devices
+    mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(devReg.List())
+    })
+    // POST /iot/register: {device_id, firmware, model, kid, pub, sensors[], caps[]}
+    mux.HandleFunc("/iot/register", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
+        var req struct{
+            DeviceID string `json:"device_id"`
+            Firmware string `json:"firmware"`
+            Model    string `json:"model"`
+            Kid      string `json:"kid"`
+            Pub      string `json:"pub"`
+            Sensors  []string `json:"sensors"`
+            Caps     []string `json:"caps"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "bad json", http.StatusBadRequest); return }
+        // basic checks
+        if req.DeviceID == "" || req.Kid == "" || req.Pub == "" { http.Error(w, "missing fields", http.StatusBadRequest); return }
+        pub, err := hex.DecodeString(req.Pub); if err != nil || len(pub) != ed25519.PublicKeySize { http.Error(w, "bad pub", http.StatusBadRequest); return }
+        if _, err := hex.DecodeString(req.Kid); err != nil { http.Error(w, "bad kid", http.StatusBadRequest); return }
+        // save in device registry and key registry for tx validation
+        // Derive kid from pub (sha256(pub)[:8]) if none, and register for COSE validation
+        kid := sha256.Sum256(pub)
+        devReg.Upsert(iot.Device{DeviceID: req.DeviceID, Firmware: req.Firmware, Model: req.Model, KidHex: strings.ToLower(hex.EncodeToString(kid[:8])), PubHex: strings.ToLower(req.Pub), Sensors: req.Sensors, Caps: req.Caps, FirstSeen: time.Now(), LastSeen: time.Now()})
+        coseutil.RegistryRegister(kid[:8], ed25519.PublicKey(pub))
+        w.WriteHeader(http.StatusNoContent)
     })
     srv := &http.Server{Addr: addr, Handler: mux}
     go func() {
