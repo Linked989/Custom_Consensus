@@ -41,7 +41,10 @@ type device struct {
 
 func main() {
 	// Flags
-	base := flag.String("base", "http://localhost:14000", "gateway base URL (no trailing slash)")
+	base := flag.String("base", "http://localhost:14000", "default base URL (no trailing slash); used for TX unless -tx-base provided")
+	txBase := flag.String("tx-base", "", "HTTP base URL to POST /tx and /keys/register (defaults to -base)")
+	regBasesCSV := flag.String("reg-bases", "", "comma-separated HTTP base URLs for /iot/register assignment (defaults to -base)")
+	regCapsCSV := flag.String("reg-caps", "", "comma-separated caps per -reg-bases (0=unlimited). Example: 3,0 means first base gets up to 3, rest unlimited on second")
 	chain := flag.String("chain", "iotnet-main", "chain/network id")
 	n := flag.Int("devices", 5, "number of simulated devices")
 	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
@@ -61,8 +64,21 @@ func main() {
 		return
 	}
 
+	// Resolve TX and registration bases
+	regBases := parseCSV(*regBasesCSV)
+	if len(regBases) == 0 {
+		regBases = []string{strings.TrimRight(*base, "/")}
+	}
+	if *txBase == "" {
+		*txBase = strings.TrimRight(*base, "/")
+	} else {
+		*txBase = strings.TrimRight(*txBase, "/")
+	}
+	regCaps := parseCaps(*regCapsCSV, len(regBases))
+
 	// Create devices and register
 	devs := make([]device, *n)
+	assign := planAssignments(*n, regBases, regCaps)
 	for i := 0; i < *n; i++ {
 		pub, priv, err := ed25519.GenerateKey(crand.Reader)
 		if err != nil {
@@ -71,11 +87,17 @@ func main() {
 		kid := kidFromPub(pub)
 		id := fmt.Sprintf("did:iot:SIM-%x", kid)
 		devs[i] = device{id: id, pub: pub, priv: priv, kid: kid, seq: 0}
-		if err := registerDevice(*base, devs[i]); err != nil {
-			log.Fatalf("register %d: %v", i+1, err)
+		// Register device to assigned registration base for cell membership
+		regBase := assign[i]
+		if err := registerDevice(regBase, devs[i]); err != nil {
+			log.Fatalf("register %d at %s: %v", i+1, regBase, err)
+		}
+		// Also register key on TX node so this device can send TXs there regardless of cell
+		if err := registerKey(*txBase, devs[i]); err != nil {
+			log.Fatalf("register key %d at %s: %v", i+1, *txBase, err)
 		}
 	}
-	log.Printf("registered %d devices", *n)
+	log.Printf("registered %d devices (cell assign=%v) and keys on tx-base=%s", *n, summarizeAssignments(assign), *txBase)
 
 	// Start senders
 	var wg sync.WaitGroup
@@ -90,14 +112,14 @@ func main() {
 					return
 				default:
 				}
-				// Build COSE tx and POST /tx
+				// Build COSE tx and POST /tx (always to tx-base)
 				d.seq++
 				cose, txid, err := buildCOSE(d.priv, d.kid, *chain, d.id, d.seq)
 				if err != nil {
 					log.Printf("build error (%s): %v", d.id, err)
 					return
 				}
-				req, _ := http.NewRequest(http.MethodPost, *base+"/tx", bytes.NewReader(cose))
+				req, _ := http.NewRequest(http.MethodPost, *txBase+"/tx", bytes.NewReader(cose))
 				req.Header.Set("Content-Type", "application/cbor")
 				resp, err := cli.Do(req)
 				if err != nil {
@@ -128,7 +150,26 @@ func registerDevice(base string, d device) error {
 	// HTTP: POST /iot/register {device_id, firmware, model, kid, pub}
 	body := fmt.Sprintf(`{"device_id":"%s","firmware":"1.0.0","model":"sim-sensor","kid":"%s","pub":"%s","sensors":["temp","humidity"],"caps":["push"]}`,
 		d.id, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
-	req, _ := http.NewRequest(http.MethodPost, base+"/iot/register", bytes.NewReader([]byte(body)))
+	req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(base, "/")+"/iot/register", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	cli := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status %s", resp.Status)
+	}
+	return nil
+}
+
+func registerKey(base string, d device) error {
+	// HTTP: POST /keys/register {kid: hex, pub: hex}
+	body := fmt.Sprintf(`{"kid":"%s","pub":"%s"}`,
+		hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
+	req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(base, "/")+"/keys/register", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	cli := &http.Client{Timeout: 5 * time.Second}
 	resp, err := cli.Do(req)
@@ -205,4 +246,63 @@ func short(s string) string {
 		return s[len(s)-12:]
 	}
 	return s
+}
+
+// parseCSV splits a comma-separated list and trims empties/spaces.
+func parseCSV(s string) []string {
+	if strings.TrimSpace(s) == "" { return nil }
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" { continue }
+		out = append(out, strings.TrimRight(p, "/"))
+	}
+	return out
+}
+
+// parseCaps parses caps CSV into a slice of length n (or 0s if empty).
+func parseCaps(s string, n int) []int {
+	if strings.TrimSpace(s) == "" { return make([]int, n) }
+	parts := strings.Split(s, ",")
+	caps := make([]int, n)
+	for i := 0; i < n; i++ {
+		if i < len(parts) {
+			v := strings.TrimSpace(parts[i])
+			if v == "" { caps[i] = 0; continue }
+			var val int
+			_, err := fmt.Sscanf(v, "%d", &val)
+			if err != nil { val = 0 }
+			if val < 0 { val = 0 }
+			caps[i] = val
+		} else {
+			caps[i] = 0
+		}
+	}
+	return caps
+}
+
+// planAssignments returns a per-device chosen registration base URL,
+// honoring caps (0 = unlimited). Devices are assigned in order, filling
+// the first base up to its cap, then the next, etc.
+func planAssignments(n int, bases []string, caps []int) []string {
+	assign := make([]string, n)
+	counts := make([]int, len(bases))
+	for i := 0; i < n; i++ {
+		chosen := -1
+		for j := 0; j < len(bases); j++ {
+			if caps[j] == 0 || counts[j] < caps[j] { chosen = j; break }
+		}
+		if chosen == -1 { chosen = len(bases) - 1 }
+		assign[i] = bases[chosen]
+		counts[chosen]++
+	}
+	return assign
+}
+
+// summarizeAssignments prints counts per base for logging.
+func summarizeAssignments(assign []string) map[string]int {
+	counts := map[string]int{}
+	for _, b := range assign { counts[b]++ }
+	return counts
 }
