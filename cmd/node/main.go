@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"strings"
 	"time"
-    "sync"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
@@ -187,7 +186,7 @@ func main() {
 	}
 
     // AION network service (commit/reveal/VRF + selection); enabled by default
-    aionSvc := aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams())
+    aionSvc := aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams(), cellMgr)
 
     if *httpIn != "" {
         srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
@@ -217,35 +216,26 @@ func main() {
         }
     }
 
-	if statsInterval != nil && *statsInterval > 0 {
-		var entropyOnce sync.Once
-		go func() {
-			t := time.NewTicker(*statsInterval)
-			defer t.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.C:
-					all := members.CountAndSweep()
-					connected := len(h.Network().Peers())
-					logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
-					// Try to form a cell when threshold is met
-					if c := cellMgr.TryForm(devReg); c != nil {
-						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
-                    entropyOnce.Do(func() {
-                        // small delay to allow initial blocks/txs
-                        time.Sleep(1 * time.Second)
-                        // Compute entropy from on-chain data for cell devices over the last epoch window
-                        win := int64(aion.DefaultParams().EpochLength)
-                        score, used := entropy.ComputeCellEntropyFromChain(*chainID, c, win)
-                        logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", fmt.Sprintf("%.4f", score))
-                    })
-					}
-				}
-			}
-		}()
-	}
+    if statsInterval != nil && *statsInterval > 0 {
+        go func() {
+            t := time.NewTicker(*statsInterval)
+            defer t.Stop()
+            for {
+                select {
+                case <-ctx.Done():
+                    return
+                case <-t.C:
+                    all := members.CountAndSweep()
+                    connected := len(h.Network().Peers())
+                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
+                    // Try to form a cell when threshold is met
+                    if c := cellMgr.TryForm(devReg); c != nil {
+                        logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
+                    }
+                }
+            }
+        }()
+    }
 
 	// Periodically list IoT devices if requested
 	if *listIot && listIotInterval != nil && *listIotInterval > 0 {

@@ -37,6 +37,7 @@ type Service struct {
     em       cbor.EncMode
     dm       cbor.DecMode
     epochLen uint64
+    cellMgr  *cell.Manager
 
     // local seeds and commits
     seeds   map[uint64][]byte      // epoch -> seed
@@ -52,10 +53,10 @@ type Service struct {
 }
 
 // StartAIONService starts gossip handlers and periodic publisher.
-func StartAIONService(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID string, params Params) *Service {
+func StartAIONService(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID string, params Params, cm *cell.Manager) *Service {
     em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
     dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength,
+    s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
         seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct{ y [32]byte; proof []byte }), leader: make(map[uint64]string)}
     s.run(ctx)
     return s
@@ -92,6 +93,15 @@ func (s *Service) run(ctx context.Context) {
                     // New epoch: publish reveal+vrf for e if we have commit; publish commit for e+1
                     s.publishCommit(ctx, tC, uint64(e+1))
                     s.publishRevealAndVRF(ctx, tR, tV, uint64(e), tip)
+                    // On epoch boundary, compute and log cell entropy for previous epoch window if cell is active
+                    if s.cellMgr != nil {
+                        c := s.cellMgr.Status()
+                        if c != nil && c.Active {
+                            win := int64(s.params.EpochLength)
+                            score, used := entropy.ComputeCellEntropyFromChain(s.chainID, c, win)
+                            if used > 0 { logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score) }
+                        }
+                    }
                     lastEpoch = e
                 }
             }
