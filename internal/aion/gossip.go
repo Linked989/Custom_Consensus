@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"peer"
 	"sync"
 	"time"
 
@@ -70,10 +71,10 @@ type Service struct {
 	}
 
 	// elected leaders per epoch
-    leader map[uint64]string // epoch -> pubhex
+	leader map[uint64]string // epoch -> pubhex
 
-    // lifecycle: mark once leader elected to announce counters start
-    started bool
+	// lifecycle: mark once leader elected to announce counters start
+	started bool
 }
 
 // NetStatus is a snapshot of AION election state for the current epoch.
@@ -88,9 +89,9 @@ type NetStatus struct {
 	Slot               uint64    `json:"slot"`
 	EpochSlotOffset    uint64    `json:"epoch_slot_offset"`
 	TipHeight          int64     `json:"tip_height"`
-    SlotEpoch          uint64    `json:"slot_epoch"`
-    SlotDurationMS     uint64    `json:"slot_duration_ms"`
-    ReadyToProduce     bool      `json:"ready_to_produce"`
+	SlotEpoch          uint64    `json:"slot_epoch"`
+	SlotDurationMS     uint64    `json:"slot_duration_ms"`
+	ReadyToProduce     bool      `json:"ready_to_produce"`
 }
 
 // GetNetStatus returns a best-effort status for the current epoch.
@@ -137,28 +138,45 @@ func (s *Service) GetNetStatus() NetStatus {
 	slot := s.params.CurrentSlot(now)
 	off := s.params.EpochSlotOffset(slot)
 	se := s.params.Epoch(slot)
-    sdms := uint64(s.params.SlotDuration / time.Millisecond)
-    ready := s.AllowProduceSlot()
-    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16, Slot: uint64(slot), EpochSlotOffset: off, TipHeight: h, SlotEpoch: se, SlotDurationMS: sdms, ReadyToProduce: ready}
+	sdms := uint64(s.params.SlotDuration / time.Millisecond)
+	ready := s.AllowProduceSlot()
+	return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16, Slot: uint64(slot), EpochSlotOffset: off, TipHeight: h, SlotEpoch: se, SlotDurationMS: sdms, ReadyToProduce: ready}
 }
 
 // AllowProduceSlot returns true if this node should produce a block for the current epoch/slot.
 // Policy: must be elected leader locally AND either (a) seen >=2 VRF candidates for this epoch,
 // or (b) have no connected peers (single-node test setup).
 func (s *Service) AllowProduceSlot() bool {
-    if s.epochLen == 0 { return false }
-    // Compute current epoch from chain height
-    h, _ := blockchain.CurrentTip(s.chainID)
-    var e uint64
-    if h > 0 { e = uint64(h-1) / s.epochLen } else { e = 0 }
-    pub := s.getPubBytes(); if len(pub) == 0 { return false }
-    if !s.IsLeader(e, pub) { return false }
-    // Require at least two candidates to avoid split production at epoch start.
-    s.mu.Lock(); cand := len(s.vrf[e]); s.mu.Unlock()
-    if cand >= 2 { return true }
-    // If we're alone (no peers), allow production to avoid stalling demos.
-    if len(s.h.Network().Peers()) == 0 { return true }
-    return false
+	if s.epochLen == 0 {
+		return false
+	}
+	// Compute current epoch from chain height
+	h, _ := blockchain.CurrentTip(s.chainID)
+	var e uint64
+	if h > 0 {
+		e = uint64(h-1) / s.epochLen
+	} else {
+		e = 0
+	}
+	pub := s.getPubBytes()
+	if len(pub) == 0 {
+		return false
+	}
+	if !s.IsLeader(e, pub) {
+		return false
+	}
+	// Require at least two candidates to avoid split production at epoch start.
+	s.mu.Lock()
+	cand := len(s.vrf[e])
+	s.mu.Unlock()
+	if cand >= 2 {
+		return true
+	}
+	// If we're alone (no peers), allow production to avoid stalling demos.
+	if len(s.h.Network().Peers()) == 0 {
+		return true
+	}
+	return false
 }
 
 // StartAIONService starts gossip handlers and periodic publisher.
@@ -465,50 +483,64 @@ func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
 }
 
 func (s *Service) updateLeader(e uint64) {
-    wt, hnorm := s.weightForEpoch(e)
-    // iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
-    s.mu.Lock()
-    entries := s.vrf[e]
-    s.mu.Unlock()
-    var bestPub string
-    var bestRank [33]byte
-    var init bool
-    for pubhex, rec := range entries {
-        r := RankValue(rec.y, wt)
-        if !init || CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub) {
-            bestPub, bestRank, init = pubhex, r, true
-        }
-    }
-    if init {
-        s.mu.Lock(); first := !s.started; s.leader[e] = bestPub; if first { s.started = true }; s.mu.Unlock()
-        rank16 := binary.BigEndian.Uint16(bestRank[0:2])
-        cand := len(entries)
-        tipH, _ := blockchain.CurrentTip(s.chainID)
-        // Try to compute leader peer ID from pubkey
-        leaderID := ""
-        if b, err := hex.DecodeString(bestPub); err == nil {
-            if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
-                if pid, err := peer.IDFromPublicKey(pk); err == nil { leaderID = pid.String() }
-            }
-        }
-        // Colors
-        const green = "\x1b[32m"; const red = "\x1b[31m"; const cyan = "\x1b[36m"; const yellow = "\x1b[33m"; const reset = "\x1b[0m"
-        // Election header
-        logx.Info(cyan+"AION ELECTION"+reset, "epoch", e, "candidates", cand)
-        // Candidates detail
-        for pubhex, rec := range entries {
-            r := RankValue(rec.y, wt)
-            r16 := binary.BigEndian.Uint16(r[0:2])
-            col := red
-            if pubhex == bestPub { col = green }
-            logx.Info(col+"candidate"+reset, "pub", pubhex, "rank16", r16)
-        }
-        // Result line
-        logx.Info(yellow+"leader elected"+reset, "epoch", e, "leader_peer_id", leaderID, "leader_pub", bestPub, "weight_q16", wt, "best_rank16", rank16, "tip_height", tipH, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
-        if first {
-            logx.Info(green+"AION START: leader elected; counters active"+reset, "epoch", e)
-        }
-    }
+	wt, hnorm := s.weightForEpoch(e)
+	// iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
+	s.mu.Lock()
+	entries := s.vrf[e]
+	s.mu.Unlock()
+	var bestPub string
+	var bestRank [33]byte
+	var init bool
+	for pubhex, rec := range entries {
+		r := RankValue(rec.y, wt)
+		if !init || CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub) {
+			bestPub, bestRank, init = pubhex, r, true
+		}
+	}
+	if init {
+		s.mu.Lock()
+		first := !s.started
+		s.leader[e] = bestPub
+		if first {
+			s.started = true
+		}
+		s.mu.Unlock()
+		rank16 := binary.BigEndian.Uint16(bestRank[0:2])
+		cand := len(entries)
+		tipH, _ := blockchain.CurrentTip(s.chainID)
+		// Try to compute leader peer ID from pubkey
+		leaderID := ""
+		if b, err := hex.DecodeString(bestPub); err == nil {
+			if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
+				if pid, err := peer.IDFromPublicKey(pk); err == nil {
+					leaderID = pid.String()
+				}
+			}
+		}
+		// Colors
+		const green = "\x1b[32m"
+		const red = "\x1b[31m"
+		const cyan = "\x1b[36m"
+		const yellow = "\x1b[33m"
+		const reset = "\x1b[0m"
+		// Election header
+		logx.Info(cyan+"AION ELECTION"+reset, "epoch", e, "candidates", cand)
+		// Candidates detail
+		for pubhex, rec := range entries {
+			r := RankValue(rec.y, wt)
+			r16 := binary.BigEndian.Uint16(r[0:2])
+			col := red
+			if pubhex == bestPub {
+				col = green
+			}
+			logx.Info(col+"candidate"+reset, "pub", pubhex, "rank16", r16)
+		}
+		// Result line
+		logx.Info(yellow+"leader elected"+reset, "epoch", e, "leader_peer_id", leaderID, "leader_pub", bestPub, "weight_q16", wt, "best_rank16", rank16, "tip_height", tipH, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
+		if first {
+			logx.Info(green+"AION START: leader elected; counters active"+reset, "epoch", e)
+		}
+	}
 }
 
 // IsLeader returns true if the given pubkey is elected leader for epoch e.
