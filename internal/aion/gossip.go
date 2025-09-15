@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	cbor "github.com/fxamacker/cbor/v2"
-	"github.com/libp2p/go-libp2p-core/peer"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	crypto "github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
+    cbor "github.com/fxamacker/cbor/v2"
+    pubsub "github.com/libp2p/go-libp2p-pubsub"
+    crypto "github.com/libp2p/go-libp2p/core/crypto"
+    "github.com/libp2p/go-libp2p/core/host"
+    "github.com/libp2p/go-libp2p/core/peer"
 
 	"pose/internal/blockchain"
 	"pose/internal/cell"
