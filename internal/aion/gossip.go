@@ -523,10 +523,10 @@ func (s *Service) updateLeader(e uint64) {
 	wt, hnorm := s.weightForEpoch(e)
 	// iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
 	s.mu.Lock()
-    entries := s.vrf[e]
-    ents := s.ent[e]
-    candCount := len(entries)
-    s.mu.Unlock()
+	entries := s.vrf[e]
+	// ents := s.ent[e]
+	candCount := len(entries)
+	s.mu.Unlock()
 	// Require at least two VRF candidates; entropy is optional for ranking.
 	if candCount < 2 {
 		return
