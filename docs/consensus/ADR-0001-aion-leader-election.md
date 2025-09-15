@@ -1,6 +1,6 @@
 # ADR-0001: AION Leader Election Wiring
 
-Status: Proposed
+Status: Accepted
 
 Context
 
@@ -38,4 +38,3 @@ Security Considerations
 
 - Commit-before-challenge prevents grinding. Entropy floors/caps and moving average mitigate dominance and noise.
 - Secrets must never be logged; use constant-time comparisons where relevant.
-

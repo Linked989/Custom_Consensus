@@ -3,7 +3,6 @@
 ## Project Structure & Module Organization
 - Entrypoints in `cmd/`: `cmd/node` (full node), `cmd/iotp2p` (P2P runner), `cmd/iotdev` (device simulator), `cmd/txgen` (load generator).
 - Core logic in `internal/*` (e.g., `internal/blockchain`, `internal/mempool`, `internal/merkle`).
-- Tests live next to code as `*_test.go`. Keep fixtures minimal and deterministic.
 
 ## Build, Test, and Development Commands
 - Toolchain: Go 1.24.7. Use the standard `go` CLI; Makefile provides wrappers.
