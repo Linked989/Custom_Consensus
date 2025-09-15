@@ -351,25 +351,10 @@ func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic,
 	logx.Info("aion reveal+vrf", "epoch", e)
 }
 
-// challengeForEpoch computes the epoch challenge from the boundary block hash at height e*epochLen.
-// For epoch 0 or if the boundary block is unavailable locally, falls back to using only the epoch number.
+// challengeForEpoch returns a deterministic epoch challenge independent of local chain state.
+// Using only the epoch number avoids divergence if nodes' boundary blocks differ due to forks.
 func (s *Service) challengeForEpoch(e uint64) [32]byte {
-	if s.epochLen == 0 || e == 0 {
-		return Challenge(nil, e)
-	}
-	boundaryHeight := int64(e * s.epochLen)
-	if boundaryHeight <= 0 {
-		return Challenge(nil, e)
-	}
-	hashHex, ok := blockchain.GetHashByHeight(s.chainID, boundaryHeight)
-	if !ok || len(hashHex) == 0 {
-		return Challenge(nil, e)
-	}
-	hb, err := hex.DecodeString(hashHex)
-	if err != nil {
-		return Challenge(nil, e)
-	}
-	return Challenge(hb, e)
+    return Challenge(nil, e)
 }
 
 func (s *Service) onCommit(by []byte) {
