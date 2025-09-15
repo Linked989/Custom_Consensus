@@ -253,7 +253,8 @@ func main() {
                 case <-t.C:
                     all := members.CountAndSweep()
                     connected := len(h.Network().Peers())
-                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected)
+                    tipH, _ := blockchain.GetTip(*chainID)
+                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH)
                     // Try to form a cell when threshold is met
                     if c := cellMgr.TryForm(devReg); c != nil {
                         logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))

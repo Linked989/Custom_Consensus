@@ -66,6 +66,7 @@ type NetStatus struct {
     BestRank16            uint16    `json:"best_rank16"`
     Slot                  uint64    `json:"slot"`
     EpochSlotOffset       uint64    `json:"epoch_slot_offset"`
+    TipHeight             int64     `json:"tip_height"`
 }
 
 // GetNetStatus returns a best-effort status for the current epoch.
@@ -107,7 +108,7 @@ func (s *Service) GetNetStatus() NetStatus {
     now := time.Now().UTC()
     slot := s.params.CurrentSlot(now)
     off := s.params.EpochSlotOffset(slot)
-    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16, Slot: uint64(slot), EpochSlotOffset: off}
+    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16, Slot: uint64(slot), EpochSlotOffset: off, TipHeight: h}
 }
 
 // StartAIONService starts gossip handlers and periodic publisher.
@@ -310,7 +311,8 @@ func (s *Service) updateLeader(e uint64) {
         s.mu.Lock(); s.leader[e] = bestPub; s.mu.Unlock()
         rank16 := binary.BigEndian.Uint16(bestRank[0:2])
         cand := len(entries)
-        logx.Info("leader elected", "epoch", e, "pub", bestPub, "candidates", cand, "weight_q16", wt, "best_rank16", rank16, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
+        tipH, _ := blockchain.CurrentTip(s.chainID)
+        logx.Info("leader elected", "epoch", e, "pub", bestPub, "candidates", cand, "weight_q16", wt, "best_rank16", rank16, "tip_height", tipH, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
     }
 }
 
