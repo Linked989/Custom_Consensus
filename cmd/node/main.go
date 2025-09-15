@@ -217,7 +217,8 @@ func main() {
     }
 
     // AION network service (commit/reveal/VRF + selection); enabled by default
-    aionSvc = aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams(), cellMgr)
+    aionParams := aion.DefaultParams()
+    aionSvc = aion.StartAIONService(ctx, h, ps, *chainID, aionParams, cellMgr)
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
@@ -236,7 +237,9 @@ func main() {
     if *produceBlocks {
         // Gate production on being the elected leader for current epoch
         allow := func() bool { return aionSvc.LocalIsLeader() }
-        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax, allow); err != nil {
+        // Produce one block per slot using AION slot duration
+        blkInterval := aionParams.SlotDuration
+        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, blkInterval, *blockMax, *blockBytesMax, allow); err != nil {
             logx.Error("block builder", "err", err)
             os.Exit(1)
         }
