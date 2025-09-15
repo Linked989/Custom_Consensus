@@ -22,10 +22,11 @@ func EpochEntropyQ16(chainID string, epoch uint64, epochLen uint64) uint32 {
 		return 0
 	}
 
-	// accumulate histogram (256 symbols)
-	var freq [256]uint64
-	var n uint64
-	for h := start; h <= end; h++ {
+    // accumulate histogram (256 symbols)
+    var freq [256]uint64
+    var n uint64
+    em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
+    for h := start; h <= end; h++ {
 		hashHex, ok := blockchain.GetHashByHeight(chainID, h)
 		if !ok {
 			continue
@@ -45,16 +46,16 @@ func EpochEntropyQ16(chainID string, epoch uint64, epochLen uint64) uint32 {
 			// Re-encode to canonical CBOR to ensure consistent byte stream
 			// Note: ExtractIoTDataSection already returns CBOR-encoded value.
 			// We decode then re-encode to normalized form.
-			var val any
-			if cbor.Unmarshal(by, &val) == nil {
-				if enc, err := cbor.Marshal(val); err == nil {
-					for _, b := range enc {
-						freq[int(b)]++
-						n++
-					}
-					continue
-				}
-			}
+            var val any
+            if cbor.Unmarshal(by, &val) == nil {
+                if enc, err := em.Marshal(val); err == nil {
+                    for _, b := range enc {
+                        freq[int(b)]++
+                        n++
+                    }
+                    continue
+                }
+            }
 			// Fallback: use raw bytes
 			for _, b := range by {
 				freq[int(b)]++

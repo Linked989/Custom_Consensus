@@ -140,3 +140,73 @@ func dataFromArray(arr []interface{}) ([]byte, error) {
     }
     return nil, errInvalid
 }
+
+// ExtractDevIDAndData extracts the device ID (payload[3][0]) and the IoT data section (payload[8])
+// from a COSE_Sign1 transaction without verifying the signature. The data bytes returned are the
+// CBOR encoding of the value under key 8. Returns ok=false on decode errors.
+func ExtractDevIDAndData(b []byte) (string, []byte, bool) {
+    // Unwrap CBOR Tag(18) if present
+    var tag cbor.Tag
+    if err := cbor.Unmarshal(b, &tag); err == nil && tag.Number == 18 {
+        if arr, ok := tag.Content.([]interface{}); ok {
+            return devAndDataFromArray(arr)
+        }
+    }
+    var arr []interface{}
+    if err := cbor.Unmarshal(b, &arr); err != nil { return "", nil, false }
+    return devAndDataFromArray(arr)
+}
+
+func devAndDataFromArray(arr []interface{}) (string, []byte, bool) {
+    if len(arr) != 4 { return "", nil, false }
+    // payload is arr[2]
+    var payload []byte
+    switch v := arr[2].(type) {
+    case []byte:
+        payload = v
+    case cbor.RawMessage:
+        payload = []byte(v)
+    default:
+        return "", nil, false
+    }
+    var pl map[int]interface{}
+    if err := cbor.Unmarshal(payload, &pl); err != nil { return "", nil, false }
+    devMap, ok := asIntKeyed(pl[3])
+    if !ok { return "", nil, false }
+    devID, _ := devMap[0].(string)
+    if devID == "" { return "", nil, false }
+    if v, ok := pl[8]; ok {
+        by, err := cbor.Marshal(v)
+        if err != nil { return "", nil, false }
+        return devID, by, true
+    }
+    return "", nil, false
+}
+
+func asIntKeyed(v interface{}) (map[int]interface{}, bool) {
+    switch m := v.(type) {
+    case map[int]interface{}:
+        return m, true
+    case map[int64]interface{}:
+        out := make(map[int]interface{}, len(m))
+        for k, val := range m { out[int(k)] = val }
+        return out, true
+    case map[uint64]interface{}:
+        out := make(map[int]interface{}, len(m))
+        for k, val := range m { out[int(k)] = val }
+        return out, true
+    case map[interface{}]interface{}:
+        out := make(map[int]interface{}, len(m))
+        for k, val := range m {
+            switch kk := k.(type) {
+            case int: out[kk] = val
+            case int64: out[int(kk)] = val
+            case uint64: out[int(kk)] = val
+            default: return nil, false
+            }
+        }
+        return out, true
+    default:
+        return nil, false
+    }
+}

@@ -233,13 +233,14 @@ func main() {
 					// Try to form a cell when threshold is met
 					if c := cellMgr.TryForm(devReg); c != nil {
 						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
-						entropyOnce.Do(func() {
-							// tiny delay to accumulate a few tx samples
-							time.Sleep(1 * time.Second)
-							entries := pool.Snapshot()
-							score, used := entropy.ComputeCellEntropy(c, entries)
-							logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", fmt.Sprintf("%.4f", score))
-						})
+                    entropyOnce.Do(func() {
+                        // small delay to allow initial blocks/txs
+                        time.Sleep(1 * time.Second)
+                        // Compute entropy from on-chain data for cell devices over the last epoch window
+                        win := int64(aion.DefaultParams().EpochLength)
+                        score, used := entropy.ComputeCellEntropyFromChain(*chainID, c, win)
+                        logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", fmt.Sprintf("%.4f", score))
+                    })
 					}
 				}
 			}
