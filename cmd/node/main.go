@@ -23,7 +23,6 @@ import (
 	"pose/internal/logx"
 	"pose/internal/mempool"
 	"pose/internal/p2p"
-    "pose/internal/entropy"
 )
 
 const mdnsServiceTag = "pose-simple-mdns"
