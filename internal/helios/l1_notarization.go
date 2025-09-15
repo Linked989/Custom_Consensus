@@ -67,6 +67,11 @@ type L1Service struct {
     seen map[string]map[string]struct{}
     // firstSeen time to compute latency
     first map[string]time.Time
+
+    // recent records for HTTP status
+    recent     []L1Record
+    recByHash  map[string]int // hashHex -> index in recent
+    maxRecent  int
 }
 
 // StartL1 launches the L1 notarization service.
@@ -75,7 +80,7 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
     if p.MaxLatency <= 0 { p.MaxLatency = defaultL1Params().MaxLatency }
     em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
     dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: blockTopicName, seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time)}
+    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: blockTopicName, seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), recByHash: make(map[string]int), maxRecent: 32}
 
     // Join topics
     tA, _ := ps.Join(topicL1Attest)
@@ -164,11 +169,12 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
     s.mu.Unlock()
     if cnt >= need {
         // Notarize once
+        dt := time.Since(first)
+        s.recordNotarized(key, a.Epoch, a.Height, cnt, dt)
         s.mu.Lock(); delete(s.seen, key); delete(s.first, key); s.mu.Unlock()
         out := l1Notarized{Epoch: a.Epoch, Height: a.Height, Hash: append([]byte(nil), a.Hash...), Count: cnt, Attesters: [][]byte{a.Attester}}
         by, _ := s.em.Marshal(out)
         _ = tN.Publish(context.Background(), by)
-        dt := time.Since(first)
         logx.Info("HELIOS L1 NOTARIZED", "epoch", a.Epoch, "height", a.Height, "hash", short(key), "attesters", cnt, "latency_ms", dt.Milliseconds())
     }
 }
@@ -186,3 +192,42 @@ func (s *L1Service) pubBytes() []byte {
 }
 
 func short(h string) string { if len(h) <= 8 { return h }; return h[:8] }
+
+// L1Record is a snapshot for HTTP status.
+type L1Record struct {
+    Epoch      uint64 `json:"epoch"`
+    Height     int64  `json:"height"`
+    Hash       string `json:"hash"` // hex
+    Notarized  bool   `json:"notarized"`
+    Attesters  int    `json:"attesters"`
+    LatencyMS  int64  `json:"latency_ms"`
+    When       int64  `json:"when_unix_ms"`
+}
+
+func (s *L1Service) recordNotarized(hashHex string, epoch uint64, height int64, attesters int, dt time.Duration) {
+    s.mu.Lock(); defer s.mu.Unlock()
+    nowms := time.Now().UnixMilli()
+    if idx, ok := s.recByHash[hashHex]; ok {
+        r := s.recent[idx]
+        r.Notarized = true
+        r.Attesters = attesters
+        r.LatencyMS = dt.Milliseconds()
+        r.When = nowms
+        s.recent[idx] = r
+        return
+    }
+    rec := L1Record{Epoch: epoch, Height: height, Hash: hashHex, Notarized: true, Attesters: attesters, LatencyMS: dt.Milliseconds(), When: nowms}
+    s.recent = append([]L1Record{rec}, s.recent...)
+    // reindex
+    s.recByHash = make(map[string]int, len(s.recent))
+    for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
+    if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
+}
+
+// RecentStatus returns a copy of the recent records.
+func (s *L1Service) RecentStatus() []L1Record {
+    s.mu.Lock(); defer s.mu.Unlock()
+    out := make([]L1Record, len(s.recent))
+    copy(out, s.recent)
+    return out
+}

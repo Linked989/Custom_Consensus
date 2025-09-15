@@ -187,15 +187,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Prepare aion service pointer and getter closure for HTTP.
-	var aionSvc *aion.Service
-	getAION := func() *aion.Service { return aionSvc }
-	// Start HTTP API early so devices can register while we wait for preflight.
-	if *httpIn != "" {
-		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION)
-		defer srv.Shutdown(ctx)
-		logx.Info("http api", "listen", *httpIn)
-	}
+    // Prepare AION/HELIOS service pointers and getter closures for HTTP.
+    var aionSvc *aion.Service
+    getAION := func() *aion.Service { return aionSvc }
+    var l1svc *helios.L1Service
+    getHELIOS := func() *helios.L1Service { return l1svc }
+    // Start HTTP API early so devices can register while we wait for preflight.
+    if *httpIn != "" {
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION, getHELIOS)
+        defer srv.Shutdown(ctx)
+        logx.Info("http api", "listen", *httpIn)
+    }
 
 	// Preflight: ensure at least 2 nodes present and minimum devices are connected locally
 	// before starting blockchain services. Log progress while waiting.
@@ -244,7 +246,7 @@ func main() {
 	}
 
 	// HELIOS L1 notarization: start and wire to observe proposed blocks via subscriber callbacks.
-    _ = helios.StartL1(ctx, h, ps, aionSvc, helios.L1Params{}, *blockTopicName)
+    l1svc = helios.StartL1(ctx, h, ps, aionSvc, helios.L1Params{}, *blockTopicName)
     // Always start builder; AllowProduceSlot gates production to elected leader.
     {
         allow := func() bool { return aionSvc.AllowProduceSlot() }

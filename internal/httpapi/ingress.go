@@ -23,12 +23,13 @@ import (
     "pose/internal/cell"
     "pose/internal/entropy"
     "pose/internal/aion"
+    "pose/internal/helios"
     // AION status endpoint disabled here; use blockchain and gossip for status
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
-// StartHTTPAPI starts the HTTP server. getAION may be nil; if provided, it should return the current AION service.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service) *http.Server {
+// StartHTTPAPI starts the HTTP server. getAION/getHELIOS may be nil; if provided, they should return the current services.
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service) *http.Server {
     mux := http.NewServeMux()
     mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
@@ -145,6 +146,21 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         st := svc.GetNetStatus()
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(st)
+    })
+    // GET /helios/status: recent notarization info
+    mux.HandleFunc("/helios/status", func(w http.ResponseWriter, r *http.Request) {
+        if getHELIOS == nil {
+            http.Error(w, "helios not available", http.StatusServiceUnavailable)
+            return
+        }
+        svc := getHELIOS()
+        if svc == nil {
+            http.Error(w, "helios not initialized", http.StatusServiceUnavailable)
+            return
+        }
+        recs := svc.RecentStatus()
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]any{"recent": recs})
     })
     // GET /iot/devices
     mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
