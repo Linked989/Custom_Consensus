@@ -4,6 +4,7 @@ import (
     "context"
     "crypto/sha256"
     "encoding/hex"
+    "encoding/binary"
     "sync"
     "time"
 
@@ -89,8 +90,14 @@ func (s *Service) run(ctx context.Context) {
                 return
             case <-tick.C:
                 height, tip := blockchain.CurrentTip(s.chainID)
-                if height <= 0 || s.epochLen == 0 { continue }
-                e := int64(uint64(height-1) / s.epochLen)
+                if s.epochLen == 0 { continue }
+                // Bootstrap: if no blocks yet, operate at epoch 0 with current tip (may be empty)
+                var e int64
+                if height > 0 {
+                    e = int64(uint64(height-1) / s.epochLen)
+                } else {
+                    e = 0
+                }
                 if e != lastEpoch {
                     // New epoch: publish reveal+vrf for e if we have commit; publish commit for e+1
                     s.publishCommit(ctx, tC, uint64(e+1))
@@ -141,6 +148,7 @@ func (s *Service) publishCommit(ctx context.Context, t *pubsub.Topic, e uint64) 
     msg := msgCommit{Pub: pub, Epoch: e, Commit: c[:]}
     by, _ := s.em.Marshal(msg)
     _ = t.Publish(ctx, by)
+    logx.Info("aion commit", "epoch", e)
 }
 
 func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic, e uint64, lastTip []byte) {
@@ -161,6 +169,7 @@ func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic,
     msgV := msgVRF{Pub: pub, Epoch: e, Input: input, Y: y[:], Proof: proof}
     by, _ := s.em.Marshal(msgV)
     _ = tV.Publish(ctx, by)
+    logx.Info("aion reveal+vrf", "epoch", e)
 }
 
 func (s *Service) onCommit(by []byte) {
@@ -243,7 +252,9 @@ func (s *Service) updateLeader(e uint64) {
     }
     if init {
         s.mu.Lock(); s.leader[e] = bestPub; s.mu.Unlock()
-        logx.Info("LEADER ELECTED: "+bestPub, "epoch", e, "weight_q16", wt, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
+        rank16 := binary.BigEndian.Uint16(bestRank[0:2])
+        cand := len(entries)
+        logx.Info("leader elected", "epoch", e, "pub", bestPub, "candidates", cand, "weight_q16", wt, "best_rank16", rank16, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
     }
 }
 
@@ -257,8 +268,9 @@ func (s *Service) IsLeader(e uint64, pub []byte) bool {
 // LocalIsLeader reports if this node is leader for the epoch of the current chain tip.
 func (s *Service) LocalIsLeader() bool {
     h, _ := blockchain.CurrentTip(s.chainID)
-    if h <= 0 || s.epochLen == 0 { return false }
-    e := uint64(h-1) / s.epochLen
+    if s.epochLen == 0 { return false }
+    var e uint64
+    if h > 0 { e = uint64(h-1) / s.epochLen } else { e = 0 }
     pub := s.getPubBytes(); if len(pub) == 0 { return false }
     return s.IsLeader(e, pub)
 }
