@@ -565,7 +565,9 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                     logx.Error("block sign", "err", err)
                     continue
                 }
-                // publish
+                // Publish with a colored log
+                const green = "\x1b[32m"; const cyan = "\x1b[36m"; const reset = "\x1b[0m"
+                logx.Info(cyan+"propose block"+reset, "height", blk.Height, "txs", len(blk.Txs), "mempool_len", pool.Len())
                 data, err := encMode.Marshal(blk)
                 if err != nil { logx.Error("block marshal", "err", err); continue }
                 if err := blkTopic.Publish(ctx, data); err != nil { logx.Error("block publish", "err", err) }
@@ -660,14 +662,16 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 
 			// decide to accept now or queue
             if blk.Height == 1 && len(blk.PrevHash) == 0 {
+                const green = "\x1b[32m"; const reset = "\x1b[0m"
                 accept(&blk)
-                logx.Info("block accepted", "height", blk.Height, "txs", len(blk.Txs), "producer", blk.ProducerID)
+                logx.Info(green+"block accepted"+reset, "height", blk.Height, "txs", len(blk.Txs), "producer", blk.ProducerID)
                 ch.mu.Unlock()
                 continue
             }
             if ph, ok := ch.isKnown(blk.PrevHash); ok && blk.Height == ph+1 {
+                const green = "\x1b[32m"; const reset = "\x1b[0m"
                 accept(&blk)
-                logx.Info("block accepted", "height", blk.Height, "txs", len(blk.Txs), "producer", blk.ProducerID)
+                logx.Info(green+"block accepted"+reset, "height", blk.Height, "txs", len(blk.Txs), "producer", blk.ProducerID)
                 ch.mu.Unlock()
                 continue
             }

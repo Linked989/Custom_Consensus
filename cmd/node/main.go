@@ -41,8 +41,7 @@ func main() {
 	// Gossip
 	chainID := flag.String("chain-id", "iotnet-main", "chain/network id")
 	txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
-	blockTopicName := flag.String("block-topic", "pose/block/1.0.0", "pubsub topic for blocks")
-	produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
+    blockTopicName := flag.String("block-topic", "pose/block/1.0.0", "pubsub topic for blocks")
 	// blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
 	blockMax := flag.Int("block-max", 100, "max txs per block")
 	blockBytesMax := flag.Int("block-bytes-max", 0, "max total tx bytes per block (0 = unlimited)")
@@ -242,16 +241,15 @@ func main() {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
-	if *produceBlocks {
-		// Gate production on being the elected leader for current epoch
-		allow := func() bool { return aionSvc.LocalIsLeader() }
-		// Produce one block per slot using AION slot duration
-		blkInterval := aionParams.SlotDuration
-		if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, blkInterval, *blockMax, *blockBytesMax, allow); err != nil {
-			logx.Error("block builder", "err", err)
-			os.Exit(1)
-		}
-	}
+    // Always start builder; AllowProduceSlot gates production to elected leader.
+    {
+        allow := func() bool { return aionSvc.AllowProduceSlot() }
+        blkInterval := aionParams.SlotDuration
+        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, blkInterval, *blockMax, *blockBytesMax, allow); err != nil {
+            logx.Error("block builder", "err", err)
+            os.Exit(1)
+        }
+    }
 
 	if statsInterval != nil && *statsInterval > 0 {
 		go func() {
@@ -262,14 +260,16 @@ func main() {
 				case <-ctx.Done():
 					return
             case <-t.C:
-                all := members.CountAndSweep()
-                connected := len(h.Network().Peers())
-                tipH, _ := blockchain.GetTip(*chainID)
-                if logMempool != nil && *logMempool {
-                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "mempool_len", pool.Len())
-                } else {
-                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH)
-                }
+                    all := members.CountAndSweep()
+                    connected := len(h.Network().Peers())
+                    tipH, _ := blockchain.GetTip(*chainID)
+                    ns := aionSvc.GetNetStatus()
+                    const magenta = "\x1b[35m"; const reset = "\x1b[0m"
+                    if logMempool != nil && *logMempool {
+                        logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch, "mempool_len", pool.Len())
+                    } else {
+                        logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch)
+                    }
                 // Try to form a cell when threshold is met
                 if c := cellMgr.TryForm(devReg); c != nil {
                     logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
