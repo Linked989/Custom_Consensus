@@ -203,19 +203,19 @@ func (s *Service) onVRF(by []byte) {
     s.updateLeader(m.Epoch)
 }
 
-func (s *Service) weightForEpoch(e uint64) uint32 {
+func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
     // Use moving average of previous 4 epochs' normalized entropy
-    if s.epochLen == 0 { return qOne }
+    if s.epochLen == 0 { return qOne, [4]uint32{} }
     var h [4]uint32
     for i := 0; i < 4; i++ {
         if e == 0 || e <= uint64(i) { h[i] = 0; continue }
         h[i] = EpochEntropyQ16(s.chainID, e-1-uint64(i), s.epochLen)
     }
-    return WeightQ16(uint32(s.params.AlphaQ16), h[0], h[1], h[2], h[3])
+    return WeightQ16(uint32(s.params.AlphaQ16), h[0], h[1], h[2], h[3]), h
 }
 
 func (s *Service) updateLeader(e uint64) {
-    wt := s.weightForEpoch(e)
+    wt, hnorm := s.weightForEpoch(e)
     // iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
     s.mu.Lock()
     entries := s.vrf[e]
@@ -231,7 +231,7 @@ func (s *Service) updateLeader(e uint64) {
     }
     if init {
         s.mu.Lock(); s.leader[e] = bestPub; s.mu.Unlock()
-        logx.Info("aion leader", "epoch", e, "pub", bestPub)
+        logx.Info("LEADER ELECTED: "+bestPub, "epoch", e, "weight_q16", wt, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
     }
 }
 
@@ -257,4 +257,3 @@ func (s *Service) LeaderForEpoch(e uint64) (string, bool) {
     v, ok := s.leader[e]
     return v, ok
 }
-
