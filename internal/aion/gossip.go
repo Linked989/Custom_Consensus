@@ -64,6 +64,8 @@ type NetStatus struct {
     LeaderPub             string    `json:"leader_pub_hex"`
     LocalIsLeader         bool      `json:"local_is_leader"`
     BestRank16            uint16    `json:"best_rank16"`
+    Slot                  uint64    `json:"slot"`
+    EpochSlotOffset       uint64    `json:"epoch_slot_offset"`
 }
 
 // GetNetStatus returns a best-effort status for the current epoch.
@@ -101,7 +103,11 @@ func (s *Service) GetNetStatus() NetStatus {
     pub := s.getPubBytes()
     var local bool
     if len(pub) > 0 { local = s.IsLeader(e, pub) }
-    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16}
+    // Slot info (non-consensus diagnostic)
+    now := time.Now().UTC()
+    slot := s.params.CurrentSlot(now)
+    off := s.params.EpochSlotOffset(slot)
+    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16, Slot: uint64(slot), EpochSlotOffset: off}
 }
 
 // StartAIONService starts gossip handlers and periodic publisher.
@@ -148,7 +154,8 @@ func (s *Service) run(ctx context.Context) {
                     e = 0
                 }
                 if e != lastEpoch {
-                    // New epoch: publish reveal+vrf for e if we have commit; publish commit for e+1
+                    // New epoch: ensure commit for current e (bootstrap), also publish commit for e+1, then reveal+vrf for e
+                    s.publishCommit(ctx, tC, uint64(e))
                     s.publishCommit(ctx, tC, uint64(e+1))
                     s.publishRevealAndVRF(ctx, tR, tV, uint64(e), tip)
                     // On epoch boundary, compute and log cell entropy for previous epoch window if cell is active
