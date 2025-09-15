@@ -152,10 +152,13 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
 // OnBlockProposed should be called when a block is observed (e.g., by the local block subscriber).
 // Non-leader nodes will attest immediately.
 func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height int64, hash []byte, producerPub []byte, txs [][]byte) {
-    // If this node is the leader, normally it does not attest.
-    // Exception: if there are no peers (single-node demo), allow self-attest so /helios/status reflects progress.
-    if s.aion != nil && s.aion.LocalIsLeader() && len(s.h.Network().Peers()) > 0 {
-        return
+    // Decide leadership relative to the block's epoch, not the current tip.
+    if s.aion != nil && len(s.h.Network().Peers()) > 0 {
+        pub := s.pubBytes()
+        if len(pub) > 0 && s.aion.IsLeader(epoch, pub) {
+            // Leader for this epoch does not attest (only non-leaders attest)
+            return
+        }
     }
     // Construct sample checksum deterministically from the txs (first 8 tx SHA256 prefixes)
     hh := sha256.New()
