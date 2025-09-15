@@ -62,13 +62,14 @@ type Service struct {
 	seeds   map[uint64][]byte   // epoch -> seed
 	commits map[uint64][32]byte // epoch -> commit
 
-	// caches from network
-	cmt map[uint64]map[string][32]byte // epoch -> pubhex -> commit
-	rev map[uint64]map[string][]byte   // epoch -> pubhex -> seed
-	vrf map[uint64]map[string]struct {
-		y     [32]byte
-		proof []byte
-	}
+    // caches from network
+    cmt map[uint64]map[string][32]byte // epoch -> pubhex -> commit
+    rev map[uint64]map[string][]byte   // epoch -> pubhex -> seed
+    vrf map[uint64]map[string]struct {
+        y     [32]byte
+        proof []byte
+    }
+    ent map[uint64]map[string]uint32   // epoch -> pubhex -> cell entropy q16
 
 	// elected leaders per epoch
 	leader map[uint64]string // epoch -> pubhex
@@ -165,13 +166,13 @@ func (s *Service) AllowProduceSlot() bool {
 	if !s.IsLeader(e, pub) {
 		return false
 	}
-	// Require at least two candidates to avoid split production at epoch start.
-	s.mu.Lock()
-	cand := len(s.vrf[e])
-	s.mu.Unlock()
-	if cand >= 2 {
-		return true
-	}
+    // Require at least two cells (entropy reports) to avoid split production at epoch start.
+    s.mu.Lock()
+    cells := len(s.ent[e])
+    s.mu.Unlock()
+    if cells >= 2 {
+        return true
+    }
 	// If we're alone (no peers), allow production to avoid stalling demos.
 	if len(s.h.Network().Peers()) == 0 {
 		return true
@@ -183,23 +184,25 @@ func (s *Service) AllowProduceSlot() bool {
 func StartAIONService(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID string, params Params, cm *cell.Manager) *Service {
 	em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
 	dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-	s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
-		seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
-			y     [32]byte
-			proof []byte
-		}), leader: make(map[uint64]string)}
+    s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
+        seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
+            y     [32]byte
+            proof []byte
+        }), ent: make(map[uint64]map[string]uint32), leader: make(map[uint64]string)}
 	s.run(ctx)
 	return s
 }
 
 func (s *Service) run(ctx context.Context) {
 	// Topics
-	tC, _ := s.ps.Join(topicCommit)
-	tR, _ := s.ps.Join(topicReveal)
-	tV, _ := s.ps.Join(topicVRF)
-	subC, _ := tC.Subscribe()
-	subR, _ := tR.Subscribe()
-	subV, _ := tV.Subscribe()
+    tC, _ := s.ps.Join(topicCommit)
+    tR, _ := s.ps.Join(topicReveal)
+    tV, _ := s.ps.Join(topicVRF)
+    tE, _ := s.ps.Join(topicEntropy)
+    subC, _ := tC.Subscribe()
+    subR, _ := tR.Subscribe()
+    subV, _ := tV.Subscribe()
+    subE, _ := tE.Subscribe()
 
 	// Subscribers
 	go func() {
@@ -220,15 +223,22 @@ func (s *Service) run(ctx context.Context) {
 			s.onReveal(msg.Message.GetData())
 		}
 	}()
-	go func() {
-		for {
-			msg, err := subV.Next(ctx)
-			if err != nil {
-				return
-			}
-			s.onVRF(msg.Message.GetData())
-		}
-	}()
+    go func() {
+        for {
+            msg, err := subV.Next(ctx)
+            if err != nil {
+                return
+            }
+            s.onVRF(msg.Message.GetData())
+        }
+    }()
+    go func() {
+        for {
+            msg, err := subE.Next(ctx)
+            if err != nil { return }
+            s.onEntropy(msg.Message.GetData())
+        }
+    }()
 
 	// Publisher: poll chain tip and publish at epoch boundaries
 	go func() {
@@ -256,17 +266,20 @@ func (s *Service) run(ctx context.Context) {
 					s.publishCommit(ctx, tC, uint64(e))
 					s.publishCommit(ctx, tC, uint64(e+1))
 					s.publishRevealAndVRF(ctx, tR, tV, uint64(e))
-					// On epoch boundary, compute and log cell entropy for previous epoch window if cell is active
-					if s.cellMgr != nil {
-						c := s.cellMgr.Status()
-						if c != nil && c.Active {
-							win := int64(s.params.EpochLength)
-							score, used := entropy.ComputeCellEntropyFromChain(s.chainID, c, win)
-							if used > 0 {
-								logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
-							}
-						}
-					}
+                    // On epoch boundary, compute and log cell entropy for previous epoch window if cell is active
+                    if s.cellMgr != nil {
+                        c := s.cellMgr.Status()
+                        if c != nil && c.Active {
+                            win := int64(s.params.EpochLength)
+                            score, used := entropy.ComputeCellEntropyFromChain(s.chainID, c, win)
+                            if used > 0 {
+                                logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
+                            }
+                            // publish normalized entropy for this epoch restricted to our cell
+                            hcell := EpochEntropyForCellQ16(s.chainID, uint64(e), s.epochLen, c)
+                            s.publishEntropy(ctx, tE, uint64(e), hcell)
+                        }
+                    }
 					lastEpoch = e
 				}
 			}
@@ -349,6 +362,13 @@ func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic,
 	by, _ := s.em.Marshal(msgV)
 	_ = tV.Publish(ctx, by)
 	logx.Info("aion reveal+vrf", "epoch", e)
+}
+
+func (s *Service) publishEntropy(ctx context.Context, tE *pubsub.Topic, e uint64, hnorm uint32) {
+    pub := s.getPubBytes(); if len(pub) == 0 { return }
+    msg := msgEntropy{Pub: pub, Epoch: e, HNorm: hnorm}
+    by, _ := s.em.Marshal(msg)
+    _ = tE.Publish(ctx, by)
 }
 
 // challengeForEpoch returns a deterministic epoch challenge independent of local chain state.
@@ -448,7 +468,19 @@ func (s *Service) onVRF(by []byte) {
 	}{y: y32, proof: append([]byte(nil), m.Proof...)}
 	s.mu.Unlock()
 	// update leader
-	s.updateLeader(m.Epoch)
+    s.updateLeader(m.Epoch)
+}
+
+func (s *Service) onEntropy(by []byte) {
+    var m msgEntropy
+    if s.dm.Unmarshal(by, &m) != nil { return }
+    if len(m.Pub) == 0 { return }
+    ph := hex.EncodeToString(m.Pub)
+    s.mu.Lock()
+    if s.ent[m.Epoch] == nil { s.ent[m.Epoch] = make(map[string]uint32) }
+    s.ent[m.Epoch][ph] = m.HNorm
+    s.mu.Unlock()
+    s.updateLeader(m.Epoch)
 }
 
 func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
@@ -476,12 +508,23 @@ func (s *Service) updateLeader(e uint64) {
 	var bestPub string
 	var bestRank [33]byte
 	var init bool
-	for pubhex, rec := range entries {
-		r := RankValue(rec.y, wt)
-		if !init || CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub) {
-			bestPub, bestRank, init = pubhex, r, true
-		}
-	}
+    for pubhex, rec := range entries {
+        r := RankValue(rec.y, wt)
+        if !init {
+            if s.ent[e] != nil { if _, ok := s.ent[e][pubhex]; !ok { continue } }
+            bestPub, bestRank, init = pubhex, r, true
+            continue
+        }
+        if s.ent[e] != nil {
+            eb := s.ent[e][bestPub]
+            ec := s.ent[e][pubhex]
+            if ec > eb || (ec == eb && (CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub))) {
+                bestPub, bestRank = pubhex, r
+            }
+        } else if CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub) {
+            bestPub, bestRank = pubhex, r
+        }
+    }
 	if init {
 		s.mu.Lock()
 		first := !s.started
@@ -510,18 +553,22 @@ func (s *Service) updateLeader(e uint64) {
 		const reset = "\x1b[0m"
 		// Election header
 		logx.Info(cyan+"AION ELECTION"+reset, "epoch", e, "candidates", cand)
-		// Candidates detail
-		for pubhex, rec := range entries {
-			r := RankValue(rec.y, wt)
-			r16 := binary.BigEndian.Uint16(r[0:2])
-			col := red
-			if pubhex == bestPub {
-				col = green
-			}
-			logx.Info(col+"candidate"+reset, "pub", pubhex, "rank16", r16)
-		}
-		// Result line
-		logx.Info(yellow+"leader elected"+reset, "epoch", e, "leader_peer_id", leaderID, "leader_pub", bestPub, "weight_q16", wt, "best_rank16", rank16, "tip_height", tipH, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
+    // Candidates detail
+    for pubhex, rec := range entries {
+        r := RankValue(rec.y, wt)
+        r16 := binary.BigEndian.Uint16(r[0:2])
+        col := red
+        if pubhex == bestPub {
+            col = green
+        }
+        var hcell uint32
+        if s.ent[e] != nil { hcell = s.ent[e][pubhex] }
+        logx.Info(col+"candidate"+reset, "pub", pubhex, "rank16", r16, "cell_entropy_q16", hcell)
+    }
+    // Result line
+    var hwin uint32
+    if s.ent[e] != nil { hwin = s.ent[e][bestPub] }
+    logx.Info(yellow+"leader elected"+reset, "epoch", e, "leader_peer_id", leaderID, "leader_pub", bestPub, "weight_q16", wt, "best_rank16", rank16, "tip_height", tipH, "leader_cell_entropy_q16", hwin, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
 		if first {
 			logx.Info(green+"AION START: leader elected; counters active"+reset, "epoch", e)
 		}
