@@ -75,6 +75,7 @@ func main() {
     aionLog := flag.Bool("aion-log", false, "log AION slot/epoch progression (dev only)")
     // AION leader gating (feature-flag; does not alter hashing/signature paths)
     aionLeader := flag.Bool("aion-leader", false, "gate block production on AION leadership (dev only)")
+    aionDenom := flag.Int("aion-denom", 64, "AION leader target denominator (1/x per slot before weighting)")
     aionForceLeader := flag.Bool("aion-force-leader", false, "force leader active locally (dev only)")
     aionForceFollower := flag.Bool("aion-force-follower", false, "force follower (disable local production) (dev only)")
     listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
@@ -191,10 +192,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *httpIn != "" {
-		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
-		defer srv.Shutdown(ctx)
-	}
+    // Optional: start AION leader service early so HTTP can expose status
+    var aionSvc *aion.LeaderService
+    if *aionLeader {
+        if *aionForceLeader {
+            aion.SetLeaderActive(true)
+        } else if *aionForceFollower {
+            aion.SetLeaderActive(false)
+        } else {
+            params := aion.DefaultParams()
+            denom := *aionDenom
+            if denom <= 0 { denom = 1 }
+            aionSvc = aion.StartLeaderService(ctx, h, pool, *chainID, cellMgr, params, *blockInterval, uint16(denom))
+        }
+    }
+
+    if *httpIn != "" {
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, aionSvc)
+        defer srv.Shutdown(ctx)
+    }
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
@@ -209,16 +225,14 @@ func main() {
 		os.Exit(1)
 	}
     if *produceBlocks {
-            var allow func() bool
-            if *aionLeader {
-                if *aionForceLeader { aion.SetLeaderActive(true) }
-                if *aionForceFollower { aion.SetLeaderActive(false) }
-                allow = func() bool { return aion.IsLeaderActive() }
-            }
-            if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax, allow); err != nil {
-                logx.Error("block builder", "err", err)
-                os.Exit(1)
-            }
+        var allow func() bool
+        if *aionLeader {
+            allow = func() bool { return aion.IsLeaderActive() }
+        }
+        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax, allow); err != nil {
+            logx.Error("block builder", "err", err)
+            os.Exit(1)
+        }
     }
 
     if *aionLog {

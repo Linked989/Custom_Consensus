@@ -22,10 +22,11 @@ import (
     "pose/internal/iot"
     "pose/internal/cell"
     "pose/internal/entropy"
+    "pose/internal/aion"
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager) *http.Server {
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager, aionSvc *aion.LeaderService) *http.Server {
     mux := http.NewServeMux()
     mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
@@ -127,6 +128,27 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         resp["per_device"] = per
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(resp)
+    })
+    // GET /aion/status
+    mux.HandleFunc("/aion/status", func(w http.ResponseWriter, r *http.Request) {
+        st := map[string]any{"active": false}
+        if aionSvc != nil {
+            s := aionSvc.GetStatus()
+            st = map[string]any{
+                "active": s.Active,
+                "epoch": s.Epoch,
+                "window_end_epoch": s.WindowEndEpoch,
+                "denom": s.Denom,
+                "alpha_q16": s.AlphaQ16,
+                "weight_q16": s.WeightQ16,
+                "entropy_bits_per_byte": s.EntropyBitsPerByte,
+                "entropy_norm_q16": s.EntropyNormQ16,
+                "rank16": s.Rank16,
+                "threshold16": s.Threshold16,
+            }
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(st)
     })
     // GET /iot/devices
     mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {

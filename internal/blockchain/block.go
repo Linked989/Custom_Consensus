@@ -213,6 +213,20 @@ func getChain(id string) *Chain {
 	return c
 }
 
+// CurrentTip returns the current tip height and hash for the given chainID.
+// The hash slice is a copy safe for use by the caller.
+func CurrentTip(chainID string) (int64, []byte) {
+    ch := getChain(chainID)
+    ch.mu.Lock()
+    defer ch.mu.Unlock()
+    h := ch.TipHeight
+    var hash []byte
+    if len(ch.TipHash) > 0 {
+        hash = append([]byte(nil), ch.TipHash...)
+    }
+    return h, hash
+}
+
 // recordKnown marks a block hash as known at a given height.
 func (c *Chain) recordKnown(hash []byte, height int64) {
 	c.known[hex.EncodeToString(hash)] = height
