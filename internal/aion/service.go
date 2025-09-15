@@ -83,24 +83,39 @@ func (s *LeaderService) evalOnce() {
         s.mu.Lock(); s.leaderActive = false; s.mu.Unlock()
         return
     }
-    // Compute entropy over current mempool snapshot for the cell
+    // Compute entropy lower bounds over current mempool snapshot for the cell
     entries := s.pool.Snapshot()
-    shannonBitsPerByte, _ := entropy.ComputeCellEntropy(c, entries)
-    // Map to a 0..128-bit lower bound surrogate by scaling 8x range to 128
-    // 8 bits/byte max => multiply by 16 to fit 0..128; clamp to uint16
-    hb := uint16(0)
-    if shannonBitsPerByte > 0 {
-        // avoid float in hot path: convert with rounding
-        v := int(shannonBitsPerByte * 16.0)
-        if v < 0 { v = 0 }
-        if v > 128 { v = 128 }
-        hb = uint16(v)
+    // Build device set for quick membership checks
+    ids := make(map[string]struct{}, len(c.Devices))
+    for _, d := range c.Devices { ids[d.DeviceID] = struct{}{} }
+    // Accumulate histogram over IoT data bytes for devices in this cell
+    var freq [256]uint64
+    var n uint64
+    for _, e := range entries {
+        if _, ok := ids[e.DevID]; !ok { continue }
+        if dataPart, ok := entropy.ExtractIoTDataSection(e.Bytes); ok && len(dataPart) > 0 {
+            for _, b := range dataPart {
+                freq[int(b)]++
+                n++
+            }
+        }
     }
+    // Compute H_min and H2 lower bounds in bits (capped to 128)
+    var maxCnt uint64
+    var sumSq uint64
+    for i := 0; i < 256; i++ {
+        c := freq[i]
+        if c > maxCnt { maxCnt = c }
+        sumSq += c * c
+    }
+    hmin := HMinBits(n, maxCnt, 128)
+    h2 := HRenyi2Bits(n, sumSq, 128)
+    hb := HLowerBoundBits(hmin, h2)
     hq := NormalizeEntropyQ16(hb)
     // Shift history: most recent at index 0
     s.mu.Lock()
     s.hist = [4]uint32{hq, s.hist[0], s.hist[1], s.hist[2]}
-    s.lastEntropyBPB = shannonBitsPerByte
+    s.lastEntropyBPB = 0 // reserved; lower bound used instead
     s.lastHb = hb
     s.lastHnormQ16 = hq
     s.mu.Unlock()

@@ -168,21 +168,43 @@ func main() {
 	// Local mempool
 	pool := mempool.New(*memCapacity, *memTTL, *memBytesCap)
 
-	members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
-		m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)
-		if err != nil {
-			return nil, nil, err
-		}
-		t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool, *logTx)
-		if err != nil {
-			return nil, nil, err
-		}
-		return m, t, nil
-	}()
-	if err != nil {
-		logx.Error("gossip start", "err", err)
-		os.Exit(1)
-	}
+    members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
+        m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)
+        if err != nil {
+            return nil, nil, err
+        }
+        t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool, *logTx)
+        if err != nil {
+            return nil, nil, err
+        }
+        return m, t, nil
+    }()
+    if err != nil {
+        logx.Error("gossip start", "err", err)
+        os.Exit(1)
+    }
+
+    // Preflight: ensure at least 2 nodes present and minimum devices are connected locally
+    // before starting blockchain services. Log progress while waiting.
+    for {
+        if ctx.Err() != nil { return }
+        total := members.CountAndSweep()
+        peers := len(h.Network().Peers())
+        devs := devReg.List()
+        haveNodes := total >= 2 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
+        haveDevices := len(devs) >= *cellMin
+        if haveDevices {
+            if c := cellMgr.TryForm(devReg); c != nil && c.Active {
+                // formed; proceed to node start after both conditions satisfied
+            }
+        }
+        if haveNodes && haveDevices {
+            logx.Info("preflight ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs))
+            break
+        }
+        logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", *cellMin)
+        time.Sleep(1 * time.Second)
+    }
 
     // AION network service (commit/reveal/VRF + selection); enabled by default
     aionSvc := aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams(), cellMgr)
