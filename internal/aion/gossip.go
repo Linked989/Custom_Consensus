@@ -67,6 +67,8 @@ type NetStatus struct {
     Slot                  uint64    `json:"slot"`
     EpochSlotOffset       uint64    `json:"epoch_slot_offset"`
     TipHeight             int64     `json:"tip_height"`
+    SlotEpoch             uint64    `json:"slot_epoch"`
+    SlotDurationMS        uint64    `json:"slot_duration_ms"`
 }
 
 // GetNetStatus returns a best-effort status for the current epoch.
@@ -108,7 +110,9 @@ func (s *Service) GetNetStatus() NetStatus {
     now := time.Now().UTC()
     slot := s.params.CurrentSlot(now)
     off := s.params.EpochSlotOffset(slot)
-    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16, Slot: uint64(slot), EpochSlotOffset: off, TipHeight: h}
+    se := s.params.Epoch(slot)
+    sdms := uint64(s.params.SlotDuration / time.Millisecond)
+    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16, Slot: uint64(slot), EpochSlotOffset: off, TipHeight: h, SlotEpoch: se, SlotDurationMS: sdms}
 }
 
 // StartAIONService starts gossip handlers and periodic publisher.

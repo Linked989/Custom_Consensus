@@ -49,12 +49,13 @@ func main() {
 	memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
 	memTTL := flag.Duration("mempool-ttl", 60*time.Second, "mempool entry TTL")
 	memBytesCap := flag.Int("mempool-bytes-cap", 0, "mempool max total bytes (0 = unlimited)")
-	// Logging toggles
-	logHeartbeats := flag.Bool("log-heartbeats", false, "log every heartbeat message")
-	logTx := flag.Bool("log-tx", false, "log every accepted tx from gossip")
-	logDev := flag.Bool("log-dev", false, "log dev tx publishes")
-	logBlockQueue := flag.Bool("log-block-queue", false, "log when blocks are queued waiting for parent")
-	logPrune := flag.Bool("log-mempool-prune", true, "log mempool pruning due to accepted blocks")
+    // Logging toggles
+    logHeartbeats := flag.Bool("log-heartbeats", false, "log every heartbeat message")
+    logTx := flag.Bool("log-tx", false, "log every accepted tx from gossip")
+    logDev := flag.Bool("log-dev", false, "log dev tx publishes")
+    logBlockQueue := flag.Bool("log-block-queue", false, "log when blocks are queued waiting for parent")
+    logPrune := flag.Bool("log-mempool-prune", true, "log mempool pruning due to accepted blocks")
+    logMempool := flag.Bool("log-mempool", false, "log mempool length in stats ticker")
 	bridgeURL := flag.String("bridge-url", "", "optional HTTP URL to forward validated txs (e.g., http://localhost:1337/tx)")
 	httpIn := flag.String("http", "", "optional HTTP listen addr to accept POST /tx and publish to gossip (e.g., :14000)")
 	// Dev generator
@@ -66,9 +67,11 @@ func main() {
 	swarmKeyPath := flag.String("pnet", "", "path to swarm.key for libp2p private network")
 	genSwarmKey := flag.String("gen-swarm-key", "", "generate a new swarm.key at the given path and exit")
 	dataDir := flag.String("data-dir", ".data", "directory for block/index storage")
-	// Logging
-	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
-	logFormat := flag.String("log-format", "text", "log format: text|json")
+    // Logging
+    logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
+    logFormat := flag.String("log-format", "text", "log format: text|json")
+    // Slots
+    slotDuration := flag.Duration("slot-duration", 500*time.Millisecond, "AION slot duration (e.g., 500ms)")
 	// AION: enabled by default (no dev flags)
 	listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
 	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
@@ -218,9 +221,12 @@ func main() {
 		time.Sleep(1 * time.Second)
 	}
 
-	// AION network service (commit/reveal/VRF + selection); enabled by default
-	aionParams := aion.DefaultParams()
-	aionSvc = aion.StartAIONService(ctx, h, ps, *chainID, aionParams, cellMgr)
+    // AION network service (commit/reveal/VRF + selection); enabled by default
+    aionParams := aion.DefaultParams()
+    // Override slot duration from CLI for visibility/testing
+    if slotDuration != nil && *slotDuration > 0 { aionParams.SlotDuration = *slotDuration }
+    aionSvc = aion.StartAIONService(ctx, h, ps, *chainID, aionParams, cellMgr)
+    logx.Info("aion params", "slot_duration_ms", int64(aionParams.SlotDuration/time.Millisecond), "epoch_length", aionParams.EpochLength)
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
@@ -255,15 +261,19 @@ func main() {
 				select {
 				case <-ctx.Done():
 					return
-				case <-t.C:
-					all := members.CountAndSweep()
-					connected := len(h.Network().Peers())
-					tipH, _ := blockchain.GetTip(*chainID)
-					logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH)
-					// Try to form a cell when threshold is met
-					if c := cellMgr.TryForm(devReg); c != nil {
-						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
-					}
+            case <-t.C:
+                all := members.CountAndSweep()
+                connected := len(h.Network().Peers())
+                tipH, _ := blockchain.GetTip(*chainID)
+                if logMempool != nil && *logMempool {
+                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "mempool_len", pool.Len())
+                } else {
+                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH)
+                }
+                // Try to form a cell when threshold is met
+                if c := cellMgr.TryForm(devReg); c != nil {
+                    logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
+                }
 				}
 			}
 		}()
