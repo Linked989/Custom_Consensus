@@ -190,7 +190,7 @@ func main() {
     aionSvc := aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams())
 
     if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, nil)
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
         defer srv.Shutdown(ctx)
     }
 
