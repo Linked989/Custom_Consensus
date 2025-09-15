@@ -83,6 +83,7 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
     // Subscribe to block topic directly to react quickly
     tB, err := ps.Join(blockTopicName); if err == nil {
         subB, _ := tB.Subscribe()
+        logx.Info("HELIOS L1 started", "block_topic", blockTopicName, "min_attesters", p.MinAttesters)
         go func() {
             for {
                 msg, err := subB.Next(ctx); if err != nil { return }
@@ -105,7 +106,10 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
 // Non-leader nodes will attest immediately.
 func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height int64, hash []byte, producerPub []byte, txs [][]byte) {
     // If this node is the leader, it does not attest.
-    if s.aion != nil && s.aion.LocalIsLeader() { return }
+    if s.aion != nil && s.aion.LocalIsLeader() {
+        // Leader does not attest; only non-leader nodes do attestation in L1
+        return
+    }
     // Construct sample checksum deterministically from the txs (first 8 tx SHA256 prefixes)
     hh := sha256.New()
     m := 0
@@ -121,9 +125,7 @@ func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height in
     sig, _ := s.h.Peerstore().PrivKey(s.h.ID()).Sign(toSign)
     att.Sig = sig
     by, _ := s.em.Marshal(att)
-    if err := s.publish(topicL1Attest, by); err == nil {
-        logx.Info("HELIOS L1 attested", "height", height, "epoch", epoch, "hash", short(hex.EncodeToString(hash)))
-    }
+    if err := s.publish(topicL1Attest, by); err == nil { logx.Info("HELIOS L1 attested", "height", height, "epoch", epoch, "hash", short(hex.EncodeToString(hash))) }
 }
 
 func (s *L1Service) onBlock(data []byte) {

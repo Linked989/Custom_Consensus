@@ -43,7 +43,7 @@ func (m *Manager) Status() *Cell {
 // TryForm tries to form a cell from the registry if not active and threshold met.
 func (m *Manager) TryForm(reg *iot.Registry) *Cell {
     m.mu.Lock(); defer m.mu.Unlock()
-    if m.cell != nil && m.cell.Active { return m.cell }
+    if m.cell != nil && m.cell.Active { return nil }
     devs := reg.List()
     if len(devs) < m.threshold { return nil }
     // Select devices by FirstSeen up to maxDevices (or threshold if maxDevices==0)
