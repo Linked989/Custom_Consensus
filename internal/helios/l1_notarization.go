@@ -72,6 +72,10 @@ type L1Service struct {
     recent     []L1Record
     recByHash  map[string]int // hashHex -> index in recent
     maxRecent  int
+
+    // topic handles
+    tAttest   *pubsub.Topic
+    tNotarize *pubsub.Topic
 }
 
 // StartL1 launches the L1 notarization service by block topic name.
@@ -85,6 +89,7 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
     // Join topics
     tA, _ := ps.Join(topicL1Attest)
     tN, _ := ps.Join(topicL1Notarize)
+    s.tAttest, s.tNotarize = tA, tN
     // Subscribe to block topic directly to react quickly
     if tB, err := ps.Join(blockTopicName); err == nil {
         subB, _ := tB.Subscribe()
@@ -119,6 +124,7 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
     // Join L1 topics
     tA, _ := ps.Join(topicL1Attest)
     tN, _ := ps.Join(topicL1Notarize)
+    s.tAttest, s.tNotarize = tA, tN
     // Subscribe to existing block topic
     if blockTopic != nil {
         if subB, err := blockTopic.Subscribe(); err == nil {
@@ -146,9 +152,9 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
 // OnBlockProposed should be called when a block is observed (e.g., by the local block subscriber).
 // Non-leader nodes will attest immediately.
 func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height int64, hash []byte, producerPub []byte, txs [][]byte) {
-    // If this node is the leader, it does not attest.
-    if s.aion != nil && s.aion.LocalIsLeader() {
-        // Leader does not attest; only non-leader nodes do attestation in L1
+    // If this node is the leader, normally it does not attest.
+    // Exception: if there are no peers (single-node demo), allow self-attest so /helios/status reflects progress.
+    if s.aion != nil && s.aion.LocalIsLeader() && len(s.h.Network().Peers()) > 0 {
         return
     }
     // Construct sample checksum deterministically from the txs (first 8 tx SHA256 prefixes)
@@ -166,7 +172,11 @@ func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height in
     sig, _ := s.h.Peerstore().PrivKey(s.h.ID()).Sign(toSign)
     att.Sig = sig
     by, _ := s.em.Marshal(att)
-    if err := s.publish(topicL1Attest, by); err == nil { logx.Info("HELIOS L1 attested", "height", height, "epoch", epoch, "hash", short(hex.EncodeToString(hash))) }
+    if err := s.publish(topicL1Attest, by); err == nil {
+        logx.Info("HELIOS L1 attested", "height", height, "epoch", epoch, "hash", short(hex.EncodeToString(hash)))
+        // Ensure local aggregation sees our attestation even if pubsub doesn't loop back
+        if s.tNotarize != nil { s.onAttest(s.tNotarize, by) }
+    }
 }
 
 func (s *L1Service) onBlock(data []byte) {
