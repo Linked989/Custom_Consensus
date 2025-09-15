@@ -593,10 +593,23 @@ func (s *Service) updateLeader(e uint64) {
 
 // IsLeader returns true if the given pubkey is elected leader for epoch e.
 func (s *Service) IsLeader(e uint64, pub []byte) bool {
-	ph := hex.EncodeToString(pub)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.leader[e] == ph
+    ph := hex.EncodeToString(pub)
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    return s.leader[e] == ph
+}
+
+// AcceptProducer returns true if there is no known leader for epoch e yet,
+// or if the provided producer pubkey matches the known leader. This avoids
+// premature rejection at epoch boundaries before election converges.
+func (s *Service) AcceptProducer(e uint64, pub []byte) bool {
+    ph := hex.EncodeToString(pub)
+    s.mu.Lock(); defer s.mu.Unlock()
+    if v, ok := s.leader[e]; ok && v != "" {
+        return v == ph
+    }
+    // No leader known yet for this epoch: accept provisionally
+    return true
 }
 
 // LocalIsLeader reports if this node is leader for the epoch of the current chain tip.

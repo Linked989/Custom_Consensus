@@ -235,7 +235,7 @@ func main() {
 	// enable block sync protocol
 	blockchain.RegisterBlockSync(h)
 	// Leader enforcement predicate from AION
-	leaderOK := func(epoch uint64, producerPub []byte) bool { return aionSvc.IsLeader(epoch, producerPub) }
+    leaderOK := func(epoch uint64, producerPub []byte) bool { return aionSvc.AcceptProducer(epoch, producerPub) }
 	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax, leaderOK)
 	if err != nil {
 		logx.Error("block sub", "err", err)
