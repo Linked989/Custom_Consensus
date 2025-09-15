@@ -149,6 +149,7 @@ func (s *L1Service) onBlock(data []byte) {
     // Compute epoch like subscriber (height-based, 64 slots per epoch)
     var epoch uint64
     if blk.Height > 0 { epoch = uint64(blk.Height-1) / 64 }
+    if len(blk.Hash) > 0 { s.recordObserved(hex.EncodeToString(blk.Hash), epoch, blk.Height) }
     // attest if non-leader
     s.OnBlockProposed(context.Background(), epoch, blk.Height, blk.Hash, blk.ProducerPub, blk.Txs)
 }
@@ -167,6 +168,7 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
     first := s.first[key]
     need := s.params.MinAttesters
     s.mu.Unlock()
+    s.updateAttesters(key, a.Epoch, a.Height, cnt)
     if cnt >= need {
         // Notarize once
         dt := time.Since(first)
@@ -230,4 +232,30 @@ func (s *L1Service) RecentStatus() []L1Record {
     out := make([]L1Record, len(s.recent))
     copy(out, s.recent)
     return out
+}
+
+func (s *L1Service) recordObserved(hashHex string, epoch uint64, height int64) {
+    s.mu.Lock(); defer s.mu.Unlock()
+    if _, ok := s.recByHash[hashHex]; ok { return }
+    rec := L1Record{Epoch: epoch, Height: height, Hash: hashHex, Notarized: false, Attesters: 0, LatencyMS: 0, When: time.Now().UnixMilli()}
+    s.recent = append([]L1Record{rec}, s.recent...)
+    if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
+    s.recByHash = make(map[string]int, len(s.recent))
+    for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
+}
+
+func (s *L1Service) updateAttesters(hashHex string, epoch uint64, height int64, attesters int) {
+    s.mu.Lock(); defer s.mu.Unlock()
+    if idx, ok := s.recByHash[hashHex]; ok {
+        r := s.recent[idx]
+        r.Attesters = attesters
+        r.When = time.Now().UnixMilli()
+        s.recent[idx] = r
+        return
+    }
+    rec := L1Record{Epoch: epoch, Height: height, Hash: hashHex, Notarized: false, Attesters: attesters, When: time.Now().UnixMilli()}
+    s.recent = append([]L1Record{rec}, s.recent...)
+    if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
+    s.recByHash = make(map[string]int, len(s.recent))
+    for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
 }
