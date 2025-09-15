@@ -184,6 +184,13 @@ func main() {
         os.Exit(1)
     }
 
+    // Start HTTP API early so devices can register while we wait for preflight.
+    if *httpIn != "" {
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
+        defer srv.Shutdown(ctx)
+        logx.Info("http api", "listen", *httpIn)
+    }
+
     // Preflight: ensure at least 2 nodes present and minimum devices are connected locally
     // before starting blockchain services. Log progress while waiting.
     for {
@@ -208,11 +215,6 @@ func main() {
 
     // AION network service (commit/reveal/VRF + selection); enabled by default
     aionSvc := aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams(), cellMgr)
-
-    if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
-        defer srv.Shutdown(ctx)
-    }
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
