@@ -562,18 +562,25 @@ func (s *Service) updateLeader(e uint64) {
 		const reset = "\x1b[0m"
 		// Election header
 		logx.Info(cyan+"AION ELECTION"+reset, "epoch", e, "candidates", cand)
-    // Candidates detail
-    for pubhex, rec := range entries {
-        r := RankValue(rec.y, wt)
-        r16 := binary.BigEndian.Uint16(r[0:2])
-        col := red
-        if pubhex == bestPub {
-            col = green
+        // Candidates detail
+        for pubhex, rec := range entries {
+            r := RankValue(rec.y, wt)
+            r16 := binary.BigEndian.Uint16(r[0:2])
+            col := red
+            if pubhex == bestPub {
+                col = green
+            }
+            var hcell uint32
+            if s.ent[e] != nil { hcell = s.ent[e][pubhex] }
+            // derive peer ID from pub for human-readable mapping
+            candPeer := ""
+            if b, err := hex.DecodeString(pubhex); err == nil {
+                if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
+                    if pid, err := peer.IDFromPublicKey(pk); err == nil { candPeer = pid.String() }
+                }
+            }
+            logx.Info(col+"candidate"+reset, "peer_id", candPeer, "pub", pubhex, "rank16", r16, "cell_entropy_q16", hcell)
         }
-        var hcell uint32
-        if s.ent[e] != nil { hcell = s.ent[e][pubhex] }
-        logx.Info(col+"candidate"+reset, "pub", pubhex, "rank16", r16, "cell_entropy_q16", hcell)
-    }
     // Result line
     var hwin uint32
     if s.ent[e] != nil { hwin = s.ent[e][bestPub] }
