@@ -543,9 +543,6 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                     default:
                     }
                 }
-                if len(batch) == 0 {
-                    continue
-                }
                 // build block with limits (count, bytes)
                 blk := Block{Version: 1, ChainID: chainID, Height: height, PrevHash: prev, Timestamp: time.Now().UTC()}
                 var total int
