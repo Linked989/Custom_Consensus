@@ -162,7 +162,7 @@ func (s *Service) run(ctx context.Context) {
                     // New epoch: ensure commit for current e (bootstrap), also publish commit for e+1, then reveal+vrf for e
                     s.publishCommit(ctx, tC, uint64(e))
                     s.publishCommit(ctx, tC, uint64(e+1))
-                    s.publishRevealAndVRF(ctx, tR, tV, uint64(e), tip)
+                    s.publishRevealAndVRF(ctx, tR, tV, uint64(e))
                     // On epoch boundary, compute and log cell entropy for previous epoch window if cell is active
                     if s.cellMgr != nil {
                         c := s.cellMgr.Status()
@@ -212,7 +212,7 @@ func (s *Service) publishCommit(ctx context.Context, t *pubsub.Topic, e uint64) 
     logx.Info("aion commit", "epoch", e)
 }
 
-func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic, e uint64, lastTip []byte) {
+func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic, e uint64) {
     pub := s.getPubBytes(); if len(pub) == 0 { return }
     seed := s.seedForEpoch(e)
     // Ensure we had a commit cached (best effort)
@@ -221,8 +221,9 @@ func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic,
         by, _ := s.em.Marshal(msg)
         _ = tR.Publish(ctx, by)
     }
-    // VRF over input = seed || challenge
-    ch := Challenge(lastTip, e)
+    // VRF over input = seed || challenge where challenge is derived from
+    // the canonical epoch boundary block to avoid divergence across nodes.
+    ch := s.challengeForEpoch(e)
     input := append(append([]byte{}, seed...), ch[:]...)
     vrf := newEd25519VRF(s.h.Peerstore().PrivKey(s.h.ID()))
     y, proof, err := vrf.Evaluate(input)
@@ -231,6 +232,27 @@ func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic,
     by, _ := s.em.Marshal(msgV)
     _ = tV.Publish(ctx, by)
     logx.Info("aion reveal+vrf", "epoch", e)
+}
+
+// challengeForEpoch computes the epoch challenge from the boundary block hash at height e*epochLen.
+// For epoch 0 or if the boundary block is unavailable locally, falls back to using only the epoch number.
+func (s *Service) challengeForEpoch(e uint64) [32]byte {
+    if s.epochLen == 0 || e == 0 {
+        return Challenge(nil, e)
+    }
+    boundaryHeight := int64(e * s.epochLen)
+    if boundaryHeight <= 0 {
+        return Challenge(nil, e)
+    }
+    hashHex, ok := blockchain.GetHashByHeight(s.chainID, boundaryHeight)
+    if !ok || len(hashHex) == 0 {
+        return Challenge(nil, e)
+    }
+    hb, err := hex.DecodeString(hashHex)
+    if err != nil {
+        return Challenge(nil, e)
+    }
+    return Challenge(hb, e)
 }
 
 func (s *Service) onCommit(by []byte) {
