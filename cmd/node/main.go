@@ -15,6 +15,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
 	"pose/internal/blockchain"
+	"pose/internal/aion"
 	"pose/internal/cell"
 	"pose/internal/dev"
 	"pose/internal/gossip"
@@ -70,6 +71,12 @@ func main() {
 	// Logging
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
+    // AION dev logging
+    aionLog := flag.Bool("aion-log", false, "log AION slot/epoch progression (dev only)")
+    // AION leader gating (feature-flag; does not alter hashing/signature paths)
+    aionLeader := flag.Bool("aion-leader", false, "gate block production on AION leadership (dev only)")
+    aionForceLeader := flag.Bool("aion-force-leader", false, "force leader active locally (dev only)")
+    aionForceFollower := flag.Bool("aion-force-follower", false, "force follower (disable local production) (dev only)")
     listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
     listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
     cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
@@ -201,12 +208,23 @@ func main() {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
-	if *produceBlocks {
-		if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax); err != nil {
-			logx.Error("block builder", "err", err)
-			os.Exit(1)
-		}
-	}
+    if *produceBlocks {
+            var allow func() bool
+            if *aionLeader {
+                if *aionForceLeader { aion.SetLeaderActive(true) }
+                if *aionForceFollower { aion.SetLeaderActive(false) }
+                allow = func() bool { return aion.IsLeaderActive() }
+            }
+            if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax, allow); err != nil {
+                logx.Error("block builder", "err", err)
+                os.Exit(1)
+            }
+    }
+
+    if *aionLog {
+        params := aion.DefaultParams()
+        aion.StartSlotLogger(ctx, params)
+    }
 
 	if statsInterval != nil && *statsInterval > 0 {
 		var entropyOnce sync.Once

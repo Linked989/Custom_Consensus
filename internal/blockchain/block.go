@@ -479,7 +479,7 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
 
 // StartBlockBuilderFromPool builds blocks by draining transactions from a local mempool.
 // It aligns the initial height/prev to the current persisted tip for the given chainID.
-func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.Pool, blkTopic *pubsub.Topic, chainID string, interval time.Duration, maxTxs int, maxBytes int) error {
+func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.Pool, blkTopic *pubsub.Topic, chainID string, interval time.Duration, maxTxs int, maxBytes int, allowProduce func() bool) error {
     // internal staging channel fed from the mempool
     mem := make(chan []byte, 4096)
     go func() {
@@ -514,6 +514,12 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
             case <-ctx.Done():
                 return
             case <-ticker.C:
+                if allowProduce != nil {
+                    if ok := allowProduce(); !ok {
+                        // Skip this tick if not currently elected to produce
+                        continue
+                    }
+                }
                 // drain up to maxTxs
                 var batch [][]byte
                 for i := 0; i < maxTxs; i++ {
