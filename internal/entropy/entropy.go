@@ -100,6 +100,15 @@ func extractDataPart(b []byte) ([]byte, error) {
     return dataFromArray(arr)
 }
 
+// ExtractIoTDataSection decodes a COSE_Sign1 payload and extracts the IoT data
+// section under key 8. Returns the CBOR-encoded value bytes and true on success.
+// The returned bytes are canonical CBOR for deterministic downstream processing.
+func ExtractIoTDataSection(b []byte) ([]byte, bool) {
+    by, err := extractDataPart(b)
+    if err != nil || len(by) == 0 { return nil, false }
+    return by, true
+}
+
 func dataFromArray(arr []interface{}) ([]byte, error) {
     if len(arr) != 4 { return nil, errInvalid }
     var payload []byte

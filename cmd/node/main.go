@@ -44,7 +44,7 @@ func main() {
 	chainID := flag.String("chain-id", "iotnet-main", "chain/network id")
 	txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
 	blockTopicName := flag.String("block-topic", "pose/block/1.0.0", "pubsub topic for blocks")
-	produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
+    produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
 	blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
 	blockMax := flag.Int("block-max", 100, "max txs per block")
 	blockBytesMax := flag.Int("block-bytes-max", 0, "max total tx bytes per block (0 = unlimited)")
@@ -71,13 +71,7 @@ func main() {
 	// Logging
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
-    // AION dev logging
-    aionLog := flag.Bool("aion-log", false, "log AION slot/epoch progression (dev only)")
-    // AION leader gating (feature-flag; does not alter hashing/signature paths)
-    aionLeader := flag.Bool("aion-leader", false, "gate block production on AION leadership (dev only)")
-    aionDenom := flag.Int("aion-denom", 64, "AION leader target denominator (1/x per slot before weighting)")
-    aionForceLeader := flag.Bool("aion-force-leader", false, "force leader active locally (dev only)")
-    aionForceFollower := flag.Bool("aion-force-follower", false, "force follower (disable local production) (dev only)")
+    // AION: enabled by default (no dev flags)
     listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
     listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
     cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
@@ -192,23 +186,11 @@ func main() {
 		os.Exit(1)
 	}
 
-    // Optional: start AION leader service early so HTTP can expose status
-    var aionSvc *aion.LeaderService
-    if *aionLeader {
-        if *aionForceLeader {
-            aion.SetLeaderActive(true)
-        } else if *aionForceFollower {
-            aion.SetLeaderActive(false)
-        } else {
-            params := aion.DefaultParams()
-            denom := *aionDenom
-            if denom <= 0 { denom = 1 }
-            aionSvc = aion.StartLeaderService(ctx, h, pool, *chainID, cellMgr, params, *blockInterval, uint16(denom))
-        }
-    }
+    // AION network service (commit/reveal/VRF + selection); enabled by default
+    aionSvc := aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams())
 
     if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, aionSvc)
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, nil)
         defer srv.Shutdown(ctx)
     }
 
@@ -219,25 +201,20 @@ func main() {
 	// Block gossip: subscribe always; optionally produce
 	// enable block sync protocol
 	blockchain.RegisterBlockSync(h)
-	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax)
+    // Leader enforcement predicate from AION
+    leaderOK := func(epoch uint64, producerPub []byte) bool { return aionSvc.IsLeader(epoch, producerPub) }
+    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax, leaderOK)
 	if err != nil {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
     if *produceBlocks {
-        var allow func() bool
-        if *aionLeader {
-            allow = func() bool { return aion.IsLeaderActive() }
-        }
+        // Gate production on being the elected leader for current epoch
+        allow := func() bool { return aionSvc.LocalIsLeader() }
         if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, *blockInterval, *blockMax, *blockBytesMax, allow); err != nil {
             logx.Error("block builder", "err", err)
             os.Exit(1)
         }
-    }
-
-    if *aionLog {
-        params := aion.DefaultParams()
-        aion.StartSlotLogger(ctx, params)
     }
 
 	if statsInterval != nil && *statsInterval > 0 {

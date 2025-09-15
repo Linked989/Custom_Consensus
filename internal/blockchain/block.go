@@ -581,7 +581,9 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
 }
 
 // StartBlockSubscriber subscribes to blockTopic and validates blocks.
-func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, expectedChain string, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
+// leaderOK, if non-nil, is used to enforce leader-only block acceptance. It receives the epoch and
+// the producer's public key bytes and must return true if this producer is elected leader.
+func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, expectedChain string, logQueue bool, maxTxs int, maxBytes int, leaderOK func(epoch uint64, producerPub []byte) bool) (*pubsub.Topic, error) {
 	topic, err := ps.Join(blockTopicName)
 	if err != nil {
 		return nil, err
@@ -601,6 +603,18 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
             // Chain ID check
             if blk.ChainID != expectedChain { logx.Warn("block wrong chain", "got", blk.ChainID, "want", expectedChain); continue }
             if err := Verify(&blk); err != nil { logx.Warn("block invalid", "err", err); continue }
+            // Enforce leader (if predicate provided)
+            if leaderOK != nil {
+                var epoch uint64
+                if blk.Height > 0 {
+                    const epochLen = 64
+                    epoch = uint64(blk.Height-1) / epochLen
+                }
+                if ok := leaderOK(epoch, blk.ProducerPub); !ok {
+                    logx.Warn("block rejected: not leader", "height", blk.Height, "epoch", epoch, "producer", blk.ProducerID)
+                    continue
+                }
+            }
             // Block limits: count and bytes
             if maxTxs > 0 && len(blk.Txs) > maxTxs { logx.Warn("block too many txs", "count", len(blk.Txs), "max", maxTxs); continue }
             if maxBytes > 0 {
@@ -698,8 +712,8 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 }
 
 // StartBlockSubscriberWithMempool wires block acceptance to mempool cleanup by txid.
-func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, expectedChain string, pool *mempool.Pool, logPrune bool, logQueue bool, maxTxs int, maxBytes int) (*pubsub.Topic, error) {
-    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName, expectedChain, logQueue, maxTxs, maxBytes)
+func StartBlockSubscriberWithMempool(ctx context.Context, h host.Host, ps *pubsub.PubSub, blockTopicName string, expectedChain string, pool *mempool.Pool, logPrune bool, logQueue bool, maxTxs int, maxBytes int, leaderOK func(epoch uint64, producerPub []byte) bool) (*pubsub.Topic, error) {
+    topic, err := StartBlockSubscriber(ctx, h, ps, blockTopicName, expectedChain, logQueue, maxTxs, maxBytes, leaderOK)
     if err != nil { return nil, err }
     // Subscribe again just to observe accepted blocks and prune mempool.
     sub, err := topic.Subscribe()
