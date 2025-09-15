@@ -13,8 +13,8 @@ import (
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
-	"pose/internal/blockchain"
 	"pose/internal/aion"
+	"pose/internal/blockchain"
 	"pose/internal/cell"
 	"pose/internal/dev"
 	"pose/internal/gossip"
@@ -42,8 +42,8 @@ func main() {
 	chainID := flag.String("chain-id", "iotnet-main", "chain/network id")
 	txTopicName := flag.String("tx-topic", txTopicDefault, "pubsub topic for transactions")
 	blockTopicName := flag.String("block-topic", "pose/block/1.0.0", "pubsub topic for blocks")
-    produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
-	blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
+	produceBlocks := flag.Bool("produce-blocks", false, "enable local block production")
+	// blockInterval := flag.Duration("block-interval", 2*time.Second, "block production interval")
 	blockMax := flag.Int("block-max", 100, "max txs per block")
 	blockBytesMax := flag.Int("block-bytes-max", 0, "max total tx bytes per block (0 = unlimited)")
 	memCapacity := flag.Int("mempool-cap", 8192, "mempool max entries")
@@ -69,11 +69,11 @@ func main() {
 	// Logging
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := flag.String("log-format", "text", "log format: text|json")
-    // AION: enabled by default (no dev flags)
-    listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
-    listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
-    cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
-    cellMax := flag.Int("cell-max-devices", 0, "maximum devices to include in a Cell (0 = unlimited)")
+	// AION: enabled by default (no dev flags)
+	listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
+	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
+	cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
+	cellMax := flag.Int("cell-max-devices", 0, "maximum devices to include in a Cell (0 = unlimited)")
 	var bootstraps multiFlag
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
 	flag.Parse()
@@ -143,8 +143,8 @@ func main() {
 	// IoT registry and libp2p device registration protocol
 	devReg := iot.NewRegistry(*chainID)
 	iot.RegisterIotHandler(h, devReg)
-    // Cell manager (uses registry)
-    cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin, *cellMax)
+	// Cell manager (uses registry)
+	cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin, *cellMax)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
@@ -168,57 +168,59 @@ func main() {
 	// Local mempool
 	pool := mempool.New(*memCapacity, *memTTL, *memBytesCap)
 
-    members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
-        m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)
-        if err != nil {
-            return nil, nil, err
-        }
-        t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool, *logTx)
-        if err != nil {
-            return nil, nil, err
-        }
-        return m, t, nil
-    }()
-    if err != nil {
-        logx.Error("gossip start", "err", err)
-        os.Exit(1)
-    }
+	members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
+		m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)
+		if err != nil {
+			return nil, nil, err
+		}
+		t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool, *logTx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return m, t, nil
+	}()
+	if err != nil {
+		logx.Error("gossip start", "err", err)
+		os.Exit(1)
+	}
 
-    // Prepare aion service pointer and getter closure for HTTP.
-    var aionSvc *aion.Service
-    getAION := func() *aion.Service { return aionSvc }
-    // Start HTTP API early so devices can register while we wait for preflight.
-    if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION)
-        defer srv.Shutdown(ctx)
-        logx.Info("http api", "listen", *httpIn)
-    }
+	// Prepare aion service pointer and getter closure for HTTP.
+	var aionSvc *aion.Service
+	getAION := func() *aion.Service { return aionSvc }
+	// Start HTTP API early so devices can register while we wait for preflight.
+	if *httpIn != "" {
+		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION)
+		defer srv.Shutdown(ctx)
+		logx.Info("http api", "listen", *httpIn)
+	}
 
-    // Preflight: ensure at least 2 nodes present and minimum devices are connected locally
-    // before starting blockchain services. Log progress while waiting.
-    for {
-        if ctx.Err() != nil { return }
-        total := members.CountAndSweep()
-        peers := len(h.Network().Peers())
-        devs := devReg.List()
-        haveNodes := total >= 2 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
-        haveDevices := len(devs) >= *cellMin
-        if haveDevices {
-            if c := cellMgr.TryForm(devReg); c != nil && c.Active {
-                // formed; proceed to node start after both conditions satisfied
-            }
-        }
-        if haveNodes && haveDevices {
-            logx.Info("preflight ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs))
-            break
-        }
-        logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", *cellMin)
-        time.Sleep(1 * time.Second)
-    }
+	// Preflight: ensure at least 2 nodes present and minimum devices are connected locally
+	// before starting blockchain services. Log progress while waiting.
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		total := members.CountAndSweep()
+		peers := len(h.Network().Peers())
+		devs := devReg.List()
+		haveNodes := total >= 2 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
+		haveDevices := len(devs) >= *cellMin
+		if haveDevices {
+			if c := cellMgr.TryForm(devReg); c != nil && c.Active {
+				// formed; proceed to node start after both conditions satisfied
+			}
+		}
+		if haveNodes && haveDevices {
+			logx.Info("preflight ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs))
+			break
+		}
+		logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", *cellMin)
+		time.Sleep(1 * time.Second)
+	}
 
-    // AION network service (commit/reveal/VRF + selection); enabled by default
-    aionParams := aion.DefaultParams()
-    aionSvc = aion.StartAIONService(ctx, h, ps, *chainID, aionParams, cellMgr)
+	// AION network service (commit/reveal/VRF + selection); enabled by default
+	aionParams := aion.DefaultParams()
+	aionSvc = aion.StartAIONService(ctx, h, ps, *chainID, aionParams, cellMgr)
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
@@ -227,45 +229,45 @@ func main() {
 	// Block gossip: subscribe always; optionally produce
 	// enable block sync protocol
 	blockchain.RegisterBlockSync(h)
-    // Leader enforcement predicate from AION
-    leaderOK := func(epoch uint64, producerPub []byte) bool { return aionSvc.IsLeader(epoch, producerPub) }
-    blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax, leaderOK)
+	// Leader enforcement predicate from AION
+	leaderOK := func(epoch uint64, producerPub []byte) bool { return aionSvc.IsLeader(epoch, producerPub) }
+	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax, leaderOK)
 	if err != nil {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
-    if *produceBlocks {
-        // Gate production on being the elected leader for current epoch
-        allow := func() bool { return aionSvc.LocalIsLeader() }
-        // Produce one block per slot using AION slot duration
-        blkInterval := aionParams.SlotDuration
-        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, blkInterval, *blockMax, *blockBytesMax, allow); err != nil {
-            logx.Error("block builder", "err", err)
-            os.Exit(1)
-        }
-    }
+	if *produceBlocks {
+		// Gate production on being the elected leader for current epoch
+		allow := func() bool { return aionSvc.LocalIsLeader() }
+		// Produce one block per slot using AION slot duration
+		blkInterval := aionParams.SlotDuration
+		if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, blkInterval, *blockMax, *blockBytesMax, allow); err != nil {
+			logx.Error("block builder", "err", err)
+			os.Exit(1)
+		}
+	}
 
-    if statsInterval != nil && *statsInterval > 0 {
-        go func() {
-            t := time.NewTicker(*statsInterval)
-            defer t.Stop()
-            for {
-                select {
-                case <-ctx.Done():
-                    return
-                case <-t.C:
-                    all := members.CountAndSweep()
-                    connected := len(h.Network().Peers())
-                    tipH, _ := blockchain.GetTip(*chainID)
-                    logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH)
-                    // Try to form a cell when threshold is met
-                    if c := cellMgr.TryForm(devReg); c != nil {
-                        logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
-                    }
-                }
-            }
-        }()
-    }
+	if statsInterval != nil && *statsInterval > 0 {
+		go func() {
+			t := time.NewTicker(*statsInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					all := members.CountAndSweep()
+					connected := len(h.Network().Peers())
+					tipH, _ := blockchain.GetTip(*chainID)
+					logx.Info("stats", "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH)
+					// Try to form a cell when threshold is met
+					if c := cellMgr.TryForm(devReg); c != nil {
+						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
+					}
+				}
+			}
+		}()
+	}
 
 	// Periodically list IoT devices if requested
 	if *listIot && listIotInterval != nil && *listIotInterval > 0 {
