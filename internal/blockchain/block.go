@@ -528,6 +528,20 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
             case <-ctx.Done():
                 return
             case <-ticker.C:
+                // Re-sync builder cursor to the current chain tip before proposing,
+                // so we always append to the latest known tip even if remote blocks
+                // advanced the chain since the builder started.
+                ch := getChain(chainID)
+                ch.mu.Lock()
+                curTip := ch.TipHeight
+                curHash := append([]byte(nil), ch.TipHash...)
+                ch.mu.Unlock()
+                // If our local cursor is behind or parent hash differs, reset.
+                if height != curTip+1 || !bytes.Equal(prev, curHash) {
+                    height = curTip + 1
+                    prev = curHash
+                    if height <= 0 { height = 1 }
+                }
                 if allowProduce != nil {
                     if ok := allowProduce(); !ok {
                         // Skip this tick if not currently elected to produce
