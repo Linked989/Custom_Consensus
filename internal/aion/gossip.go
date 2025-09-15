@@ -523,14 +523,15 @@ func (s *Service) updateLeader(e uint64) {
 	wt, hnorm := s.weightForEpoch(e)
 	// iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
 	s.mu.Lock()
-	entries := s.vrf[e]
-	// ents := s.ent[e]
-	candCount := len(entries)
-	s.mu.Unlock()
-	// Require at least two VRF candidates; entropy is optional for ranking.
-	if candCount < 2 {
-		return
-	}
+    entries := s.vrf[e]
+    entMap := s.ent[e]
+    candCount := len(entries)
+    entCount := len(entMap)
+    s.mu.Unlock()
+    // Require at least two VRF candidates and two entropy reports before electing
+    if candCount < 2 || entCount < 2 {
+        return
+    }
 	var bestPub string
 	var bestRank [33]byte
 	var init bool
@@ -545,15 +546,15 @@ func (s *Service) updateLeader(e uint64) {
 			bestPub, bestRank, init = pubhex, r, true
 			continue
 		}
-		if s.ent[e] != nil {
-			eb := s.ent[e][bestPub]
-			ec := s.ent[e][pubhex]
-			if ec > eb || (ec == eb && (CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub))) {
-				bestPub, bestRank = pubhex, r
-			}
-		} else if CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub) {
-			bestPub, bestRank = pubhex, r
-		}
+        if entMap != nil {
+            eb := entMap[bestPub]
+            ec := entMap[pubhex]
+            if ec > eb || (ec == eb && (CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub))) {
+                bestPub, bestRank = pubhex, r
+            }
+        } else if CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub) {
+            bestPub, bestRank = pubhex, r
+        }
 	}
 	if init {
 		s.mu.Lock()
@@ -630,14 +631,17 @@ func (s *Service) IsLeader(e uint64, pub []byte) bool {
 // or if the provided producer pubkey matches the known leader. This avoids
 // premature rejection at epoch boundaries before election converges.
 func (s *Service) AcceptProducer(e uint64, pub []byte) bool {
-	ph := hex.EncodeToString(pub)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if v, ok := s.leader[e]; ok && v != "" {
-		return v == ph
-	}
-	// No leader known yet for this epoch: accept provisionally
-	return true
+    ph := hex.EncodeToString(pub)
+    s.mu.Lock()
+    leader, has := s.leader[e]
+    cand := len(s.vrf[e])
+    ents := len(s.ent[e])
+    s.mu.Unlock()
+    // Accept provisionally until election has converged (both VRFs and entropies seen and leader chosen)
+    if !has || cand < 2 || ents < 2 {
+        return true
+    }
+    return leader == ph
 }
 
 // LocalIsLeader reports if this node is leader for the epoch of the current chain tip.

@@ -215,6 +215,7 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
     need := s.params.MinAttesters
     s.mu.Unlock()
     s.updateAttesters(key, a.Epoch, a.Height, cnt)
+    logx.Info("HELIOS L1 attest received", "epoch", a.Epoch, "height", a.Height, "hash", short(key), "attesters", cnt)
     if cnt >= need {
         // Notarize once
         dt := time.Since(first)
