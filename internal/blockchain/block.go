@@ -556,7 +556,7 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                     total += len(tx)
                     if maxTxs > 0 && len(blk.Txs) >= maxTxs { break }
                 }
-                if len(blk.Txs) == 0 { continue }
+                // Allow empty blocks so the chain advances one block per slot.
                 // compute Merkle root over txids (hex -> bytes)
                 var leaves [][]byte
                 for _, hx := range blk.TxIDs { if b, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, b) } }
