@@ -55,6 +55,55 @@ type Service struct {
     leader map[uint64]string // epoch -> pubhex
 }
 
+// NetStatus is a snapshot of AION election state for the current epoch.
+type NetStatus struct {
+    Epoch                 uint64    `json:"epoch"`
+    Candidates            int       `json:"candidates"`
+    WeightQ16             uint32    `json:"weight_q16"`
+    EntropyNormPrevQ16    [4]uint32 `json:"entropy_norm_prev_q16"`
+    LeaderPub             string    `json:"leader_pub_hex"`
+    LocalIsLeader         bool      `json:"local_is_leader"`
+    BestRank16            uint16    `json:"best_rank16"`
+}
+
+// GetNetStatus returns a best-effort status for the current epoch.
+func (s *Service) GetNetStatus() NetStatus {
+    // Determine current epoch (bootstrap to 0)
+    h, _ := blockchain.CurrentTip(s.chainID)
+    var e uint64
+    if s.epochLen == 0 {
+        e = 0
+    } else if h > 0 {
+        e = uint64(h-1) / s.epochLen
+    } else {
+        e = 0
+    }
+    // Weight and previous entropy normals
+    wt, hnorm := s.weightForEpoch(e)
+    // Candidates and leader
+    s.mu.Lock()
+    entries := s.vrf[e]
+    leader := s.leader[e]
+    s.mu.Unlock()
+    cand := len(entries)
+    // Recompute best rank for observability
+    var best [33]byte
+    var bestInit bool
+    for pubhex, rec := range entries {
+        r := RankValue(rec.y, wt)
+        if !bestInit || CmpRank(r, best) < 0 || (CmpRank(r, best) == 0 && pubhex < leader) {
+            best, bestInit = r, true
+        }
+    }
+    var r16 uint16
+    if bestInit { r16 = binary.BigEndian.Uint16(best[0:2]) }
+    // Local leader check
+    pub := s.getPubBytes()
+    var local bool
+    if len(pub) > 0 { local = s.IsLeader(e, pub) }
+    return NetStatus{Epoch: e, Candidates: cand, WeightQ16: wt, EntropyNormPrevQ16: hnorm, LeaderPub: leader, LocalIsLeader: local, BestRank16: r16}
+}
+
 // StartAIONService starts gossip handlers and periodic publisher.
 func StartAIONService(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID string, params Params, cm *cell.Manager) *Service {
     em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()

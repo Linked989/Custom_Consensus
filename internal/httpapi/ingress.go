@@ -22,11 +22,13 @@ import (
     "pose/internal/iot"
     "pose/internal/cell"
     "pose/internal/entropy"
+    "pose/internal/aion"
     // AION status endpoint disabled here; use blockchain and gossip for status
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager) *http.Server {
+// StartHTTPAPI starts the HTTP server. getAION may be nil; if provided, it should return the current AION service.
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service) *http.Server {
     mux := http.NewServeMux()
     mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
@@ -128,6 +130,21 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         resp["per_device"] = per
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(resp)
+    })
+    // GET /aion/status: network election status snapshot
+    mux.HandleFunc("/aion/status", func(w http.ResponseWriter, r *http.Request) {
+        if getAION == nil {
+            http.Error(w, "aion not available", http.StatusServiceUnavailable)
+            return
+        }
+        svc := getAION()
+        if svc == nil {
+            http.Error(w, "aion not initialized", http.StatusServiceUnavailable)
+            return
+        }
+        st := svc.GetNetStatus()
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(st)
     })
     // GET /iot/devices
     mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {

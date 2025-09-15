@@ -184,9 +184,12 @@ func main() {
         os.Exit(1)
     }
 
+    // Prepare aion service pointer and getter closure for HTTP.
+    var aionSvc *aion.Service
+    getAION := func() *aion.Service { return aionSvc }
     // Start HTTP API early so devices can register while we wait for preflight.
     if *httpIn != "" {
-        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr)
+        srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION)
         defer srv.Shutdown(ctx)
         logx.Info("http api", "listen", *httpIn)
     }
@@ -214,7 +217,7 @@ func main() {
     }
 
     // AION network service (commit/reveal/VRF + selection); enabled by default
-    aionSvc := aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams(), cellMgr)
+    aionSvc = aion.StartAIONService(ctx, h, ps, *chainID, aion.DefaultParams(), cellMgr)
 
 	if *devGen {
 		dev.StartDevGenerator(ctx, h, txTopic, *devReuseKey, *devInterval, *logDev)
