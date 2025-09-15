@@ -19,11 +19,14 @@ type Params struct {
 
 // DefaultParams returns the canonical AION parameters.
 func DefaultParams() Params {
-	return Params{
-		SlotDuration:     500 * time.Millisecond, // 1.5 seconds
-		EpochLength:      10,
-		LeadershipWindow: 5,
-		AlphaQ16:         0x00008000, // 0.5 in Q16.16 as a sane default; tunable via governance
-		Genesis:          time.Now().UTC(),
-	}
+    return Params{
+        // Keep slot duration modest for dev environments.
+        SlotDuration:     500 * time.Millisecond, // 0.5 seconds
+        // Must match the epoch computation used by the blockchain subscriber
+        // to ensure leader gating uses the same epoch boundaries.
+        EpochLength:      64,
+        LeadershipWindow: 5,
+        AlphaQ16:         0x00008000, // 0.5 in Q16.16 as a sane default; tunable via governance
+        Genesis:          time.Now().UTC(),
+    }
 }
