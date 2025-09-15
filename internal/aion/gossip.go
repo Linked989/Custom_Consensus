@@ -13,6 +13,8 @@ import (
     "github.com/libp2p/go-libp2p/core/host"
 
     "pose/internal/blockchain"
+    "pose/internal/cell"
+    "pose/internal/entropy"
     "pose/internal/logx"
 )
 
