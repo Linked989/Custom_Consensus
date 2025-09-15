@@ -152,11 +152,16 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
 // OnBlockProposed should be called when a block is observed (e.g., by the local block subscriber).
 // Non-leader nodes will attest immediately.
 func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height int64, hash []byte, producerPub []byte, txs [][]byte) {
-    // Decide leadership relative to the block's epoch, not the current tip.
-    if s.aion != nil && len(s.h.Network().Peers()) > 0 {
-        pub := s.pubBytes()
-        if len(pub) > 0 && s.aion.IsLeader(epoch, pub) {
-            // Leader for this epoch does not attest (only non-leaders attest)
+    // Attest from any non-producer node. This avoids relying on local leader
+    // state convergence and ensures prompt attestation from observers.
+    myPub := s.pubBytes()
+    if len(myPub) > 0 && len(producerPub) > 0 {
+        same := len(myPub) == len(producerPub)
+        if same {
+            for i := range myPub { if myPub[i] != producerPub[i] { same = false; break } }
+        }
+        if same && len(s.h.Network().Peers()) > 0 {
+            // If we are the producer and we have peers, we do not attest.
             return
         }
     }
@@ -175,7 +180,14 @@ func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height in
     sig, _ := s.h.Peerstore().PrivKey(s.h.ID()).Sign(toSign)
     att.Sig = sig
     by, _ := s.em.Marshal(att)
-    if err := s.publish(topicL1Attest, by); err == nil {
+    // Prefer pre-joined topic handle to publish
+    var perr error
+    if s.tAttest != nil {
+        perr = s.tAttest.Publish(ctx, by)
+    } else {
+        perr = s.publish(topicL1Attest, by)
+    }
+    if perr == nil {
         logx.Info("HELIOS L1 attested", "height", height, "epoch", epoch, "hash", short(hex.EncodeToString(hash)))
         // Ensure local aggregation sees our attestation even if pubsub doesn't loop back
         if s.tNotarize != nil { s.onAttest(s.tNotarize, by) }
