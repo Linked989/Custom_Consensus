@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	topicCommit = "aion/commit/1.0.0"
-	topicReveal = "aion/reveal/1.0.0"
-	topicVRF    = "aion/vrf/1.0.0"
+    topicCommit = "aion/commit/1.0.0"
+    topicReveal = "aion/reveal/1.0.0"
+    topicVRF    = "aion/vrf/1.0.0"
+    topicEntropy = "aion/entropy/1.0.0"
 )
 
 // Wire types (CBOR)
@@ -39,11 +40,19 @@ type msgReveal struct {
 	Commit []byte `cbor:"3,keyasint"`
 }
 type msgVRF struct {
-	Pub   []byte `cbor:"0,keyasint"`
-	Epoch uint64 `cbor:"1,keyasint"`
-	Input []byte `cbor:"2,keyasint"`
-	Y     []byte `cbor:"3,keyasint"`
-	Proof []byte `cbor:"4,keyasint"`
+    Pub   []byte `cbor:"0,keyasint"`
+    Epoch uint64 `cbor:"1,keyasint"`
+    Input []byte `cbor:"2,keyasint"`
+    Y     []byte `cbor:"3,keyasint"`
+    Proof []byte `cbor:"4,keyasint"`
+}
+
+// msgEntropy carries a node's per-epoch normalized cell entropy (Q16.16)
+// so that election can compare cell entropies across nodes.
+type msgEntropy struct {
+    Pub   []byte `cbor:"0,keyasint"`
+    Epoch uint64 `cbor:"1,keyasint"`
+    HNorm uint32 `cbor:"2,keyasint"`
 }
 
 // Service holds AION state and gossip handles.
