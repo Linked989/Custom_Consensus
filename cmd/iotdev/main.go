@@ -7,11 +7,13 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -58,7 +60,7 @@ func main() {
 	defer stop()
 
 	if *list {
-		if err := listDevices(*base); err != nil {
+		if err := listDevices(ctx, *base); err != nil {
 			log.Fatalf("list: %v", err)
 		}
 		return
@@ -89,11 +91,11 @@ func main() {
 		devs[i] = device{id: id, pub: pub, priv: priv, kid: kid, seq: 0}
 		// Register device to assigned registration base for cell membership
 		regBase := assign[i]
-		if err := registerDevice(regBase, devs[i]); err != nil {
+		if err := registerDevice(ctx, regBase, devs[i]); err != nil {
 			log.Fatalf("register %d at %s: %v", i+1, regBase, err)
 		}
 		// Also register key on TX node so this device can send TXs there regardless of cell
-		if err := registerKey(*txBase, devs[i]); err != nil {
+		if err := registerKey(ctx, *txBase, devs[i]); err != nil {
 			log.Fatalf("register key %d at %s: %v", i+1, *txBase, err)
 		}
 	}
@@ -119,16 +121,20 @@ func main() {
 					log.Printf("build error (%s): %v", d.id, err)
 					return
 				}
-				req, _ := http.NewRequest(http.MethodPost, *txBase+"/tx", bytes.NewReader(cose))
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, *txBase+"/tx", bytes.NewReader(cose))
 				req.Header.Set("Content-Type", "application/cbor")
-				resp, err := cli.Do(req)
+
+				// Retry until success or context canceled.
+				resp, err := doHTTPWithRetry(ctx, cli, req)
 				if err != nil {
-					log.Printf("post error (%s): %v", d.id, err)
+					// Happens on context cancellation; exit cleanly.
+					log.Printf("post aborted (%s): %v", d.id, err)
 					return
 				}
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
 				log.Printf("sent device=%s txid=%s status=%s", short(d.id), txid[:12], resp.Status)
+
 				if *once {
 					return
 				}
@@ -146,14 +152,15 @@ func main() {
 	wg.Wait()
 }
 
-func registerDevice(base string, d device) error {
+func registerDevice(ctx context.Context, base string, d device) error {
 	// HTTP: POST /iot/register {device_id, firmware, model, kid, pub}
 	body := fmt.Sprintf(`{"device_id":"%s","firmware":"1.0.0","model":"sim-sensor","kid":"%s","pub":"%s","sensors":["temp","humidity"],"caps":["push"]}`,
 		d.id, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
-	req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(base, "/")+"/iot/register", bytes.NewReader([]byte(body)))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/iot/register", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	cli := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cli.Do(req)
+
+	resp, err := doHTTPWithRetry(ctx, cli, req)
 	if err != nil {
 		return err
 	}
@@ -165,14 +172,14 @@ func registerDevice(base string, d device) error {
 	return nil
 }
 
-func registerKey(base string, d device) error {
+func registerKey(ctx context.Context, base string, d device) error {
 	// HTTP: POST /keys/register {kid: hex, pub: hex}
-	body := fmt.Sprintf(`{"kid":"%s","pub":"%s"}`,
-		hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
-	req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(base, "/")+"/keys/register", bytes.NewReader([]byte(body)))
+	body := fmt.Sprintf(`{"kid":"%s","pub":"%s"}`, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/keys/register", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	cli := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cli.Do(req)
+
+	resp, err := doHTTPWithRetry(ctx, cli, req)
 	if err != nil {
 		return err
 	}
@@ -184,8 +191,10 @@ func registerKey(base string, d device) error {
 	return nil
 }
 
-func listDevices(base string) error {
-	resp, err := http.Get(strings.TrimRight(base, "/") + "/iot/devices")
+func listDevices(ctx context.Context, base string) error {
+	cli := &http.Client{Timeout: 5 * time.Second}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/iot/devices", nil)
+	resp, err := doHTTPWithRetry(ctx, cli, req)
 	if err != nil {
 		return err
 	}
@@ -196,6 +205,84 @@ func listDevices(base string) error {
 	io.Copy(os.Stdout, resp.Body)
 	return nil
 }
+
+// --- Retry machinery ---
+
+func retryable(resp *http.Response, err error) bool {
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) {
+			return true // timeouts, temporary, etc.
+		}
+		msg := strings.ToLower(err.Error())
+		// Canonical dial/transport failures worth retrying.
+		if strings.Contains(msg, "connection refused") ||
+			strings.Contains(msg, "dial tcp") ||
+			strings.Contains(msg, "no such host") ||
+			strings.Contains(msg, "connection reset") ||
+			strings.Contains(msg, "tls handshake timeout") ||
+			strings.Contains(msg, "server misbehaving") {
+			return true
+		}
+		return false
+	}
+	// Retry on 425/429/5xx
+	if resp.StatusCode == 425 || resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode <= 599) {
+		return true
+	}
+	return false
+}
+
+func doHTTPWithRetry(ctx context.Context, cli *http.Client, req *http.Request) (*http.Response, error) {
+	const (
+		base   = 500 * time.Millisecond
+		max    = 30 * time.Second
+		factor = 2.0
+	)
+	backoff := base
+
+	for attempt := 0; ; attempt++ {
+		// Ensure the request carries the latest context on each attempt.
+		r := req.Clone(ctx)
+		resp, err := cli.Do(r)
+		if !retryable(resp, err) {
+			return resp, err
+		}
+		// Drain/close on retry to free connection.
+		if resp != nil && resp.Body != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		log.Printf("retrying %s %s (attempt=%d, next=%s): %s",
+			req.Method, req.URL.String(), attempt+1, backoff, errOrStatus(err, resp))
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff + time.Duration(rand.Int63n(int64(backoff/2)))):
+		}
+
+		// Exponential backoff with cap.
+		next := time.Duration(float64(backoff) * factor)
+		if next > max {
+			next = max
+		}
+		backoff = next
+	}
+}
+
+func errOrStatus(err error, resp *http.Response) string {
+	if err != nil {
+		return err.Error()
+	}
+	if resp != nil {
+		return resp.Status
+	}
+	return "unknown"
+}
+
+// --- Payload/COSE ---
 
 func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID string, seq uint64) ([]byte, string, error) {
 	payload := map[int]interface{}{
@@ -239,8 +326,12 @@ func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID strin
 	return out, hex.EncodeToString(txid[:]), nil
 }
 
+// --- Misc helpers ---
+
 func kidFromPub(pub ed25519.PublicKey) []byte { sum := sha256.Sum256(pub); return sum[:8] }
-func randBytes(n int) []byte                  { b := make([]byte, n); io.ReadFull(crand.Reader, b); return b }
+
+func randBytes(n int) []byte { b := make([]byte, n); io.ReadFull(crand.Reader, b); return b }
+
 func short(s string) string {
 	if len(s) > 12 {
 		return s[len(s)-12:]
@@ -250,12 +341,16 @@ func short(s string) string {
 
 // parseCSV splits a comma-separated list and trims empties/spaces.
 func parseCSV(s string) []string {
-	if strings.TrimSpace(s) == "" { return nil }
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
 	parts := strings.Split(s, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
-		if p == "" { continue }
+		if p == "" {
+			continue
+		}
 		out = append(out, strings.TrimRight(p, "/"))
 	}
 	return out
@@ -263,17 +358,26 @@ func parseCSV(s string) []string {
 
 // parseCaps parses caps CSV into a slice of length n (or 0s if empty).
 func parseCaps(s string, n int) []int {
-	if strings.TrimSpace(s) == "" { return make([]int, n) }
+	if strings.TrimSpace(s) == "" {
+		return make([]int, n)
+	}
 	parts := strings.Split(s, ",")
 	caps := make([]int, n)
 	for i := 0; i < n; i++ {
 		if i < len(parts) {
 			v := strings.TrimSpace(parts[i])
-			if v == "" { caps[i] = 0; continue }
+			if v == "" {
+				caps[i] = 0
+				continue
+			}
 			var val int
 			_, err := fmt.Sscanf(v, "%d", &val)
-			if err != nil { val = 0 }
-			if val < 0 { val = 0 }
+			if err != nil {
+				val = 0
+			}
+			if val < 0 {
+				val = 0
+			}
 			caps[i] = val
 		} else {
 			caps[i] = 0
@@ -291,9 +395,14 @@ func planAssignments(n int, bases []string, caps []int) []string {
 	for i := 0; i < n; i++ {
 		chosen := -1
 		for j := 0; j < len(bases); j++ {
-			if caps[j] == 0 || counts[j] < caps[j] { chosen = j; break }
+			if caps[j] == 0 || counts[j] < caps[j] {
+				chosen = j
+				break
+			}
 		}
-		if chosen == -1 { chosen = len(bases) - 1 }
+		if chosen == -1 {
+			chosen = len(bases) - 1
+		}
 		assign[i] = bases[chosen]
 		counts[chosen]++
 	}
@@ -303,6 +412,8 @@ func planAssignments(n int, bases []string, caps []int) []string {
 // summarizeAssignments prints counts per base for logging.
 func summarizeAssignments(assign []string) map[string]int {
 	counts := map[string]int{}
-	for _, b := range assign { counts[b]++ }
+	for _, b := range assign {
+		counts[b]++
+	}
 	return counts
 }
