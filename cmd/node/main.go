@@ -19,6 +19,7 @@ import (
 	"pose/internal/dev"
 	"pose/internal/gossip"
 	"pose/internal/httpapi"
+	"pose/internal/helios"
 	"pose/internal/iot"
 	"pose/internal/logx"
 	"pose/internal/mempool"
@@ -241,6 +242,9 @@ func main() {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
 	}
+
+	// HELIOS L1 notarization: start and wire to observe proposed blocks via subscriber callbacks.
+    _ = helios.StartL1(ctx, h, ps, aionSvc, helios.L1Params{}, *blockTopicName)
     // Always start builder; AllowProduceSlot gates production to elected leader.
     {
         allow := func() bool { return aionSvc.AllowProduceSlot() }

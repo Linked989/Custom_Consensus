@@ -579,7 +579,7 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                     logx.Error("block sign", "err", err)
                     continue
                 }
-                // Publish with a colored log
+                // Publish with a colored log and notify HELIOS (if wired by caller)
                 const green = "\x1b[32m"; const cyan = "\x1b[36m"; const reset = "\x1b[0m"
                 logx.Info(cyan+"propose block"+reset, "height", blk.Height, "txs", len(blk.Txs), "mempool_len", pool.Len())
                 data, err := encMode.Marshal(blk)
