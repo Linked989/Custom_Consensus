@@ -245,8 +245,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// HELIOS L1 notarization: start and wire to observe proposed blocks via subscriber callbacks.
-    l1svc = helios.StartL1(ctx, h, ps, aionSvc, helios.L1Params{}, *blockTopicName)
+    // HELIOS L1 notarization: start and observe the same block topic handle used by subscriber
+    l1svc = helios.StartL1FromTopic(ctx, h, ps, aionSvc, helios.L1Params{}, blkTopic)
     // Always start builder; AllowProduceSlot gates production to elected leader.
     {
         allow := func() bool { return aionSvc.AllowProduceSlot() }

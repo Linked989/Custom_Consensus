@@ -74,7 +74,7 @@ type L1Service struct {
     maxRecent  int
 }
 
-// StartL1 launches the L1 notarization service.
+// StartL1 launches the L1 notarization service by block topic name.
 func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Service, p L1Params, blockTopicName string) *L1Service {
     if p.MinAttesters <= 0 { p.MinAttesters = defaultL1Params().MinAttesters }
     if p.MaxLatency <= 0 { p.MaxLatency = defaultL1Params().MaxLatency }
@@ -86,7 +86,7 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
     tA, _ := ps.Join(topicL1Attest)
     tN, _ := ps.Join(topicL1Notarize)
     // Subscribe to block topic directly to react quickly
-    tB, err := ps.Join(blockTopicName); if err == nil {
+    if tB, err := ps.Join(blockTopicName); err == nil {
         subB, _ := tB.Subscribe()
         logx.Info("HELIOS L1 started", "block_topic", blockTopicName, "min_attesters", p.MinAttesters)
         go func() {
@@ -95,6 +95,8 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
                 s.onBlock(msg.Message.GetData())
             }
         }()
+    } else {
+        logx.Warn("HELIOS L1 could not join block topic", "topic", blockTopicName, "err", err)
     }
 
     subA, _ := tA.Subscribe()
@@ -104,6 +106,40 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
             s.onAttest(tN, msg.Message.GetData())
         }
     }()
+    return s
+}
+
+// StartL1FromTopic launches L1 notarization using an existing block topic handle (preferred).
+func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Service, p L1Params, blockTopic *pubsub.Topic) *L1Service {
+    if p.MinAttesters <= 0 { p.MinAttesters = defaultL1Params().MinAttesters }
+    if p.MaxLatency <= 0 { p.MaxLatency = defaultL1Params().MaxLatency }
+    em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
+    dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
+    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: "", seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), recByHash: make(map[string]int), maxRecent: 32}
+    // Join L1 topics
+    tA, _ := ps.Join(topicL1Attest)
+    tN, _ := ps.Join(topicL1Notarize)
+    // Subscribe to existing block topic
+    if blockTopic != nil {
+        if subB, err := blockTopic.Subscribe(); err == nil {
+            logx.Info("HELIOS L1 started", "block_topic", "(existing)", "min_attesters", p.MinAttesters)
+            go func() {
+                for {
+                    msg, err := subB.Next(ctx); if err != nil { return }
+                    s.onBlock(msg.Message.GetData())
+                }
+            }()
+        }
+    }
+    // L1 attestation subscriber
+    if subA, err := tA.Subscribe(); err == nil {
+        go func() {
+            for {
+                msg, err := subA.Next(ctx); if err != nil { return }
+                s.onAttest(tN, msg.Message.GetData())
+            }
+        }()
+    }
     return s
 }
 
