@@ -509,11 +509,17 @@ func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
 }
 
 func (s *Service) updateLeader(e uint64) {
-	wt, hnorm := s.weightForEpoch(e)
-	// iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
-	s.mu.Lock()
-	entries := s.vrf[e]
-	s.mu.Unlock()
+    wt, hnorm := s.weightForEpoch(e)
+    // iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
+    s.mu.Lock()
+    entries := s.vrf[e]
+    ents := s.ent[e]
+    candCount := len(entries)
+    entCount := len(ents)
+    s.mu.Unlock()
+    if candCount < 2 || entCount < 2 {
+        return
+    }
 	var bestPub string
 	var bestRank [33]byte
 	var init bool
