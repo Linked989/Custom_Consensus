@@ -175,11 +175,11 @@ func (s *Service) AllowProduceSlot() bool {
 	if !s.IsLeader(e, pub) {
 		return false
 	}
-    // Require at least two cells (entropy reports) to avoid split production at epoch start.
+    // Require at least two VRF candidates to avoid split production at epoch start.
     s.mu.Lock()
-    cells := len(s.ent[e])
+    cand := len(s.vrf[e])
     s.mu.Unlock()
-    if cells >= 2 {
+    if cand >= 2 {
         return true
     }
 	// If we're alone (no peers), allow production to avoid stalling demos.
@@ -517,7 +517,8 @@ func (s *Service) updateLeader(e uint64) {
     candCount := len(entries)
     entCount := len(ents)
     s.mu.Unlock()
-    if candCount < 2 || entCount < 2 {
+    // Require at least two VRF candidates; entropy is optional for ranking.
+    if candCount < 2 {
         return
     }
 	var bestPub string
