@@ -227,7 +227,7 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
         // Notarize once
         dt := time.Since(first)
         s.recordNotarized(key, a.Epoch, a.Height, cnt, dt)
-        s.mu.Lock(); delete(s.seen, key); delete(s.first, key); delete(s.attests, key); s.mu.Unlock()
+        s.mu.Lock(); delete(s.seen, key); delete(s.first, key); s.mu.Unlock()
         out := l1Notarized{Epoch: a.Epoch, Height: a.Height, Hash: append([]byte(nil), a.Hash...), Count: cnt, Attesters: [][]byte{a.Attester}}
         by, _ := s.em.Marshal(out)
         _ = tN.Publish(context.Background(), by)
@@ -270,6 +270,7 @@ func (s *L1Service) recordNotarized(hashHex string, epoch uint64, height int64, 
         r.LatencyMS = dt.Milliseconds()
         r.When = nowms
         s.recent[idx] = r
+        s.pruneAttestsLocked()
         return
     }
     rec := L1Record{Epoch: epoch, Height: height, Hash: hashHex, Notarized: true, Attesters: attesters, LatencyMS: dt.Milliseconds(), When: nowms}
@@ -278,6 +279,7 @@ func (s *L1Service) recordNotarized(hashHex string, epoch uint64, height int64, 
     s.recByHash = make(map[string]int, len(s.recent))
     for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
     if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
+    s.pruneAttestsLocked()
 }
 
 // RecentStatus returns a copy of the recent records.
@@ -296,6 +298,7 @@ func (s *L1Service) recordObserved(hashHex string, epoch uint64, height int64) {
     if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
     s.recByHash = make(map[string]int, len(s.recent))
     for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
+    s.pruneAttestsLocked()
 }
 
 func (s *L1Service) updateAttesters(hashHex string, epoch uint64, height int64, attesters int) {
@@ -305,6 +308,7 @@ func (s *L1Service) updateAttesters(hashHex string, epoch uint64, height int64, 
         r.Attesters = attesters
         r.When = time.Now().UnixMilli()
         s.recent[idx] = r
+        s.pruneAttestsLocked()
         return
     }
     rec := L1Record{Epoch: epoch, Height: height, Hash: hashHex, Notarized: false, Attesters: attesters, When: time.Now().UnixMilli()}
@@ -312,6 +316,20 @@ func (s *L1Service) updateAttesters(hashHex string, epoch uint64, height int64, 
     if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
     s.recByHash = make(map[string]int, len(s.recent))
     for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
+    s.pruneAttestsLocked()
+}
+
+// pruneAttestsLocked keeps attests entries only for hashes present in recent index.
+// Caller must hold s.mu when invoking this function.
+func (s *L1Service) pruneAttestsLocked() {
+    if len(s.attests) <= s.maxRecent { return }
+    allow := make(map[string]struct{}, len(s.recByHash))
+    for k := range s.recByHash { allow[k] = struct{}{} }
+    for k := range s.attests {
+        if _, ok := allow[k]; !ok {
+            delete(s.attests, k)
+        }
+    }
 }
 
 // AttestationInfo is a decoded, friendly view of an L1 attestation.
