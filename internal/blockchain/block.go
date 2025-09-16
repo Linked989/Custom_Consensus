@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+    "sort"
 
 	cbor "github.com/fxamacker/cbor/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -39,6 +40,17 @@ func init() {
 	em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
 	dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
 	encMode, decMode = em, dm
+}
+
+// Context key and helper for injecting L1 attestation fetcher into the block builder.
+type ctxKeyGetAttest struct{}
+
+// AttestFetcher returns raw CBOR-encoded attestations for a given parent block hash.
+type AttestFetcher func(parentHash []byte) [][]byte
+
+// WithAttestationFetcher attaches an attestation fetcher to ctx for consumption by the block builder.
+func WithAttestationFetcher(ctx context.Context, fn AttestFetcher) context.Context {
+    return context.WithValue(ctx, ctxKeyGetAttest{}, fn)
 }
 
 // SetDataDir configures on-disk storage location for blocks and indices.
@@ -76,6 +88,9 @@ type Block struct {
     Hash        []byte    `cbor:"9,keyasint"`
     Signature   []byte    `cbor:"10,keyasint"`
     TxRoot      []byte    `cbor:"11,keyasint"`
+    // L1Attestations optionally embeds raw CBOR-encoded HELIOS L1 attestation messages
+    // that refer to the parent block (PrevHash), enabling on-chain auditability.
+    L1Attestations [][]byte `cbor:"12,keyasint"`
 }
 
 // hashForSign returns the hash over the block fields excluding Hash and Signature.
@@ -374,6 +389,23 @@ func GetHashByHeight(chainID string, height int64) (string, bool) {
     return "", false
 }
 
+// ListRecentHashes returns up to n most recent known block hashes with heights, sorted by height desc.
+func ListRecentHashes(chainID string, n int) []struct{ Height int64; Hash string } {
+    if n <= 0 { n = 20 }
+    ch := getChain(chainID)
+    ch.mu.Lock(); defer ch.mu.Unlock()
+    // Collect pairs
+    type pair struct{ H int64; X string }
+    arr := make([]pair, 0, len(ch.known))
+    for x, h := range ch.known { arr = append(arr, pair{H: h, X: x}) }
+    // Sort by height desc
+    sort.Slice(arr, func(i, j int) bool { return arr[i].H > arr[j].H })
+    if len(arr) > n { arr = arr[:n] }
+    out := make([]struct{ Height int64; Hash string }, len(arr))
+    for i := range arr { out[i] = struct{ Height int64; Hash string }{Height: arr[i].H, Hash: arr[i].X} }
+    return out
+}
+
 // loadBlockTimestamp reads a stored block and returns its timestamp.
 func loadBlockTimestamp(chainID string, hashHex string) (time.Time, bool) {
     p := filepath.Join(blocksDir(chainID), strings.ToLower(hashHex)+".cbor")
@@ -575,6 +607,14 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
                 var leaves [][]byte
                 for _, hx := range blk.TxIDs { if b, err := hex.DecodeString(hx); err == nil { leaves = append(leaves, b) } }
                 blk.TxRoot = merkle.ComputeRoot(leaves)
+                // L1 attestations for parent (if any) can be injected by the caller via context value
+                if v := ctx.Value(ctxKeyGetAttest{}); v != nil {
+                    if fn, ok := v.(func([]byte) [][]byte); ok {
+                        if len(prev) > 0 {
+                            blk.L1Attestations = fn(prev)
+                        }
+                    }
+                }
                 if err := Sign(h, &blk); err != nil {
                     logx.Error("block sign", "err", err)
                     continue

@@ -67,6 +67,8 @@ type L1Service struct {
     seen map[string]map[string]struct{}
     // firstSeen time to compute latency
     first map[string]time.Time
+    // raw attestations per block hash (hex)
+    attests map[string][][]byte
 
     // recent records for HTTP status
     recent     []L1Record
@@ -84,7 +86,7 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
     if p.MaxLatency <= 0 { p.MaxLatency = defaultL1Params().MaxLatency }
     em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
     dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: blockTopicName, seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), recByHash: make(map[string]int), maxRecent: 32}
+    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: blockTopicName, seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32}
 
     // Join topics
     tA, _ := ps.Join(topicL1Attest)
@@ -120,7 +122,7 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
     if p.MaxLatency <= 0 { p.MaxLatency = defaultL1Params().MaxLatency }
     em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
     dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: "", seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), recByHash: make(map[string]int), maxRecent: 32}
+    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: "", seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32}
     // Join L1 topics
     tA, _ := ps.Join(topicL1Attest)
     tN, _ := ps.Join(topicL1Notarize)
@@ -152,19 +154,7 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
 // OnBlockProposed should be called when a block is observed (e.g., by the local block subscriber).
 // Non-leader nodes will attest immediately.
 func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height int64, hash []byte, producerPub []byte, txs [][]byte) {
-    // Attest from any non-producer node. This avoids relying on local leader
-    // state convergence and ensures prompt attestation from observers.
-    myPub := s.pubBytes()
-    if len(myPub) > 0 && len(producerPub) > 0 {
-        same := len(myPub) == len(producerPub)
-        if same {
-            for i := range myPub { if myPub[i] != producerPub[i] { same = false; break } }
-        }
-        if same && len(s.h.Network().Peers()) > 0 {
-            // If we are the producer and we have peers, we do not attest.
-            return
-        }
-    }
+    // Attest from all nodes (including producer) to increase redundancy.
     // Construct sample checksum deterministically from the txs (first 8 tx SHA256 prefixes)
     hh := sha256.New()
     m := 0
@@ -225,6 +215,7 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
     s.mu.Lock()
     if s.seen[key] == nil { s.seen[key] = make(map[string]struct{}); s.first[key] = time.Now() }
     s.seen[key][att] = struct{}{}
+    s.attests[key] = append(s.attests[key], append([]byte(nil), data...))
     cnt := len(s.seen[key])
     first := s.first[key]
     need := s.params.MinAttesters
@@ -235,7 +226,7 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
         // Notarize once
         dt := time.Since(first)
         s.recordNotarized(key, a.Epoch, a.Height, cnt, dt)
-        s.mu.Lock(); delete(s.seen, key); delete(s.first, key); s.mu.Unlock()
+        s.mu.Lock(); delete(s.seen, key); delete(s.first, key); delete(s.attests, key); s.mu.Unlock()
         out := l1Notarized{Epoch: a.Epoch, Height: a.Height, Hash: append([]byte(nil), a.Hash...), Count: cnt, Attesters: [][]byte{a.Attester}}
         by, _ := s.em.Marshal(out)
         _ = tN.Publish(context.Background(), by)
@@ -320,4 +311,17 @@ func (s *L1Service) updateAttesters(hashHex string, epoch uint64, height int64, 
     if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
     s.recByHash = make(map[string]int, len(s.recent))
     for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
+}
+
+// GetAttestationsFor returns up to max raw CBOR-encoded L1 attestation messages observed for the given block hash.
+// If max <= 0, returns all available. Returned slices are copies safe for use by caller.
+func (s *L1Service) GetAttestationsFor(hash []byte, max int) [][]byte {
+    key := hex.EncodeToString(hash)
+    s.mu.Lock(); defer s.mu.Unlock()
+    lst := s.attests[key]
+    if len(lst) == 0 { return nil }
+    if max > 0 && len(lst) > max { lst = lst[:max] }
+    out := make([][]byte, len(lst))
+    for i := range lst { out[i] = append([]byte(nil), lst[i]...) }
+    return out
 }

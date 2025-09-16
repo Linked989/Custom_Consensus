@@ -254,7 +254,12 @@ func main() {
     {
         allow := func() bool { return aionSvc.AllowProduceSlot() }
         blkInterval := aionParams.SlotDuration
-        if err := blockchain.StartBlockBuilderFromPool(ctx, h, pool, blkTopic, *chainID, blkInterval, *blockMax, *blockBytesMax, allow); err != nil {
+        // Inject attestation fetcher so builder can embed attestations for parent block
+        ctxAtt := blockchain.WithAttestationFetcher(ctx, func(parent []byte) [][]byte {
+            if l1svc == nil { return nil }
+            return l1svc.GetAttestationsFor(parent, 0)
+        })
+        if err := blockchain.StartBlockBuilderFromPool(ctxAtt, h, pool, blkTopic, *chainID, blkInterval, *blockMax, *blockBytesMax, allow); err != nil {
             logx.Error("block builder", "err", err)
             os.Exit(1)
         }

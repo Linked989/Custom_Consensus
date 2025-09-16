@@ -53,6 +53,16 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(out)
     })
+    // GET /blocks?n=20 — list recent block hashes
+    mux.HandleFunc("/blocks", func(w http.ResponseWriter, r *http.Request) {
+        n := 20
+        if qs := r.URL.Query().Get("n"); qs != "" {
+            if v, err := strconv.Atoi(qs); err == nil && v > 0 { n = v }
+        }
+        lst := blockchain.ListRecentHashes(chainID, n)
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]any{"blocks": lst})
+    })
     // POST /keys/register {kid: hex, pub: hex}
     mux.HandleFunc("/keys/register", func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost { http.Error(w, "POST only", http.StatusMethodNotAllowed); return }
@@ -73,12 +83,13 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
                 "version": blk.Version,
                 "chain_id": blk.ChainID,
                 "height": blk.Height,
-                "prev_hash": hash,
+                "prev_hash": strings.ToLower(hex.EncodeToString(blk.PrevHash)),
                 "timestamp": blk.Timestamp,
                 "producer_id": blk.ProducerID,
                 "tx_root": blk.TxRoot,
-                "hash": hash,
+                "hash": strings.ToLower(hash),
                 "txids": blk.TxIDs,
+                "l1_attestations": func() []string { if len(blk.L1Attestations)==0 {return nil}; out:=make([]string,len(blk.L1Attestations)); for i:=range blk.L1Attestations{ out[i]=hex.EncodeToString(blk.L1Attestations[i])}; return out }(),
             }
             w.Header().Set("Content-Type", "application/json")
             json.NewEncoder(w).Encode(out)
