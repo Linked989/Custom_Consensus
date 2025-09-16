@@ -250,7 +250,7 @@ func (s *Service) run(ctx context.Context) {
     go func() {
         tick := time.NewTicker(500 * time.Millisecond)
         defer tick.Stop()
-        var lastEpoch int64 = -1
+        var lastEpochBySlot uint64 = ^uint64(0)
         var lastEntropyTip int64 = -1
         var lastEntropyLog time.Time
         for {
@@ -258,41 +258,35 @@ func (s *Service) run(ctx context.Context) {
             case <-ctx.Done():
                 return
             case <-tick.C:
-                height, _ := blockchain.CurrentTip(s.chainID)
+                // Use wall-clock slot/epoch to drive epoch transitions and slot-0 actions
+                now := time.Now().UTC()
+                slot := s.params.CurrentSlot(now)
+                e := s.params.Epoch(slot)
                 if s.epochLen == 0 {
                     continue
                 }
-				// Bootstrap: if no blocks yet, operate at epoch 0 with current tip (may be empty)
-				var e int64
-				if height > 0 {
-					e = int64(uint64(height-1) / s.epochLen)
-				} else {
-					e = 0
-				}
-                if e != lastEpoch {
-                    // New epoch: ensure commit for current e (bootstrap), also publish commit for e+1, then reveal+vrf for e
+                if e != lastEpochBySlot {
+                    // Slot-0 of a new epoch: publish commit for e and e+1, and reveal+vrf for e
                     s.publishCommit(ctx, tC, uint64(e))
                     s.publishCommit(ctx, tC, uint64(e+1))
                     s.publishRevealAndVRF(ctx, tR, tV, uint64(e))
-                    // On epoch boundary, compute and log cell entropy for the epoch that just ended (e-1), if any.
+                    // Compute and publish entropy for the epoch that just ended (e-1), if any
                     if s.cellMgr != nil {
                         c := s.cellMgr.Status()
-                        if c != nil && c.Active {
-                            if e > 0 {
-                                prev := uint64(e - 1)
-                                score, used := entropy.ComputeCellEntropyForEpoch(s.chainID, c, prev, s.epochLen)
-                                if used > 0 {
-                                    logx.Info("cell entropy", "epoch", prev, "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
-                                }
-                                // publish normalized entropy for the previous epoch restricted to our cell
-                                hcell := EpochEntropyForCellQ16(s.chainID, prev, s.epochLen, c)
-                                s.publishEntropy(ctx, tE, prev, hcell)
+                        if c != nil && c.Active && e > 0 {
+                            prev := uint64(e - 1)
+                            score, used := entropy.ComputeCellEntropyForEpoch(s.chainID, c, prev, s.epochLen)
+                            if used > 0 {
+                                logx.Info("cell entropy", "epoch", prev, "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
                             }
+                            hcell := EpochEntropyForCellQ16(s.chainID, prev, s.epochLen, c)
+                            s.publishEntropy(ctx, tE, prev, hcell)
                         }
                     }
-                    lastEpoch = e
+                    lastEpochBySlot = e
                 }
                 // Rolling diagnostic: periodically compute a sliding-window cell entropy ending at tip
+                height, _ := blockchain.CurrentTip(s.chainID)
                 if s.cellMgr != nil {
                     c := s.cellMgr.Status()
                     if c != nil && c.Active {
