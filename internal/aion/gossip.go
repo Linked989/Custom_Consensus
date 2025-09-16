@@ -79,20 +79,20 @@ type Service struct {
 		y     [32]byte
 		proof []byte
 	}
-    ent map[uint64]map[string]uint32 // epoch -> pubhex -> cell entropy q16
+	ent map[uint64]map[string]uint32 // epoch -> pubhex -> cell entropy q16
 
-    // ranked schedule per epoch (pubhex list, sorted once per epoch)
-    schedule map[uint64][]string // epoch -> ordered pubhex list
-    // elected leader (legacy single leader for observability)
-    leader map[uint64]string // epoch -> pubhex
+	// ranked schedule per epoch (pubhex list, sorted once per epoch)
+	schedule map[uint64][]string // epoch -> ordered pubhex list
+	// elected leader (legacy single leader for observability)
+	leader map[uint64]string // epoch -> pubhex
 
-    // pending VRFs received before matching reveal (handle pubsub reordering)
-    pendingVRF map[uint64]map[string]struct{
-        pub   []byte
-        input []byte
-        y     [32]byte
-        proof []byte
-    }
+	// pending VRFs received before matching reveal (handle pubsub reordering)
+	pendingVRF map[uint64]map[string]struct {
+		pub   []byte
+		input []byte
+		y     [32]byte
+		proof []byte
+	}
 
 	// lifecycle: mark once leader elected to announce counters start
 	started bool
@@ -217,11 +217,16 @@ func (s *Service) AllowProduceSlot() bool {
 func StartAIONService(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID string, params Params, cm *cell.Manager) *Service {
 	em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
 	dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
-        seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
-            y     [32]byte
-            proof []byte
-        }), ent: make(map[uint64]map[string]uint32), schedule: make(map[uint64][]string), leader: make(map[uint64]string), pendingVRF: make(map[uint64]map[string]struct{pub []byte; input []byte; y [32]byte; proof []byte})}
+	s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
+		seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
+			y     [32]byte
+			proof []byte
+		}), ent: make(map[uint64]map[string]uint32), schedule: make(map[uint64][]string), leader: make(map[uint64]string), pendingVRF: make(map[uint64]map[string]struct {
+			pub   []byte
+			input []byte
+			y     [32]byte
+			proof []byte
+		})}
 	s.run(ctx)
 	return s
 }
@@ -277,7 +282,11 @@ func (s *Service) run(ctx context.Context) {
 
 	// Publisher: poll chain tip and publish at epoch boundaries
 	go func() {
-		tick := time.NewTicker(500 * time.Millisecond)
+		interval := s.params.SlotDuration
+		if interval <= 0 {
+			interval = 500 * time.Millisecond
+		}
+		tick := time.NewTicker(interval)
 		defer tick.Stop()
 		var lastEpochBySlot uint64 = ^uint64(0)
 		var lastEntropyTip int64 = -1
@@ -477,37 +486,50 @@ func (s *Service) onReveal(by []byte) {
 	if ok && !VerifyReveal(c, m.Seed) {
 		return
 	}
-    s.mu.Lock()
-    if s.rev[m.Epoch] == nil {
-        s.rev[m.Epoch] = make(map[string][]byte)
-    }
-    s.rev[m.Epoch][ph] = append([]byte(nil), m.Seed...)
-    // If we have a pending VRF for this peer/epoch (arrived before reveal), validate now
-    if pendMap := s.pendingVRF[m.Epoch]; pendMap != nil {
-        if pend, ok := pendMap[ph]; ok {
-            seed := s.rev[m.Epoch][ph]
-            // check seed prefix
-            if len(seed) > 0 && len(pend.input) >= len(seed) {
-                good := true
-                for i := range seed { if pend.input[i] != seed[i] { good = false; break } }
-                if good {
-                    if pub, err := crypto.UnmarshalPublicKey(pend.pub); err == nil {
-                        v := ed25519VRF{pub: pub}
-                        if v.Verify(pend.input, pend.y, pend.proof) {
-                            if s.vrf[m.Epoch] == nil { s.vrf[m.Epoch] = make(map[string]struct{ y [32]byte; proof []byte }) }
-                            s.vrf[m.Epoch][ph] = struct{ y [32]byte; proof []byte }{ y: pend.y, proof: append([]byte(nil), pend.proof...) }
-                            delete(pendMap, ph)
-                            // update leader with newly added candidate
-                            s.mu.Unlock()
-                            s.updateLeader(m.Epoch)
-                            return
-                        }
-                    }
-                }
-            }
-        }
-    }
-    s.mu.Unlock()
+	s.mu.Lock()
+	if s.rev[m.Epoch] == nil {
+		s.rev[m.Epoch] = make(map[string][]byte)
+	}
+	s.rev[m.Epoch][ph] = append([]byte(nil), m.Seed...)
+	// If we have a pending VRF for this peer/epoch (arrived before reveal), validate now
+	if pendMap := s.pendingVRF[m.Epoch]; pendMap != nil {
+		if pend, ok := pendMap[ph]; ok {
+			seed := s.rev[m.Epoch][ph]
+			// check seed prefix
+			if len(seed) > 0 && len(pend.input) >= len(seed) {
+				good := true
+				for i := range seed {
+					if pend.input[i] != seed[i] {
+						good = false
+						break
+					}
+				}
+				if good {
+					if pub, err := crypto.UnmarshalPublicKey(pend.pub); err == nil {
+						v := ed25519VRF{pub: pub}
+						if v.Verify(pend.input, pend.y, pend.proof) {
+							if s.vrf[m.Epoch] == nil {
+								s.vrf[m.Epoch] = make(map[string]struct {
+									y     [32]byte
+									proof []byte
+								})
+							}
+							s.vrf[m.Epoch][ph] = struct {
+								y     [32]byte
+								proof []byte
+							}{y: pend.y, proof: append([]byte(nil), pend.proof...)}
+							delete(pendMap, ph)
+							// update leader with newly added candidate
+							s.mu.Unlock()
+							s.updateLeader(m.Epoch)
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *Service) onVRF(by []byte) {
@@ -518,29 +540,44 @@ func (s *Service) onVRF(by []byte) {
 	if len(m.Pub) == 0 || len(m.Input) == 0 || len(m.Y) != 32 || len(m.Proof) == 0 {
 		return
 	}
-    // check reveal present and input prefix matches seed; if reveal not yet present, stash pending
-    ph := hex.EncodeToString(m.Pub)
-    s.mu.Lock()
-    var seed []byte
-    if rmap := s.rev[m.Epoch]; rmap != nil {
-        seed = rmap[ph]
-    }
-    s.mu.Unlock()
-    if len(seed) == 0 {
-        // Stash pending VRF to handle pubsub reordering
-        var y32 [32]byte; copy(y32[:], m.Y)
-        s.mu.Lock()
-        if s.pendingVRF[m.Epoch] == nil { s.pendingVRF[m.Epoch] = make(map[string]struct{pub []byte; input []byte; y [32]byte; proof []byte}) }
-        s.pendingVRF[m.Epoch][ph] = struct{pub []byte; input []byte; y [32]byte; proof []byte}{ pub: append([]byte(nil), m.Pub...), input: append([]byte(nil), m.Input...), y: y32, proof: append([]byte(nil), m.Proof...) }
-        s.mu.Unlock()
-        return
-    }
-    if len(m.Input) < len(seed) { return }
-    for i := range seed {
-        if m.Input[i] != seed[i] {
-            return
-        }
-    }
+	// check reveal present and input prefix matches seed; if reveal not yet present, stash pending
+	ph := hex.EncodeToString(m.Pub)
+	s.mu.Lock()
+	var seed []byte
+	if rmap := s.rev[m.Epoch]; rmap != nil {
+		seed = rmap[ph]
+	}
+	s.mu.Unlock()
+	if len(seed) == 0 {
+		// Stash pending VRF to handle pubsub reordering
+		var y32 [32]byte
+		copy(y32[:], m.Y)
+		s.mu.Lock()
+		if s.pendingVRF[m.Epoch] == nil {
+			s.pendingVRF[m.Epoch] = make(map[string]struct {
+				pub   []byte
+				input []byte
+				y     [32]byte
+				proof []byte
+			})
+		}
+		s.pendingVRF[m.Epoch][ph] = struct {
+			pub   []byte
+			input []byte
+			y     [32]byte
+			proof []byte
+		}{pub: append([]byte(nil), m.Pub...), input: append([]byte(nil), m.Input...), y: y32, proof: append([]byte(nil), m.Proof...)}
+		s.mu.Unlock()
+		return
+	}
+	if len(m.Input) < len(seed) {
+		return
+	}
+	for i := range seed {
+		if m.Input[i] != seed[i] {
+			return
+		}
+	}
 	pub, err := crypto.UnmarshalPublicKey(m.Pub)
 	if err != nil {
 		return
@@ -705,6 +742,11 @@ func (s *Service) LeaderForEpoch(e uint64) (string, bool) {
 	defer s.mu.Unlock()
 	v, ok := s.leader[e]
 	return v, ok
+}
+
+// EpochLength returns the configured epoch length in slots.
+func (s *Service) EpochLength() uint64 {
+	return s.epochLen
 }
 
 // ScheduledLeaderFor returns the pubkey hex scheduled to lead at the given epoch offset.

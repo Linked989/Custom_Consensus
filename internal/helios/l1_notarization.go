@@ -224,10 +224,14 @@ func (s *L1Service) onBlock(data []byte) {
 	if s.dm.Unmarshal(data, &blk) != nil {
 		return
 	}
-	// Compute epoch like subscriber (height-based, 64 slots per epoch)
+	// Compute epoch like subscriber using the active AION epoch length.
 	var epoch uint64
 	if blk.Height > 0 {
-		epoch = uint64(blk.Height-1) / 64
+		lenSlots := s.aion.EpochLength()
+		if lenSlots == 0 {
+			lenSlots = 1
+		}
+		epoch = uint64(blk.Height-1) / lenSlots
 	}
 	if len(blk.Hash) > 0 {
 		s.recordObserved(hex.EncodeToString(blk.Hash), epoch, blk.Height)
