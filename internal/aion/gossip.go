@@ -564,14 +564,25 @@ func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
 
 func (s *Service) updateLeader(e uint64) {
 	wt, _ := s.weightForEpoch(e)
-	// Build ordered schedule once per epoch: sort by VRF rank (y/Wt) asc, tie-break by node_id asc.
 	s.mu.Lock()
 	entries := s.vrf[e]
 	s.mu.Unlock()
 	if len(entries) == 0 {
 		return
 	}
-	// Collect candidates
+
+	// Check if we need to rebuild schedule
+	// Only rebuild if we have new VRF entries since last build
+	s.mu.Lock()
+	existingSched := s.schedule[e]
+	if len(existingSched) == len(entries) {
+		// Schedule already accounts for all known VRFs
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	// Build candidate list...
 	type cand struct {
 		pubhex string
 		pid    string
@@ -580,7 +591,6 @@ func (s *Service) updateLeader(e uint64) {
 	list := make([]cand, 0, len(entries))
 	for pubhex, rec := range entries {
 		r := RankValue(rec.y, wt)
-		// derive peer ID for tiebreak
 		pid := ""
 		if b, err := hex.DecodeString(pubhex); err == nil {
 			if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
@@ -591,24 +601,20 @@ func (s *Service) updateLeader(e uint64) {
 		}
 		list = append(list, cand{pubhex: pubhex, pid: pid, rank: r})
 	}
-	// Sort: rank asc, pid asc
+
 	sort.Slice(list, func(i, j int) bool {
 		if c := CmpRank(list[i].rank, list[j].rank); c != 0 {
 			return c < 0
 		}
 		return list[i].pid < list[j].pid
 	})
-	// Persist schedule and legacy leader (first element)
+
 	sched := make([]string, len(list))
 	for i := range list {
 		sched[i] = list[i].pubhex
 	}
+
 	s.mu.Lock()
-	existingSched := s.schedule[e]
-	if len(existingSched) >= len(sched) {
-		s.mu.Unlock()
-		return // Keep existing schedule
-	}
 	s.schedule[e] = sched
 	first := !s.started
 	if len(sched) > 0 {
