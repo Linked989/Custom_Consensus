@@ -72,7 +72,7 @@ func main() {
 	logFormat := flag.String("log-format", "text", "log format: text|json")
 	verboseLogs := flag.Bool("verbose", false, "enable verbose logs (default: startup line only)")
 	// Slots
-	slotDuration := flag.Duration("slot-duration", 5*time.Second, "AION slot duration (e.g., 5s)")
+	slotDuration := flag.Duration("slot-duration", 500*time.Millisecond, "AION slot duration (e.g., 500ms)")
 	// AION: enabled by default (no dev flags)
 	listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
 	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")

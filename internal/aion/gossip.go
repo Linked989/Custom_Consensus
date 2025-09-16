@@ -188,8 +188,24 @@ func (s *Service) AllowProduceSlot() bool {
 	sched := s.schedule[uint64(wallEpoch)]
 	s.mu.Unlock()
 
+	slotsPerLeader := 1
+	slotDur := s.params.SlotDuration
+	const leaderPeriod = 5 * time.Second
+	if slotDur > 0 {
+		div := (leaderPeriod + slotDur - 1) / slotDur // round up to ensure at least one slot
+		if div > 0 {
+			slotsPerLeader = int(div)
+		}
+	}
+	if slotsPerLeader < 1 {
+		slotsPerLeader = 1
+	}
+	groupIdx := int(off)
+	if slotsPerLeader > 1 {
+		groupIdx = int(off) / slotsPerLeader
+	}
 	if len(sched) > 0 {
-		idx := int(off) % len(sched)
+		idx := groupIdx % len(sched)
 		want := sched[idx]
 		return hex.EncodeToString(pub) == want
 	}
@@ -199,7 +215,7 @@ func (s *Service) AllowProduceSlot() bool {
 		s.mu.Unlock()
 		if len(prevSched) > 0 {
 			// Use previous epoch's last leaders for grace period
-			idx := (int(off) + int(s.epochLen) - 3) % len(prevSched)
+			idx := (groupIdx + len(prevSched) - 3) % len(prevSched)
 			want := prevSched[idx]
 			if hex.EncodeToString(pub) == want {
 				return true

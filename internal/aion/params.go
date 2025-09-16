@@ -21,10 +21,10 @@ type Params struct {
 func DefaultParams() Params {
 	return Params{
 		// Keep slot duration modest for dev environments.
-		SlotDuration: 5 * time.Second, // 5 seconds per slot
+		SlotDuration: 500 * time.Millisecond, // 0.5 seconds per slot
 		// Must match the epoch computation used by the blockchain subscriber
 		// to ensure leader gating uses the same epoch boundaries.
-		EpochLength:      3600, // 5 hours worth of 5-second slots
+		EpochLength:      36000, // 5 hours worth of 0.5-second slots
 		LeadershipWindow: 5,
 		AlphaQ16:         0x00008000, // 0.5 in Q16.16 as a sane default; tunable via governance
 		Genesis:          time.Now().UTC(),
