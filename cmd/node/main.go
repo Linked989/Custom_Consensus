@@ -78,6 +78,8 @@ func main() {
 	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
 	cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
 	cellMax := flag.Int("cell-max-devices", 0, "maximum devices to include in a Cell (0 = unlimited)")
+    // HELIOS L1
+    l1Min := flag.Int("l1-min-attesters", 2, "minimum distinct attesters required to notarize")
 	var bootstraps multiFlag
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
 	flag.Parse()
@@ -249,7 +251,7 @@ func main() {
 	}
 
     // HELIOS L1 notarization: start and observe the same block topic handle used by subscriber
-    l1svc = helios.StartL1FromTopic(ctx, h, ps, aionSvc, helios.L1Params{}, blkTopic)
+    l1svc = helios.StartL1FromTopic(ctx, h, ps, aionSvc, helios.L1Params{MinAttesters: *l1Min}, blkTopic)
     // Always start builder; AllowProduceSlot gates production to elected leader.
     {
         allow := func() bool { return aionSvc.AllowProduceSlot() }

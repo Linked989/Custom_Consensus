@@ -6,6 +6,7 @@ import (
     "encoding/hex"
     "sync"
     "time"
+    "strings"
 
     cbor "github.com/fxamacker/cbor/v2"
     pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -311,6 +312,39 @@ func (s *L1Service) updateAttesters(hashHex string, epoch uint64, height int64, 
     if len(s.recent) > s.maxRecent { s.recent = s.recent[:s.maxRecent] }
     s.recByHash = make(map[string]int, len(s.recent))
     for i := range s.recent { s.recByHash[s.recent[i].Hash] = i }
+}
+
+// AttestationInfo is a decoded, friendly view of an L1 attestation.
+type AttestationInfo struct {
+    Epoch     uint64 `json:"epoch"`
+    Height    int64  `json:"height"`
+    HashHex   string `json:"hash"`
+    Attester  string `json:"attester_pub_hex"`
+    Producer  string `json:"producer_pub_hex"`
+    SampleHex string `json:"sample_hex"`
+}
+
+// GetAttestationInfos returns up to max decoded attestation infos for the given block hash.
+// If max <= 0, returns all available.
+func (s *L1Service) GetAttestationInfos(hash []byte, max int) []AttestationInfo {
+    key := hex.EncodeToString(hash)
+    s.mu.Lock(); lst := s.attests[key]; s.mu.Unlock()
+    if len(lst) == 0 { return nil }
+    if max > 0 && len(lst) > max { lst = lst[:max] }
+    out := make([]AttestationInfo, 0, len(lst))
+    for _, raw := range lst {
+        var a l1Attest
+        if s.dm.Unmarshal(raw, &a) != nil { continue }
+        out = append(out, AttestationInfo{
+            Epoch: a.Epoch,
+            Height: a.Height,
+            HashHex: strings.ToLower(hex.EncodeToString(a.Hash)),
+            Attester: strings.ToLower(hex.EncodeToString(a.Attester)),
+            Producer: strings.ToLower(hex.EncodeToString(a.Producer)),
+            SampleHex: strings.ToLower(hex.EncodeToString(a.Sample)),
+        })
+    }
+    return out
 }
 
 // GetAttestationsFor returns up to max raw CBOR-encoded L1 attestation messages observed for the given block hash.

@@ -91,6 +91,17 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
                 "txids": blk.TxIDs,
                 "l1_attestations": func() []string { if len(blk.L1Attestations)==0 {return nil}; out:=make([]string,len(blk.L1Attestations)); for i:=range blk.L1Attestations{ out[i]=hex.EncodeToString(blk.L1Attestations[i])}; return out }(),
             }
+            // Augment with live HELIOS attestations if service available
+            if getHELIOS != nil {
+                svc := getHELIOS()
+                if svc != nil {
+                    if hh, err := hex.DecodeString(hash); err == nil {
+                        infos := svc.GetAttestationInfos(hh, 0)
+                        out["l1_attestations_live_count"] = len(infos)
+                        out["l1_attestations_live"] = infos
+                    }
+                }
+            }
             w.Header().Set("Content-Type", "application/json")
             json.NewEncoder(w).Encode(out)
             return
