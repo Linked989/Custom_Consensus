@@ -161,25 +161,23 @@ func (s *Service) GetNetStatus() NetStatus {
 // or (b) have no connected peers (single-node test setup).
 func (s *Service) AllowProduceSlot() bool {
     if s.epochLen == 0 { return false }
-    // Determine current slot and epoch offset
+    // Epoch based on chain height to align with VRF buckets and schedules
+    h, _ := blockchain.CurrentTip(s.chainID)
+    var e uint64
+    if h > 0 { e = uint64(h-1) / s.epochLen } else { e = 0 }
+    // Slot offset (for selecting scheduled leader index) based on wall clock
     now := time.Now().UTC()
-    slot := s.params.CurrentSlot(now)
-    e := s.params.Epoch(slot)
-    off := s.params.EpochSlotOffset(slot)
+    off := s.params.EpochSlotOffset(s.params.CurrentSlot(now))
     pub := s.getPubBytes(); if len(pub) == 0 { return false }
-    // If we have a schedule for this epoch, require the local pub to match the scheduled leader for this offset.
-    s.mu.Lock()
-    sched := s.schedule[e]
-    cand := len(s.vrf[e])
-    s.mu.Unlock()
+    // Prefer schedule if available
+    s.mu.Lock(); sched := s.schedule[e]; s.mu.Unlock()
     if len(sched) > 0 {
-        idx := int(off)
-        if len(sched) > 0 { idx = idx % len(sched) }
+        idx := int(off) % len(sched)
         want := sched[idx]
-        if hex.EncodeToString(pub) != want { return false }
-        return true
+        return hex.EncodeToString(pub) == want
     }
-    // Fallback: simple gating similar to before — be elected leader for this epoch and ensure enough candidates
+    // Fallback: allow legacy leader with minimum candidates, or single-node
+    s.mu.Lock(); cand := len(s.vrf[e]); s.mu.Unlock()
     if !s.IsLeader(e, pub) { return false }
     if cand >= 2 { return true }
     if len(s.h.Network().Peers()) == 0 { return true }
@@ -591,19 +589,11 @@ func (s *Service) IsLeader(e uint64, pub []byte) bool {
 // premature rejection at epoch boundaries before election converges.
 func (s *Service) AcceptProducer(e uint64, pub []byte) bool {
     ph := hex.EncodeToString(pub)
-    s.mu.Lock()
-    sched := s.schedule[e]
-    s.mu.Unlock()
-    if len(sched) == 0 {
-        // schedule not known yet; be permissive
-        return true
-    }
-    // Map current wall-clock slot to offset; accept if producer matches the scheduled leader for the current offset.
-    now := time.Now().UTC()
-    slot := s.params.CurrentSlot(now)
-    off := s.params.EpochSlotOffset(slot)
-    idx := int(off) % len(sched)
-    return sched[idx] == ph
+    s.mu.Lock(); sched := s.schedule[e]; s.mu.Unlock()
+    if len(sched) == 0 { return true } // schedule not known yet; be permissive
+    // Permissive acceptance: accept if producer appears in the epoch's schedule.
+    for _, p := range sched { if p == ph { return true } }
+    return false
 }
 
 // LocalIsLeader reports if this node is leader for the epoch of the current chain tip.
