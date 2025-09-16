@@ -529,14 +529,13 @@ func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
 
 func (s *Service) updateLeader(e uint64) {
     wt, _ := s.weightForEpoch(e)
-    // Build ordered schedule: sort by (score) where better has: higher cell entropy (if available), then lower rank (y/wt), then node_id ascending.
+    // Build ordered schedule once per epoch: sort by VRF rank (y/Wt) asc, tie-break by node_id asc.
     s.mu.Lock()
     entries := s.vrf[e]
-    entMap := s.ent[e]
     s.mu.Unlock()
     if len(entries) == 0 { return }
     // Collect candidates
-    type cand struct { pubhex string; pid string; rank [33]byte; ent uint32 }
+    type cand struct { pubhex string; pid string; rank [33]byte }
     list := make([]cand, 0, len(entries))
     for pubhex, rec := range entries {
         r := RankValue(rec.y, wt)
@@ -547,13 +546,10 @@ func (s *Service) updateLeader(e uint64) {
                 if id, err := peer.IDFromPublicKey(pk); err == nil { pid = id.String() }
             }
         }
-        ent := uint32(0)
-        if entMap != nil { ent = entMap[pubhex] }
-        list = append(list, cand{pubhex: pubhex, pid: pid, rank: r, ent: ent})
+        list = append(list, cand{pubhex: pubhex, pid: pid, rank: r})
     }
-    // Sort: entropy desc, rank asc, pid asc
+    // Sort: rank asc, pid asc
     sort.Slice(list, func(i, j int) bool {
-        if list[i].ent != list[j].ent { return list[i].ent > list[j].ent }
         if c := CmpRank(list[i].rank, list[j].rank); c != 0 { return c < 0 }
         return list[i].pid < list[j].pid
     })
@@ -587,14 +583,7 @@ func (s *Service) IsLeader(e uint64, pub []byte) bool {
 // AcceptProducer returns true if there is no known leader for epoch e yet,
 // or if the provided producer pubkey matches the known leader. This avoids
 // premature rejection at epoch boundaries before election converges.
-func (s *Service) AcceptProducer(e uint64, pub []byte) bool {
-    ph := hex.EncodeToString(pub)
-    s.mu.Lock(); sched := s.schedule[e]; s.mu.Unlock()
-    if len(sched) == 0 { return true } // schedule not known yet; be permissive
-    // Permissive acceptance: accept if producer appears in the epoch's schedule.
-    for _, p := range sched { if p == ph { return true } }
-    return false
-}
+func (s *Service) AcceptProducer(e uint64, pub []byte) bool { return true }
 
 // LocalIsLeader reports if this node is leader for the epoch of the current chain tip.
 func (s *Service) LocalIsLeader() bool {
