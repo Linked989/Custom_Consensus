@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"sort"
 	"sync"
 	"time"
 
@@ -80,8 +81,10 @@ type Service struct {
 	}
 	ent map[uint64]map[string]uint32 // epoch -> pubhex -> cell entropy q16
 
-	// elected leaders per epoch
-	leader map[uint64]string // epoch -> pubhex
+    // ranked schedule per epoch (pubhex list, sorted once per epoch)
+    schedule map[uint64][]string // epoch -> ordered pubhex list
+    // elected leader (legacy single leader for observability)
+    leader map[uint64]string // epoch -> pubhex
 
 	// lifecycle: mark once leader elected to announce counters start
 	started bool
@@ -157,47 +160,41 @@ func (s *Service) GetNetStatus() NetStatus {
 // Policy: must be elected leader locally AND either (a) seen >=2 VRF candidates for this epoch,
 // or (b) have no connected peers (single-node test setup).
 func (s *Service) AllowProduceSlot() bool {
-	if s.epochLen == 0 {
-		return false
-	}
-	// Compute current epoch from chain height
-	h, _ := blockchain.CurrentTip(s.chainID)
-	var e uint64
-	if h > 0 {
-		e = uint64(h-1) / s.epochLen
-	} else {
-		e = 0
-	}
-	pub := s.getPubBytes()
-	if len(pub) == 0 {
-		return false
-	}
-	if !s.IsLeader(e, pub) {
-		return false
-	}
-	// Require at least two VRF candidates to avoid split production at epoch start.
-	s.mu.Lock()
-	cand := len(s.vrf[e])
-	s.mu.Unlock()
-	if cand >= 2 {
-		return true
-	}
-	// If we're alone (no peers), allow production to avoid stalling demos.
-	if len(s.h.Network().Peers()) == 0 {
-		return true
-	}
-	return false
+    if s.epochLen == 0 { return false }
+    // Determine current slot and epoch offset
+    now := time.Now().UTC()
+    slot := s.params.CurrentSlot(now)
+    e := s.params.Epoch(slot)
+    off := s.params.EpochSlotOffset(slot)
+    pub := s.getPubBytes(); if len(pub) == 0 { return false }
+    // If we have a schedule for this epoch, require the local pub to match the scheduled leader for this offset.
+    s.mu.Lock()
+    sched := s.schedule[e]
+    cand := len(s.vrf[e])
+    s.mu.Unlock()
+    if len(sched) > 0 {
+        idx := int(off)
+        if len(sched) > 0 { idx = idx % len(sched) }
+        want := sched[idx]
+        if hex.EncodeToString(pub) != want { return false }
+        return true
+    }
+    // Fallback: simple gating similar to before — be elected leader for this epoch and ensure enough candidates
+    if !s.IsLeader(e, pub) { return false }
+    if cand >= 2 { return true }
+    if len(s.h.Network().Peers()) == 0 { return true }
+    return false
 }
 
 // StartAIONService starts gossip handlers and periodic publisher.
 func StartAIONService(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID string, params Params, cm *cell.Manager) *Service {
 	em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
 	dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-	s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
-		seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
-			y     [32]byte
-			proof []byte
-		}), ent: make(map[uint64]map[string]uint32), leader: make(map[uint64]string)}
+    s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
+        seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
+            y     [32]byte
+            proof []byte
+        }), ent: make(map[uint64]map[string]uint32), schedule: make(map[uint64][]string), leader: make(map[uint64]string)}
 	s.run(ctx)
 	return s
 }
@@ -372,7 +369,20 @@ func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic,
 	msgV := msgVRF{Pub: pub, Epoch: e, Input: input, Y: y[:], Proof: proof}
 	by, _ := s.em.Marshal(msgV)
 	_ = tV.Publish(ctx, by)
-	logx.Info("aion reveal+vrf", "epoch", e)
+    logx.Info("aion reveal+vrf", "epoch", e)
+
+    // Also publish VRF for next epoch (e+1) so the schedule can be ready before it starts.
+    // This is safe because our challenge uses only the epoch number.
+    ne := e + 1
+    seedNext := s.seedForEpoch(ne)
+    chNext := s.challengeForEpoch(ne)
+    inNext := append(append([]byte{}, seedNext...), chNext[:]...)
+    y2, proof2, err2 := vrf.Evaluate(inNext)
+    if err2 == nil {
+        msgNext := msgVRF{Pub: pub, Epoch: ne, Input: inNext, Y: y2[:], Proof: proof2}
+        by2, _ := s.em.Marshal(msgNext)
+        _ = tV.Publish(ctx, by2)
+    }
 }
 
 func (s *Service) publishEntropy(ctx context.Context, tE *pubsub.Topic, e uint64, hnorm uint32) {
@@ -520,103 +530,52 @@ func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
 }
 
 func (s *Service) updateLeader(e uint64) {
-	wt, hnorm := s.weightForEpoch(e)
-	// iterate over all vrf entries and pick minimum rank with pubkey tiebreaker
-	s.mu.Lock()
+    wt, _ := s.weightForEpoch(e)
+    // Build ordered schedule: sort by (score) where better has: higher cell entropy (if available), then lower rank (y/wt), then node_id ascending.
+    s.mu.Lock()
     entries := s.vrf[e]
     entMap := s.ent[e]
-    candCount := len(entries)
-    entCount := len(entMap)
     s.mu.Unlock()
-    // Require at least two VRF candidates and two entropy reports before electing
-    if candCount < 2 || entCount < 2 {
-        return
-    }
-	var bestPub string
-	var bestRank [33]byte
-	var init bool
-	for pubhex, rec := range entries {
-		r := RankValue(rec.y, wt)
-		if !init {
-			if s.ent[e] != nil {
-				if _, ok := s.ent[e][pubhex]; !ok {
-					continue
-				}
-			}
-			bestPub, bestRank, init = pubhex, r, true
-			continue
-		}
-        if entMap != nil {
-            eb := entMap[bestPub]
-            ec := entMap[pubhex]
-            if ec > eb || (ec == eb && (CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub))) {
-                bestPub, bestRank = pubhex, r
+    if len(entries) == 0 { return }
+    // Collect candidates
+    type cand struct { pubhex string; pid string; rank [33]byte; ent uint32 }
+    list := make([]cand, 0, len(entries))
+    for pubhex, rec := range entries {
+        r := RankValue(rec.y, wt)
+        // derive peer ID for tiebreak
+        pid := ""
+        if b, err := hex.DecodeString(pubhex); err == nil {
+            if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
+                if id, err := peer.IDFromPublicKey(pk); err == nil { pid = id.String() }
             }
-        } else if CmpRank(r, bestRank) < 0 || (CmpRank(r, bestRank) == 0 && pubhex < bestPub) {
-            bestPub, bestRank = pubhex, r
         }
-	}
-	if init {
-		s.mu.Lock()
-		first := !s.started
-		s.leader[e] = bestPub
-		if first {
-			s.started = true
-		}
-		s.mu.Unlock()
-		rank16 := binary.BigEndian.Uint16(bestRank[0:2])
-		cand := len(entries)
-		tipH, _ := blockchain.CurrentTip(s.chainID)
-		// Try to compute leader peer ID from pubkey
-		leaderID := ""
-		if b, err := hex.DecodeString(bestPub); err == nil {
-			if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
-				if pid, err := peer.IDFromPublicKey(pk); err == nil {
-					leaderID = pid.String()
-				}
-			}
-		}
-		// Colors
-		const green = "\x1b[32m"
-		const red = "\x1b[31m"
-		const cyan = "\x1b[36m"
-		const yellow = "\x1b[33m"
-		const reset = "\x1b[0m"
-		// Election header
-		logx.Info(cyan+"AION ELECTION"+reset, "epoch", e, "candidates", cand)
-		// Candidates detail
-		for pubhex, rec := range entries {
-			r := RankValue(rec.y, wt)
-			r16 := binary.BigEndian.Uint16(r[0:2])
-			col := red
-			if pubhex == bestPub {
-				col = green
-			}
-			var hcell uint32
-			if s.ent[e] != nil {
-				hcell = s.ent[e][pubhex]
-			}
-			// derive peer ID from pub for human-readable mapping
-			candPeer := ""
-			if b, err := hex.DecodeString(pubhex); err == nil {
-				if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
-					if pid, err := peer.IDFromPublicKey(pk); err == nil {
-						candPeer = pid.String()
-					}
-				}
-			}
-			logx.Info(col+"candidate"+reset, "peer_id", candPeer, "pub", pubhex, "rank16", r16, "cell_entropy_q16", hcell)
-		}
-		// Result line
-		var hwin uint32
-		if s.ent[e] != nil {
-			hwin = s.ent[e][bestPub]
-		}
-		logx.Info(yellow+"leader elected"+reset, "epoch", e, "leader_peer_id", leaderID, "leader_pub", bestPub, "weight_q16", wt, "best_rank16", rank16, "tip_height", tipH, "leader_cell_entropy_q16", hwin, "entropy_norm_prev_q16", []uint32{hnorm[0], hnorm[1], hnorm[2], hnorm[3]})
-		if first {
-			logx.Info(green+"AION START: leader elected; counters active"+reset, "epoch", e)
-		}
-	}
+        ent := uint32(0)
+        if entMap != nil { ent = entMap[pubhex] }
+        list = append(list, cand{pubhex: pubhex, pid: pid, rank: r, ent: ent})
+    }
+    // Sort: entropy desc, rank asc, pid asc
+    sort.Slice(list, func(i, j int) bool {
+        if list[i].ent != list[j].ent { return list[i].ent > list[j].ent }
+        if c := CmpRank(list[i].rank, list[j].rank); c != 0 { return c < 0 }
+        return list[i].pid < list[j].pid
+    })
+    // Persist schedule and legacy leader (first element)
+    sched := make([]string, len(list))
+    for i := range list { sched[i] = list[i].pubhex }
+    s.mu.Lock()
+    s.schedule[e] = sched
+    first := !s.started
+    if len(sched) > 0 { s.leader[e] = sched[0] }
+    if first { s.started = true }
+    s.mu.Unlock()
+    // Log summary for visibility
+    tipH, _ := blockchain.CurrentTip(s.chainID)
+    const cyan = "\x1b[36m"; const yellow = "\x1b[33m"; const reset = "\x1b[0m"
+    logx.Info(cyan+"AION SCHEDULE"+reset, "epoch", e, "candidates", len(list), "tip_height", tipH)
+    if len(list) > 0 {
+        br16 := binary.BigEndian.Uint16(list[0].rank[0:2])
+        logx.Info(yellow+"leader scheduled"+reset, "epoch", e, "leader_pub", list[0].pubhex, "best_rank16", br16)
+    }
 }
 
 // IsLeader returns true if the given pubkey is elected leader for epoch e.
@@ -633,15 +592,18 @@ func (s *Service) IsLeader(e uint64, pub []byte) bool {
 func (s *Service) AcceptProducer(e uint64, pub []byte) bool {
     ph := hex.EncodeToString(pub)
     s.mu.Lock()
-    leader, has := s.leader[e]
-    cand := len(s.vrf[e])
-    ents := len(s.ent[e])
+    sched := s.schedule[e]
     s.mu.Unlock()
-    // Accept provisionally until election has converged (both VRFs and entropies seen and leader chosen)
-    if !has || cand < 2 || ents < 2 {
+    if len(sched) == 0 {
+        // schedule not known yet; be permissive
         return true
     }
-    return leader == ph
+    // Map current wall-clock slot to offset; accept if producer matches the scheduled leader for the current offset.
+    now := time.Now().UTC()
+    slot := s.params.CurrentSlot(now)
+    off := s.params.EpochSlotOffset(slot)
+    idx := int(off) % len(sched)
+    return sched[idx] == ph
 }
 
 // LocalIsLeader reports if this node is leader for the epoch of the current chain tip.
@@ -665,8 +627,18 @@ func (s *Service) LocalIsLeader() bool {
 
 // LeaderForEpoch returns the elected leader's pubkey hex if known.
 func (s *Service) LeaderForEpoch(e uint64) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v, ok := s.leader[e]
-	return v, ok
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    v, ok := s.leader[e]
+    return v, ok
+}
+
+// ScheduledLeaderFor returns the pubkey hex scheduled to lead at the given epoch offset.
+// If the schedule is shorter than the epoch length, it cycles through the list.
+func (s *Service) ScheduledLeaderFor(e uint64, offset uint64) (string, bool) {
+    s.mu.Lock(); defer s.mu.Unlock()
+    sched := s.schedule[e]
+    if len(sched) == 0 { return "", false }
+    idx := int(offset) % len(sched)
+    return sched[idx], true
 }
