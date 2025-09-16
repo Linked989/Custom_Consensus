@@ -75,6 +75,8 @@ type L1Service struct {
     recent     []L1Record
     recByHash  map[string]int // hashHex -> index in recent
     maxRecent  int
+    // retain in-memory raw attestations for at least this duration
+    retainFor  time.Duration
 
     // topic handles
     tAttest   *pubsub.Topic
@@ -87,7 +89,7 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
     if p.MaxLatency <= 0 { p.MaxLatency = defaultL1Params().MaxLatency }
     em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
     dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: blockTopicName, seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32}
+    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: blockTopicName, seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32, retainFor: 10 * time.Minute}
 
     // Join topics
     tA, _ := ps.Join(topicL1Attest)
@@ -123,7 +125,7 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
     if p.MaxLatency <= 0 { p.MaxLatency = defaultL1Params().MaxLatency }
     em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
     dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: "", seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32}
+    s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: "", seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32, retainFor: 10 * time.Minute}
     // Join L1 topics
     tA, _ := ps.Join(topicL1Attest)
     tN, _ := ps.Join(topicL1Notarize)
@@ -227,7 +229,8 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
         // Notarize once
         dt := time.Since(first)
         s.recordNotarized(key, a.Epoch, a.Height, cnt, dt)
-        s.mu.Lock(); delete(s.seen, key); delete(s.first, key); s.mu.Unlock()
+        // Stop tracking attester set, but keep first-seen time for TTL-based retention
+        s.mu.Lock(); delete(s.seen, key); /* keep s.first[key] */ s.mu.Unlock()
         out := l1Notarized{Epoch: a.Epoch, Height: a.Height, Hash: append([]byte(nil), a.Hash...), Count: cnt, Attesters: [][]byte{a.Attester}}
         by, _ := s.em.Marshal(out)
         _ = tN.Publish(context.Background(), by)
@@ -322,13 +325,18 @@ func (s *L1Service) updateAttesters(hashHex string, epoch uint64, height int64, 
 // pruneAttestsLocked keeps attests entries only for hashes present in recent index.
 // Caller must hold s.mu when invoking this function.
 func (s *L1Service) pruneAttestsLocked() {
-    if len(s.attests) <= s.maxRecent { return }
+    now := time.Now()
     allow := make(map[string]struct{}, len(s.recByHash))
     for k := range s.recByHash { allow[k] = struct{}{} }
     for k := range s.attests {
-        if _, ok := allow[k]; !ok {
-            delete(s.attests, k)
+        // keep if in recent index
+        if _, ok := allow[k]; ok { continue }
+        // keep if within retention window based on first-seen time
+        if t, ok := s.first[k]; ok {
+            if now.Sub(t) < s.retainFor { continue }
         }
+        delete(s.attests, k)
+        // do not delete s.first here; let it expire naturally
     }
 }
 
@@ -351,6 +359,27 @@ func (s *L1Service) GetAttestationInfos(hash []byte, max int) []AttestationInfo 
     if max > 0 && len(lst) > max { lst = lst[:max] }
     out := make([]AttestationInfo, 0, len(lst))
     for _, raw := range lst {
+        var a l1Attest
+        if s.dm.Unmarshal(raw, &a) != nil { continue }
+        out = append(out, AttestationInfo{
+            Epoch: a.Epoch,
+            Height: a.Height,
+            HashHex: strings.ToLower(hex.EncodeToString(a.Hash)),
+            Attester: strings.ToLower(hex.EncodeToString(a.Attester)),
+            Producer: strings.ToLower(hex.EncodeToString(a.Producer)),
+            SampleHex: strings.ToLower(hex.EncodeToString(a.Sample)),
+        })
+    }
+    return out
+}
+
+// DecodeRawAttestations decodes raw CBOR-encoded attestations into AttestationInfo.
+// If max <= 0, decodes all.
+func (s *L1Service) DecodeRawAttestations(list [][]byte, max int) []AttestationInfo {
+    if len(list) == 0 { return nil }
+    if max > 0 && len(list) > max { list = list[:max] }
+    out := make([]AttestationInfo, 0, len(list))
+    for _, raw := range list {
         var a l1Attest
         if s.dm.Unmarshal(raw, &a) != nil { continue }
         out = append(out, AttestationInfo{

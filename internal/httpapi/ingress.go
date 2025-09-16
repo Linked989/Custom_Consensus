@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+    "bytes"
     "context"
     "io"
     "net/http"
@@ -99,6 +100,22 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
                         infos := svc.GetAttestationInfos(hh, 0)
                         out["l1_attestations_live_count"] = len(infos)
                         out["l1_attestations_live"] = infos
+                        // If none live and block did not embed attestations for its parent,
+                        // try to surface attestations embedded by the child block (height+1)
+                        if len(infos) == 0 && len(blk.L1Attestations) == 0 {
+                            if h2, ok := blockchain.GetHashByHeight(chainID, blk.Height+1); ok {
+                                if child, ok := blockchain.LoadBlockByHash(chainID, h2); ok {
+                                    // Ensure this block is indeed the parent
+                                    if bytes.Equal(child.PrevHash, blk.Hash) && len(child.L1Attestations) > 0 {
+                                        // Decode using HELIOS' decoder for consistency
+                                        emb := svc.DecodeRawAttestations(child.L1Attestations, 0)
+                                        if len(emb) > 0 {
+                                            out["l1_attestations_embedded_from_child"] = emb
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
