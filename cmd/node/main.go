@@ -70,6 +70,7 @@ func main() {
     // Logging
     logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
     logFormat := flag.String("log-format", "text", "log format: text|json")
+    verboseLogs := flag.Bool("verbose", false, "enable verbose logs (default: startup line only)")
     // Slots
     slotDuration := flag.Duration("slot-duration", 500*time.Millisecond, "AION slot duration (e.g., 500ms)")
 	// AION: enabled by default (no dev flags)
@@ -81,8 +82,9 @@ func main() {
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
 	flag.Parse()
 
-	// Configure logging first
-	logx.Configure(*logLevel, *logFormat)
+    // Configure logging first
+    logx.Configure(*logLevel, *logFormat)
+    logx.SetVerbose(*verboseLogs)
 	// Configure P2P chain handshake
 	p2p.SetChainID(*chainID)
 
@@ -136,7 +138,8 @@ func main() {
 	}
 	defer h.Close()
 
-	logx.Info("node", "id", h.ID().String())
+    // Always show startup line with node id; other logs follow verbosity
+    logx.Startup("node started", "id", h.ID().String())
 	for _, a := range h.Addrs() {
 		logx.Info("listen", "addr", a.String()+"/p2p/"+h.ID().String())
 	}
