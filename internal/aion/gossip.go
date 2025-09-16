@@ -247,19 +247,21 @@ func (s *Service) run(ctx context.Context) {
 	}()
 
 	// Publisher: poll chain tip and publish at epoch boundaries
-	go func() {
-		tick := time.NewTicker(500 * time.Millisecond)
-		defer tick.Stop()
-		var lastEpoch int64 = -1
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				height, _ := blockchain.CurrentTip(s.chainID)
-				if s.epochLen == 0 {
-					continue
-				}
+    go func() {
+        tick := time.NewTicker(500 * time.Millisecond)
+        defer tick.Stop()
+        var lastEpoch int64 = -1
+        var lastEntropyTip int64 = -1
+        var lastEntropyLog time.Time
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-tick.C:
+                height, _ := blockchain.CurrentTip(s.chainID)
+                if s.epochLen == 0 {
+                    continue
+                }
 				// Bootstrap: if no blocks yet, operate at epoch 0 with current tip (may be empty)
 				var e int64
 				if height > 0 {
@@ -267,30 +269,48 @@ func (s *Service) run(ctx context.Context) {
 				} else {
 					e = 0
 				}
-				if e != lastEpoch {
-					// New epoch: ensure commit for current e (bootstrap), also publish commit for e+1, then reveal+vrf for e
-					s.publishCommit(ctx, tC, uint64(e))
-					s.publishCommit(ctx, tC, uint64(e+1))
-					s.publishRevealAndVRF(ctx, tR, tV, uint64(e))
-					// On epoch boundary, compute and log cell entropy for previous epoch window if cell is active
-					if s.cellMgr != nil {
-						c := s.cellMgr.Status()
-						if c != nil && c.Active {
-							win := int64(s.params.EpochLength)
-							score, used := entropy.ComputeCellEntropyFromChain(s.chainID, c, win)
-							if used > 0 {
-								logx.Info("cell entropy", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
-							}
-							// publish normalized entropy for this epoch restricted to our cell
-							hcell := EpochEntropyForCellQ16(s.chainID, uint64(e), s.epochLen, c)
-							s.publishEntropy(ctx, tE, uint64(e), hcell)
-						}
-					}
-					lastEpoch = e
-				}
-			}
-		}
-	}()
+                if e != lastEpoch {
+                    // New epoch: ensure commit for current e (bootstrap), also publish commit for e+1, then reveal+vrf for e
+                    s.publishCommit(ctx, tC, uint64(e))
+                    s.publishCommit(ctx, tC, uint64(e+1))
+                    s.publishRevealAndVRF(ctx, tR, tV, uint64(e))
+                    // On epoch boundary, compute and log cell entropy for the epoch that just ended (e-1), if any.
+                    if s.cellMgr != nil {
+                        c := s.cellMgr.Status()
+                        if c != nil && c.Active {
+                            if e > 0 {
+                                prev := uint64(e - 1)
+                                score, used := entropy.ComputeCellEntropyForEpoch(s.chainID, c, prev, s.epochLen)
+                                if used > 0 {
+                                    logx.Info("cell entropy", "epoch", prev, "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
+                                }
+                                // publish normalized entropy for the previous epoch restricted to our cell
+                                hcell := EpochEntropyForCellQ16(s.chainID, prev, s.epochLen, c)
+                                s.publishEntropy(ctx, tE, prev, hcell)
+                            }
+                        }
+                    }
+                    lastEpoch = e
+                }
+                // Rolling diagnostic: periodically compute a sliding-window cell entropy ending at tip
+                if s.cellMgr != nil {
+                    c := s.cellMgr.Status()
+                    if c != nil && c.Active {
+                        // Recompute if tip advanced and at most once every 5s to limit cost
+                        if height != lastEntropyTip && time.Since(lastEntropyLog) >= 5*time.Second {
+                            win := int64(s.params.EpochLength)
+                            score, used := entropy.ComputeCellEntropyFromChain(s.chainID, c, win)
+                            if used > 0 {
+                                logx.Info("cell entropy (rolling)", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
+                            }
+                            lastEntropyTip = height
+                            lastEntropyLog = time.Now()
+                        }
+                    }
+                }
+            }
+        }
+    }()
 }
 
 func (s *Service) getPubBytes() []byte {
