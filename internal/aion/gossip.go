@@ -81,10 +81,10 @@ type Service struct {
 	}
 	ent map[uint64]map[string]uint32 // epoch -> pubhex -> cell entropy q16
 
-    // ranked schedule per epoch (pubhex list, sorted once per epoch)
-    schedule map[uint64][]string // epoch -> ordered pubhex list
-    // elected leader (legacy single leader for observability)
-    leader map[uint64]string // epoch -> pubhex
+	// ranked schedule per epoch (pubhex list, sorted once per epoch)
+	schedule map[uint64][]string // epoch -> ordered pubhex list
+	// elected leader (legacy single leader for observability)
+	leader map[uint64]string // epoch -> pubhex
 
 	// lifecycle: mark once leader elected to announce counters start
 	started bool
@@ -160,39 +160,60 @@ func (s *Service) GetNetStatus() NetStatus {
 // Policy: must be elected leader locally AND either (a) seen >=2 VRF candidates for this epoch,
 // or (b) have no connected peers (single-node test setup).
 func (s *Service) AllowProduceSlot() bool {
-    if s.epochLen == 0 { return false }
-    // Epoch based on chain height to align with VRF buckets and schedules
-    h, _ := blockchain.CurrentTip(s.chainID)
-    var e uint64
-    if h > 0 { e = uint64(h-1) / s.epochLen } else { e = 0 }
-    // Slot offset (for selecting scheduled leader index) based on wall clock
-    now := time.Now().UTC()
-    off := s.params.EpochSlotOffset(s.params.CurrentSlot(now))
-    pub := s.getPubBytes(); if len(pub) == 0 { return false }
-    // Prefer schedule if available
-    s.mu.Lock(); sched := s.schedule[e]; s.mu.Unlock()
-    if len(sched) > 0 {
-        idx := int(off) % len(sched)
-        want := sched[idx]
-        return hex.EncodeToString(pub) == want
-    }
-    // Fallback: allow legacy leader with minimum candidates, or single-node
-    s.mu.Lock(); cand := len(s.vrf[e]); s.mu.Unlock()
-    if !s.IsLeader(e, pub) { return false }
-    if cand >= 2 { return true }
-    if len(s.h.Network().Peers()) == 0 { return true }
-    return false
+	if s.epochLen == 0 {
+		return false
+	}
+
+	// Use wall-clock epoch for schedule lookup, not chain height
+	now := time.Now().UTC()
+	slot := s.params.CurrentSlot(now)
+	wallEpoch := s.params.Epoch(slot)
+	off := s.params.EpochSlotOffset(slot)
+
+	pub := s.getPubBytes()
+	if len(pub) == 0 {
+		return false
+	}
+
+	// Check schedule for wall-clock epoch
+	s.mu.Lock()
+	sched := s.schedule[uint64(wallEpoch)]
+	s.mu.Unlock()
+
+	if len(sched) > 0 {
+		idx := int(off) % len(sched)
+		want := sched[idx]
+		return hex.EncodeToString(pub) == want
+	}
+	if off < 3 && uint64(wallEpoch) > 0 {
+		s.mu.Lock()
+		prevSched := s.schedule[uint64(wallEpoch)-1]
+		s.mu.Unlock()
+		if len(prevSched) > 0 {
+			// Use previous epoch's last leaders for grace period
+			idx := (int(off) + int(s.epochLen) - 3) % len(prevSched)
+			want := prevSched[idx]
+			if hex.EncodeToString(pub) == want {
+				return true
+			}
+		}
+	}
+	// Fallback for bootstrap/single-node
+	if len(s.h.Network().Peers()) == 0 {
+		return true
+	}
+	return false
 }
 
 // StartAIONService starts gossip handlers and periodic publisher.
 func StartAIONService(ctx context.Context, h host.Host, ps *pubsub.PubSub, chainID string, params Params, cm *cell.Manager) *Service {
 	em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
 	dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-    s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
-        seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
-            y     [32]byte
-            proof []byte
-        }), ent: make(map[uint64]map[string]uint32), schedule: make(map[uint64][]string), leader: make(map[uint64]string)}
+	s := &Service{params: params, chainID: chainID, h: h, ps: ps, em: em, dm: dm, epochLen: params.EpochLength, cellMgr: cm,
+		seeds: make(map[uint64][]byte), commits: make(map[uint64][32]byte), cmt: make(map[uint64]map[string][32]byte), rev: make(map[uint64]map[string][]byte), vrf: make(map[uint64]map[string]struct {
+			y     [32]byte
+			proof []byte
+		}), ent: make(map[uint64]map[string]uint32), schedule: make(map[uint64][]string), leader: make(map[uint64]string)}
 	s.run(ctx)
 	return s
 }
@@ -247,64 +268,64 @@ func (s *Service) run(ctx context.Context) {
 	}()
 
 	// Publisher: poll chain tip and publish at epoch boundaries
-    go func() {
-        tick := time.NewTicker(500 * time.Millisecond)
-        defer tick.Stop()
-        var lastEpochBySlot uint64 = ^uint64(0)
-        var lastEntropyTip int64 = -1
-        var lastEntropyLog time.Time
-        for {
-            select {
-            case <-ctx.Done():
-                return
-            case <-tick.C:
-                // Use wall-clock slot/epoch to drive epoch transitions and slot-0 actions
-                now := time.Now().UTC()
-                slot := s.params.CurrentSlot(now)
-                e := s.params.Epoch(slot)
-                if s.epochLen == 0 {
-                    continue
-                }
-                if e != lastEpochBySlot {
-                    // Slot-0 of a new epoch: publish commit for e and e+1, and reveal+vrf for e
-                    s.publishCommit(ctx, tC, uint64(e))
-                    s.publishCommit(ctx, tC, uint64(e+1))
-                    s.publishRevealAndVRF(ctx, tR, tV, uint64(e))
-                    // Compute and publish entropy for the epoch that just ended (e-1), if any
-                    if s.cellMgr != nil {
-                        c := s.cellMgr.Status()
-                        if c != nil && c.Active && e > 0 {
-                            prev := uint64(e - 1)
-                            score, used := entropy.ComputeCellEntropyForEpoch(s.chainID, c, prev, s.epochLen)
-                            if used > 0 {
-                                logx.Info("cell entropy", "epoch", prev, "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
-                            }
-                            hcell := EpochEntropyForCellQ16(s.chainID, prev, s.epochLen, c)
-                            s.publishEntropy(ctx, tE, prev, hcell)
-                        }
-                    }
-                    lastEpochBySlot = e
-                }
-                // Rolling diagnostic: periodically compute a sliding-window cell entropy ending at tip
-                height, _ := blockchain.CurrentTip(s.chainID)
-                if s.cellMgr != nil {
-                    c := s.cellMgr.Status()
-                    if c != nil && c.Active {
-                        // Recompute if tip advanced and at most once every 5s to limit cost
-                        if height != lastEntropyTip && time.Since(lastEntropyLog) >= 5*time.Second {
-                            win := int64(s.params.EpochLength)
-                            score, used := entropy.ComputeCellEntropyFromChain(s.chainID, c, win)
-                            if used > 0 {
-                                logx.Info("cell entropy (rolling)", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
-                            }
-                            lastEntropyTip = height
-                            lastEntropyLog = time.Now()
-                        }
-                    }
-                }
-            }
-        }
-    }()
+	go func() {
+		tick := time.NewTicker(500 * time.Millisecond)
+		defer tick.Stop()
+		var lastEpochBySlot uint64 = ^uint64(0)
+		var lastEntropyTip int64 = -1
+		var lastEntropyLog time.Time
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				// Use wall-clock slot/epoch to drive epoch transitions and slot-0 actions
+				now := time.Now().UTC()
+				slot := s.params.CurrentSlot(now)
+				e := s.params.Epoch(slot)
+				if s.epochLen == 0 {
+					continue
+				}
+				if e != lastEpochBySlot {
+					// Slot-0 of a new epoch: publish commit for e and e+1, and reveal+vrf for e
+					s.publishCommit(ctx, tC, uint64(e))
+					s.publishCommit(ctx, tC, uint64(e+1))
+					s.publishRevealAndVRF(ctx, tR, tV, uint64(e))
+					// Compute and publish entropy for the epoch that just ended (e-1), if any
+					if s.cellMgr != nil {
+						c := s.cellMgr.Status()
+						if c != nil && c.Active && e > 0 {
+							prev := uint64(e - 1)
+							score, used := entropy.ComputeCellEntropyForEpoch(s.chainID, c, prev, s.epochLen)
+							if used > 0 {
+								logx.Info("cell entropy", "epoch", prev, "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
+							}
+							hcell := EpochEntropyForCellQ16(s.chainID, prev, s.epochLen, c)
+							s.publishEntropy(ctx, tE, prev, hcell)
+						}
+					}
+					lastEpochBySlot = e
+				}
+				// Rolling diagnostic: periodically compute a sliding-window cell entropy ending at tip
+				height, _ := blockchain.CurrentTip(s.chainID)
+				if s.cellMgr != nil {
+					c := s.cellMgr.Status()
+					if c != nil && c.Active {
+						// Recompute if tip advanced and at most once every 5s to limit cost
+						if height != lastEntropyTip && time.Since(lastEntropyLog) >= 5*time.Second {
+							win := int64(s.params.EpochLength)
+							score, used := entropy.ComputeCellEntropyFromChain(s.chainID, c, win)
+							if used > 0 {
+								logx.Info("cell entropy (rolling)", "cell_id", c.ID, "devices", len(c.Devices), "tx_samples", used, "entropy_bits_per_byte", score)
+							}
+							lastEntropyTip = height
+							lastEntropyLog = time.Now()
+						}
+					}
+				}
+			}
+		}
+	}()
 }
 
 func (s *Service) getPubBytes() []byte {
@@ -381,20 +402,20 @@ func (s *Service) publishRevealAndVRF(ctx context.Context, tR, tV *pubsub.Topic,
 	msgV := msgVRF{Pub: pub, Epoch: e, Input: input, Y: y[:], Proof: proof}
 	by, _ := s.em.Marshal(msgV)
 	_ = tV.Publish(ctx, by)
-    logx.Info("aion reveal+vrf", "epoch", e)
+	logx.Info("aion reveal+vrf", "epoch", e)
 
-    // Also publish VRF for next epoch (e+1) so the schedule can be ready before it starts.
-    // This is safe because our challenge uses only the epoch number.
-    ne := e + 1
-    seedNext := s.seedForEpoch(ne)
-    chNext := s.challengeForEpoch(ne)
-    inNext := append(append([]byte{}, seedNext...), chNext[:]...)
-    y2, proof2, err2 := vrf.Evaluate(inNext)
-    if err2 == nil {
-        msgNext := msgVRF{Pub: pub, Epoch: ne, Input: inNext, Y: y2[:], Proof: proof2}
-        by2, _ := s.em.Marshal(msgNext)
-        _ = tV.Publish(ctx, by2)
-    }
+	// Also publish VRF for next epoch (e+1) so the schedule can be ready before it starts.
+	// This is safe because our challenge uses only the epoch number.
+	ne := e + 1
+	seedNext := s.seedForEpoch(ne)
+	chNext := s.challengeForEpoch(ne)
+	inNext := append(append([]byte{}, seedNext...), chNext[:]...)
+	y2, proof2, err2 := vrf.Evaluate(inNext)
+	if err2 == nil {
+		msgNext := msgVRF{Pub: pub, Epoch: ne, Input: inNext, Y: y2[:], Proof: proof2}
+		by2, _ := s.em.Marshal(msgNext)
+		_ = tV.Publish(ctx, by2)
+	}
 }
 
 func (s *Service) publishEntropy(ctx context.Context, tE *pubsub.Topic, e uint64, hnorm uint32) {
@@ -542,48 +563,71 @@ func (s *Service) weightForEpoch(e uint64) (uint32, [4]uint32) {
 }
 
 func (s *Service) updateLeader(e uint64) {
-    wt, _ := s.weightForEpoch(e)
-    // Build ordered schedule once per epoch: sort by VRF rank (y/Wt) asc, tie-break by node_id asc.
-    s.mu.Lock()
-    entries := s.vrf[e]
-    s.mu.Unlock()
-    if len(entries) == 0 { return }
-    // Collect candidates
-    type cand struct { pubhex string; pid string; rank [33]byte }
-    list := make([]cand, 0, len(entries))
-    for pubhex, rec := range entries {
-        r := RankValue(rec.y, wt)
-        // derive peer ID for tiebreak
-        pid := ""
-        if b, err := hex.DecodeString(pubhex); err == nil {
-            if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
-                if id, err := peer.IDFromPublicKey(pk); err == nil { pid = id.String() }
-            }
-        }
-        list = append(list, cand{pubhex: pubhex, pid: pid, rank: r})
-    }
-    // Sort: rank asc, pid asc
-    sort.Slice(list, func(i, j int) bool {
-        if c := CmpRank(list[i].rank, list[j].rank); c != 0 { return c < 0 }
-        return list[i].pid < list[j].pid
-    })
-    // Persist schedule and legacy leader (first element)
-    sched := make([]string, len(list))
-    for i := range list { sched[i] = list[i].pubhex }
-    s.mu.Lock()
-    s.schedule[e] = sched
-    first := !s.started
-    if len(sched) > 0 { s.leader[e] = sched[0] }
-    if first { s.started = true }
-    s.mu.Unlock()
-    // Log summary for visibility
-    tipH, _ := blockchain.CurrentTip(s.chainID)
-    const cyan = "\x1b[36m"; const yellow = "\x1b[33m"; const reset = "\x1b[0m"
-    logx.Info(cyan+"AION SCHEDULE"+reset, "epoch", e, "candidates", len(list), "tip_height", tipH)
-    if len(list) > 0 {
-        br16 := binary.BigEndian.Uint16(list[0].rank[0:2])
-        logx.Info(yellow+"leader scheduled"+reset, "epoch", e, "leader_pub", list[0].pubhex, "best_rank16", br16)
-    }
+	wt, _ := s.weightForEpoch(e)
+	// Build ordered schedule once per epoch: sort by VRF rank (y/Wt) asc, tie-break by node_id asc.
+	s.mu.Lock()
+	entries := s.vrf[e]
+	s.mu.Unlock()
+	if len(entries) == 0 {
+		return
+	}
+	// Collect candidates
+	type cand struct {
+		pubhex string
+		pid    string
+		rank   [33]byte
+	}
+	list := make([]cand, 0, len(entries))
+	for pubhex, rec := range entries {
+		r := RankValue(rec.y, wt)
+		// derive peer ID for tiebreak
+		pid := ""
+		if b, err := hex.DecodeString(pubhex); err == nil {
+			if pk, err := crypto.UnmarshalPublicKey(b); err == nil {
+				if id, err := peer.IDFromPublicKey(pk); err == nil {
+					pid = id.String()
+				}
+			}
+		}
+		list = append(list, cand{pubhex: pubhex, pid: pid, rank: r})
+	}
+	// Sort: rank asc, pid asc
+	sort.Slice(list, func(i, j int) bool {
+		if c := CmpRank(list[i].rank, list[j].rank); c != 0 {
+			return c < 0
+		}
+		return list[i].pid < list[j].pid
+	})
+	// Persist schedule and legacy leader (first element)
+	sched := make([]string, len(list))
+	for i := range list {
+		sched[i] = list[i].pubhex
+	}
+	s.mu.Lock()
+	existingSched := s.schedule[e]
+	if len(existingSched) >= len(sched) {
+		s.mu.Unlock()
+		return // Keep existing schedule
+	}
+	s.schedule[e] = sched
+	first := !s.started
+	if len(sched) > 0 {
+		s.leader[e] = sched[0]
+	}
+	if first {
+		s.started = true
+	}
+	s.mu.Unlock()
+	// Log summary for visibility
+	tipH, _ := blockchain.CurrentTip(s.chainID)
+	const cyan = "\x1b[36m"
+	const yellow = "\x1b[33m"
+	const reset = "\x1b[0m"
+	logx.Info(cyan+"AION SCHEDULE"+reset, "epoch", e, "candidates", len(list), "tip_height", tipH)
+	if len(list) > 0 {
+		br16 := binary.BigEndian.Uint16(list[0].rank[0:2])
+		logx.Info(yellow+"leader scheduled"+reset, "epoch", e, "leader_pub", list[0].pubhex, "best_rank16", br16)
+	}
 }
 
 // IsLeader returns true if the given pubkey is elected leader for epoch e.
@@ -620,18 +664,21 @@ func (s *Service) LocalIsLeader() bool {
 
 // LeaderForEpoch returns the elected leader's pubkey hex if known.
 func (s *Service) LeaderForEpoch(e uint64) (string, bool) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    v, ok := s.leader[e]
-    return v, ok
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.leader[e]
+	return v, ok
 }
 
 // ScheduledLeaderFor returns the pubkey hex scheduled to lead at the given epoch offset.
 // If the schedule is shorter than the epoch length, it cycles through the list.
 func (s *Service) ScheduledLeaderFor(e uint64, offset uint64) (string, bool) {
-    s.mu.Lock(); defer s.mu.Unlock()
-    sched := s.schedule[e]
-    if len(sched) == 0 { return "", false }
-    idx := int(offset) % len(sched)
-    return sched[idx], true
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sched := s.schedule[e]
+	if len(sched) == 0 {
+		return "", false
+	}
+	idx := int(offset) % len(sched)
+	return sched[idx], true
 }
