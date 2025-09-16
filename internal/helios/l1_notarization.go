@@ -139,7 +139,7 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
 	}
 	em, _ := cbor.EncOptions{Sort: cbor.SortCoreDeterministic, TimeTag: cbor.EncTagRequired}.EncMode()
 	dm, _ := cbor.DecOptions{TimeTag: cbor.DecTagRequired}.DecMode()
-	s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: "", seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32, retainFor: 10 * time.Minute}
+	s := &L1Service{h: h, ps: ps, aion: a, em: em, dm: dm, params: p, blockTopic: "", seen: make(map[string]map[string]struct{}), first: make(map[string]time.Time), attests: make(map[string][][]byte), recByHash: make(map[string]int), maxRecent: 32, retainFor: 30 * time.Second}
 	// Join L1 topics
 	tA, _ := ps.Join(topicL1Attest)
 	tN, _ := ps.Join(topicL1Notarize)
