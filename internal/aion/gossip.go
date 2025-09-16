@@ -571,18 +571,7 @@ func (s *Service) updateLeader(e uint64) {
 		return
 	}
 
-	// Check if we need to rebuild schedule
-	// Only rebuild if we have new VRF entries since last build
-	s.mu.Lock()
-	existingSched := s.schedule[e]
-	if len(existingSched) == len(entries) {
-		// Schedule already accounts for all known VRFs
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Unlock()
-
-	// Build candidate list...
+	// Build complete schedule from ALL known VRFs every time
 	type cand struct {
 		pubhex string
 		pid    string
@@ -615,6 +604,7 @@ func (s *Service) updateLeader(e uint64) {
 	}
 
 	s.mu.Lock()
+	// REMOVE the preservation check - always update with latest complete schedule
 	s.schedule[e] = sched
 	first := !s.started
 	if len(sched) > 0 {
@@ -624,7 +614,8 @@ func (s *Service) updateLeader(e uint64) {
 		s.started = true
 	}
 	s.mu.Unlock()
-	// Log summary for visibility
+
+	// Logging
 	tipH, _ := blockchain.CurrentTip(s.chainID)
 	const cyan = "\x1b[36m"
 	const yellow = "\x1b[33m"
