@@ -197,6 +197,7 @@ func main() {
 	getAION := func() *aion.Service { return aionSvc }
 	var l1svc *helios.L1Service
 	getHELIOS := func() *helios.L1Service { return l1svc }
+	var l2svc *helios.L2Service
 	// Start HTTP API early so devices can register while we wait for preflight.
 	if *httpIn != "" {
 		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION, getHELIOS)
@@ -254,6 +255,10 @@ func main() {
 
 	// HELIOS L1 notarization: start and observe the same block topic handle used by subscriber
 	l1svc = helios.StartL1FromTopic(ctx, h, ps, aionSvc, helios.L1Params{MinAttesters: *l1Min}, blkTopic)
+	// HELIOS L2 checkpointing: aggregate quorum votes for deterministic commits
+	l2Params := helios.L2Params{QuorumSize: 2}
+	l2svc = helios.StartL2FromTopic(ctx, h, ps, l2Params, blkTopic)
+	logx.Info("helios l2 params", "quorum", l2Params.QuorumSize)
 	// Always start builder; AllowProduceSlot gates production to elected leader.
 	{
 		allow := func() bool { return aionSvc.AllowProduceSlot() }
@@ -284,12 +289,16 @@ func main() {
 					connected := len(h.Network().Peers())
 					tipH, _ := blockchain.GetTip(*chainID)
 					ns := aionSvc.GetNetStatus()
+					var l2Commit int64
+					if l2svc != nil {
+						l2Commit = l2svc.LatestCommitHeight()
+					}
 					const magenta = "\x1b[35m"
 					const reset = "\x1b[0m"
 					if logMempool != nil && *logMempool {
-						logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch, "mempool_len", pool.Len())
+						logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch, "l2_commit_height", l2Commit, "mempool_len", pool.Len())
 					} else {
-						logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch)
+						logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch, "l2_commit_height", l2Commit)
 					}
 					// Try to form a cell when threshold is met
 					if c := cellMgr.TryForm(devReg); c != nil {
