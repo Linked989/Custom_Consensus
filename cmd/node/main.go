@@ -199,9 +199,26 @@ func main() {
 	getHELIOS := func() *helios.L1Service { return l1svc }
 	var l2svc *helios.L2Service
 	getL2 := func() *helios.L2Service { return l2svc }
+	var l3svc *helios.L3Service
+	getL3 := func() *helios.L3Service { return l3svc }
+	// registerCell forwards the active cell profile into L3 service if available.
+	registerCell := func(c *cell.Cell) {
+		if c == nil || !c.Active {
+			return
+		}
+		if l3 := l3svc; l3 != nil {
+			var pub []byte
+			if len(c.Devices) > 0 {
+				if key, err := hex.DecodeString(strings.ToLower(c.Devices[0].PubHex)); err == nil {
+					pub = key
+				}
+			}
+			l3.RegisterCell(helios.CellRecord{ID: c.ID, RegionID: c.NodeID, PubKey: pub})
+		}
+	}
 	// Start HTTP API early so devices can register while we wait for preflight.
 	if *httpIn != "" {
-		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION, getHELIOS, getL2)
+		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION, getHELIOS, getL2, getL3)
 		defer srv.Shutdown(ctx)
 		logx.Info("http api", "listen", *httpIn)
 	}
@@ -220,6 +237,7 @@ func main() {
 		if haveDevices {
 			if c := cellMgr.TryForm(devReg); c != nil && c.Active {
 				// formed; proceed to node start after both conditions satisfied
+				registerCell(c)
 			}
 		}
 		if haveNodes && haveDevices {
@@ -248,7 +266,14 @@ func main() {
 	blockchain.RegisterBlockSync(h)
 	// Leader enforcement predicate from AION
 	leaderOK := func(epoch uint64, producerPub []byte) bool { return aionSvc.AcceptProducer(epoch, producerPub) }
-	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax, leaderOK)
+	blkTopic, err := blockchain.StartBlockSubscriberWithMempool(ctx, h, ps, *blockTopicName, *chainID, pool, *logPrune, *logBlockQueue, *blockMax, *blockBytesMax, leaderOK, func(b *blockchain.Block) {
+		if svc := getL2(); svc != nil {
+			svc.UpdateBlockInfo(append([]byte(nil), b.Hash...), append([]byte(nil), b.PrevHash...), b.Height, append([]byte(nil), b.TxRoot...))
+		}
+		if l3 := l3svc; l3 != nil {
+			l3.RecordBlockMeta(append([]byte(nil), b.Hash...), append([]byte(nil), b.PrevHash...), b.Height, 0, append([]byte(nil), b.TxRoot...), false)
+		}
+	})
 	if err != nil {
 		logx.Error("block sub", "err", err)
 		os.Exit(1)
@@ -262,6 +287,26 @@ func main() {
 	l2Params := helios.L2Params{QuorumSize: l2Quorum}
 	l2svc = helios.StartL2FromTopic(ctx, h, ps, l2Params, blkTopic)
 	logx.Info("helios l2 params", "validators", totalNodes, "quorum", l2Params.QuorumSize)
+	l3Params := helios.L3Params{MinCells: *cellMin, MinRegions: 1, TotalStake: float64(totalNodes)}
+	if l3Params.MinCells < 1 {
+		l3Params.MinCells = 1
+	}
+	if l3Params.MinRegions < 1 {
+		l3Params.MinRegions = 1
+	}
+	if l3Params.TotalStake <= 0 {
+		l3Params.TotalStake = 1
+	}
+	l3svc = helios.StartL3Finality(ctx, h, ps, l3Params, nil, nil)
+	if l2svc != nil && l3svc != nil {
+		l2svc.AttachL3(l3svc)
+	}
+	if c := cellMgr.Status(); c != nil {
+		registerCell(c)
+	}
+	if l3svc != nil {
+		logx.Info("helios l3 params", "min_cells", l3Params.MinCells, "min_regions", l3Params.MinRegions, "total_stake", l3Params.TotalStake)
+	}
 	// Always start builder; AllowProduceSlot gates production to elected leader.
 	{
 		allow := func() bool { return aionSvc.AllowProduceSlot() }
@@ -306,6 +351,7 @@ func main() {
 					// Try to form a cell when threshold is met
 					if c := cellMgr.TryForm(devReg); c != nil {
 						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
+						registerCell(c)
 					}
 				}
 			}

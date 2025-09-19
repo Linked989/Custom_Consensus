@@ -67,6 +67,7 @@ When making changes to files, first understand the file's code conventions. Mimi
 
 # Code style
 - IMPORTANT: Add simple, short code comments.
+- IMPORTANT: No scaffolding!!!!!
 
 # Task Management
 You have access to the IMPLEMENTATIONS.md to help you manage and plan tasks. Use that to ensure that you are tracking your tasks and giving the user visibility into your progress.
@@ -122,6 +123,7 @@ The user will primarily request you perform software engineering tasks. This inc
 - Implement the solution using all tools available to you
 NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive.
 IMPORTANT: When the user write "/q: <question>", you answer his question in detail with normal english words.
+IMPORTANT: No scaffolding!!!!!
 
 <example>
 user: /q so what how do you install x software

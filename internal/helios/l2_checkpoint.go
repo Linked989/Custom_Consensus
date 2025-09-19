@@ -83,6 +83,7 @@ type blockMeta struct {
 	height    int64
 	parentHex string
 	firstSeen time.Time
+	txRoot    []byte
 }
 
 type commitInfo struct {
@@ -98,6 +99,7 @@ type L2Service struct {
 	em     cbor.EncMode
 	dm     cbor.DecMode
 	params L2Params
+	l3     *L3Service
 
 	tVote   *pubsub.Topic
 	tQC     *pubsub.Topic
@@ -200,11 +202,40 @@ func StartL2FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, param
 	return s
 }
 
+// AttachL3 wires the optional L3 service for cross-layer notifications.
+func (s *L2Service) AttachL3(l3 *L3Service) {
+	s.l3 = l3
+}
+
 func (s *L2Service) warnIfInsufficientValidators() {
 	peers := len(s.h.Network().Peers()) + 1 // include self
 	if peers < s.params.QuorumSize {
 		logx.Warn("helios l2 quorum inactive: insufficient validators", "validators", peers, "required", s.params.QuorumSize)
 	}
+}
+
+// UpdateBlockInfo stores canonical metadata for a block once observed by the local node.
+func (s *L2Service) UpdateBlockInfo(blockID []byte, parent []byte, height int64, txRoot []byte) {
+	if len(blockID) == 0 {
+		return
+	}
+	blockHex := hex.EncodeToString(blockID)
+	parentHex := hex.EncodeToString(parent)
+	s.mu.Lock()
+	meta, ok := s.blocks[blockHex]
+	if !ok {
+		meta = blockMeta{}
+	}
+	meta.height = height
+	meta.parentHex = parentHex
+	if meta.firstSeen.IsZero() {
+		meta.firstSeen = time.Now()
+	}
+	if len(txRoot) > 0 {
+		meta.txRoot = append(meta.txRoot[:0], txRoot...)
+	}
+	s.blocks[blockHex] = meta
+	s.mu.Unlock()
 }
 
 func (s *L2Service) onBlock(data []byte) {
@@ -482,6 +513,8 @@ func (s *L2Service) onQC(data []byte) {
 func (s *L2Service) storeQC(blockHex string, qc qcMsg, parentHex string) bool {
 	stored := false
 	grandParent := ""
+	var notifyParent []byte
+	var qcRef ValidatorQCRef
 	s.mu.Lock()
 	if _, ok := s.qcs[blockHex]; !ok {
 		s.qcs[blockHex] = qc
@@ -492,6 +525,24 @@ func (s *L2Service) storeQC(blockHex string, qc qcMsg, parentHex string) bool {
 			s.childQCs[parentHex][blockHex] = struct{}{}
 			if meta, ok := s.blocks[parentHex]; ok {
 				grandParent = meta.parentHex
+			}
+			if s.l3 != nil {
+				if pb, err := hex.DecodeString(parentHex); err == nil {
+					notifyParent = pb
+					qcRef = ValidatorQCRef{
+						BlockID:   cloneBytes(qc.Block),
+						Height:    qc.Height,
+						Epoch:     0,
+						Weight:    float64(len(qc.Votes)),
+						CreatedAt: qc.CreatedAt,
+					}
+					if len(qc.Votes) > 0 {
+						qcRef.Signers = make([][]byte, len(qc.Votes))
+						for i, v := range qc.Votes {
+							qcRef.Signers[i] = append([]byte(nil), v.Payload.Pub...)
+						}
+					}
+				}
 			}
 		}
 		s.updateLockForQCLocked(blockHex, qc.Height)
@@ -505,6 +556,9 @@ func (s *L2Service) storeQC(blockHex string, qc qcMsg, parentHex string) bool {
 		if grandParent != "" {
 			s.checkCommitFor(grandParent)
 		}
+		if notifyParent != nil && s.l3 != nil {
+			s.l3.RecordDescendantQC(notifyParent, qcRef)
+		}
 	}
 	return stored
 }
@@ -515,6 +569,10 @@ func (s *L2Service) checkCommitFor(blockHex string) {
 	}
 	var commit commitMsg
 	shouldBroadcast := false
+	var l3Block []byte
+	var l3Parent []byte
+	var l3TxRoot []byte
+	var l3Height int64
 
 	s.mu.Lock()
 	if _, ok := s.committed[blockHex]; ok {
@@ -559,6 +617,16 @@ func (s *L2Service) checkCommitFor(blockHex string) {
 	commit = commitMsg{Block: cloneBytes(blockBytes), Height: meta.height, CommittedAt: time.Now().UTC()}
 	s.committed[blockHex] = commitInfo{height: meta.height, when: commit.CommittedAt}
 	s.commitMsg[blockHex] = commit
+	l3Block = cloneBytes(blockBytes)
+	l3Height = meta.height
+	if meta.parentHex != "" {
+		if pb, err := hex.DecodeString(meta.parentHex); err == nil {
+			l3Parent = pb
+		}
+	}
+	if len(meta.txRoot) > 0 {
+		l3TxRoot = append([]byte(nil), meta.txRoot...)
+	}
 	s.mu.Unlock()
 	shouldBroadcast = true
 
@@ -573,6 +641,9 @@ func (s *L2Service) checkCommitFor(blockHex string) {
 			}
 		}
 	}
+	if s.l3 != nil && len(l3Block) > 0 {
+		s.l3.RecordBlockMeta(l3Block, l3Parent, l3Height, 0, l3TxRoot, true)
+	}
 }
 
 func (s *L2Service) onCommit(data []byte) {
@@ -581,6 +652,10 @@ func (s *L2Service) onCommit(data []byte) {
 		return
 	}
 	blockHex := hex.EncodeToString(msg.Block)
+	var l3Block []byte
+	var l3Parent []byte
+	var l3TxRoot []byte
+	l3Height := msg.Height
 	s.mu.Lock()
 	if _, ok := s.committed[blockHex]; ok {
 		s.mu.Unlock()
@@ -588,8 +663,25 @@ func (s *L2Service) onCommit(data []byte) {
 	}
 	s.committed[blockHex] = commitInfo{height: msg.Height, when: msg.CommittedAt}
 	s.commitMsg[blockHex] = msg
+	if meta, ok := s.blocks[blockHex]; ok {
+		if meta.height > 0 {
+			l3Height = meta.height
+		}
+		if meta.parentHex != "" {
+			if pb, err := hex.DecodeString(meta.parentHex); err == nil {
+				l3Parent = pb
+			}
+		}
+		if len(meta.txRoot) > 0 {
+			l3TxRoot = append([]byte(nil), meta.txRoot...)
+		}
+	}
+	l3Block = append([]byte(nil), msg.Block...)
 	s.mu.Unlock()
 	logx.Info("HELIOS L2 COMMIT", "height", msg.Height, "hash", short(blockHex), "from", "network")
+	if s.l3 != nil && len(l3Block) > 0 {
+		s.l3.RecordBlockMeta(l3Block, l3Parent, l3Height, 0, l3TxRoot, true)
+	}
 }
 
 func (s *L2Service) verifyVote(msg voteMsg) bool {

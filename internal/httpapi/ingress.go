@@ -29,8 +29,8 @@ import (
 )
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
-// StartHTTPAPI starts the HTTP server. getAION/getHELIOS may be nil; if provided, they should return the current services.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service) *http.Server {
+// StartHTTPAPI starts the HTTP server. getAION/getHELIOS/getL2/getL3 may be nil; if provided, they should return the current services.
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service, getL3 func() *helios.L3Service) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -269,6 +269,101 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(st)
 	})
+	// GET /helios/l3/status?block=<hex>
+	mux.HandleFunc("/helios/l3/status", func(w http.ResponseWriter, r *http.Request) {
+		if getL3 == nil {
+			http.Error(w, "helios l3 not available", http.StatusServiceUnavailable)
+			return
+		}
+		svc := getL3()
+		if svc == nil {
+			http.Error(w, "helios l3 not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		blockHex := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("block")))
+		if blockHex == "" {
+			http.Error(w, "missing block", http.StatusBadRequest)
+			return
+		}
+		blockID, err := hex.DecodeString(blockHex)
+		if err != nil {
+			http.Error(w, "bad block", http.StatusBadRequest)
+			return
+		}
+		status := svc.QueryL3Status(blockID)
+		ready := svc.IsL3Ready(blockID)
+		cells, regions, auditsPassed, auditsFailed := svc.MetricsForBlock(blockID)
+		resp := map[string]any{
+			"block":         blockHex,
+			"status":        l3StatusToString(status),
+			"ready":         ready,
+			"cells":         cells,
+			"regions":       regions,
+			"audits_passed": auditsPassed,
+			"audits_failed": auditsFailed,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+	// GET /helios/l3/envelope?block=<hex>
+	mux.HandleFunc("/helios/l3/envelope", func(w http.ResponseWriter, r *http.Request) {
+		if getL3 == nil {
+			http.Error(w, "helios l3 not available", http.StatusServiceUnavailable)
+			return
+		}
+		svc := getL3()
+		if svc == nil {
+			http.Error(w, "helios l3 not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		blockHex := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("block")))
+		if blockHex == "" {
+			http.Error(w, "missing block", http.StatusBadRequest)
+			return
+		}
+		blockID, err := hex.DecodeString(blockHex)
+		if err != nil {
+			http.Error(w, "bad block", http.StatusBadRequest)
+			return
+		}
+		env, err := svc.GetFinalityEnvelope(blockID)
+		if err != nil {
+			http.Error(w, "envelope not found", http.StatusNotFound)
+			return
+		}
+		desc := make([]map[string]any, 0, len(env.DescendantQCs))
+		for _, qc := range env.DescendantQCs {
+			signers := make([]string, 0, len(qc.Signers))
+			for _, sgn := range qc.Signers {
+				signers = append(signers, strings.ToLower(hex.EncodeToString(sgn)))
+			}
+			desc = append(desc, map[string]any{
+				"block":      strings.ToLower(hex.EncodeToString(qc.BlockID)),
+				"height":     qc.Height,
+				"epoch":      qc.Epoch,
+				"weight":     qc.Weight,
+				"signers":    signers,
+				"created_at": qc.CreatedAt,
+			})
+		}
+		resp := map[string]any{
+			"block":          blockHex,
+			"height":         env.Height,
+			"horizon":        env.Horizon,
+			"cells":          env.CellBitmap,
+			"regions":        env.RegionBitmap,
+			"finalized_at":   env.FinalizedAt,
+			"descendant_qcs": desc,
+		}
+		if len(env.CellAggSig) > 0 {
+			resp["cell_agg_sig"] = strings.ToLower(hex.EncodeToString(env.CellAggSig))
+		}
+		if len(env.ValidatorAggSig) > 0 {
+			resp["validator_agg_sig"] = strings.ToLower(hex.EncodeToString(env.ValidatorAggSig))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
 	// GET /iot/devices
 	mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -321,4 +416,15 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 	}()
 	return srv
+}
+
+func l3StatusToString(st helios.L3Status) string {
+	switch st {
+	case helios.L3StatusFinal:
+		return "final"
+	case helios.L3StatusPending:
+		return "pending"
+	default:
+		return "none"
+	}
 }
