@@ -198,9 +198,10 @@ func main() {
 	var l1svc *helios.L1Service
 	getHELIOS := func() *helios.L1Service { return l1svc }
 	var l2svc *helios.L2Service
+	getL2 := func() *helios.L2Service { return l2svc }
 	// Start HTTP API early so devices can register while we wait for preflight.
 	if *httpIn != "" {
-		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION, getHELIOS)
+		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION, getHELIOS, getL2)
 		defer srv.Shutdown(ctx)
 		logx.Info("http api", "listen", *httpIn)
 	}
