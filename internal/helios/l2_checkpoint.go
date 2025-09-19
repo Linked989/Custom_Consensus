@@ -30,16 +30,16 @@ type L2Params struct {
 	VoteExpiry time.Duration
 }
 
-func defaultL2Params() L2Params { return L2Params{QuorumSize: 2, VoteExpiry: 15 * time.Second} }
+func defaultL2Params() L2Params { return L2Params{QuorumSize: 3, VoteExpiry: 15 * time.Second} }
 
-// HotstuffQuorumSize returns ceil(2n/3) for n validators (minimum 1).
+// HotstuffQuorumSize returns ceil(2n/3) for n validators with a minimum quorum of three.
 func HotstuffQuorumSize(validators int) int {
-	if validators <= 0 {
-		return 1
+	if validators < 3 {
+		return 3
 	}
 	quorum := (2*validators + 2) / 3
-	if quorum < 1 {
-		quorum = 1
+	if quorum < 3 {
+		quorum = 3
 	}
 	return quorum
 }
