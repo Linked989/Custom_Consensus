@@ -501,7 +501,7 @@ func (s *L3Service) onAttestation(data []byte, from peer.ID) {
 	}
 	if !s.verifier.Verify(att.BlockID, att.SampleIndices, att.Proofs, commitment) {
 		s.recordFailure(att.CellID)
-		logx.Warn("helios l3 attestation verification failed", "cell", att.CellID, "block", short(hex.EncodeToString(att.BlockID)))
+		logx.Warn("helios l3 attestation verification failed", "cell", att.CellID, "block", shortHex(hex.EncodeToString(att.BlockID)))
 		return
 	}
 	s.mu.Lock()
@@ -577,7 +577,7 @@ func (s *L3Service) onEnvelope(data []byte, from peer.ID) {
 	blk := s.ensureBlock(hexID)
 	blk.envelope = &env
 	blk.status = L3StatusFinal
-	logx.Info("helios l3 finality observed", "block", short(hexID), "height", env.Height, "from", from)
+	logx.Info("helios l3 finality observed", "block", shortHex(hexID), "height", env.Height, "from", from)
 }
 
 // RecordDescendantQC updates weight tracking for a block's descendants.
@@ -599,7 +599,7 @@ func (s *L3Service) maybeFinalizeLocked(blockHex string, blk *blockCounters) {
 		env := s.buildEnvelopeLocked(blockHex, blk)
 		blk.envelope = env
 		blk.status = L3StatusFinal
-		logx.Info("helios l3 finalized", "block", short(blockHex), "height", blk.height, "cells", len(blk.cells), "regions", len(blk.regions))
+		logx.Info("helios l3 finalized", "block", shortHex(blockHex), "height", blk.height, "cells", len(blk.cells), "regions", len(blk.regions))
 		s.broadcastEnvelope(env)
 	}
 }
@@ -733,7 +733,7 @@ func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, regions int, aud
 }
 
 // Short helper for logs.
-func short(in string) string {
+func shortHex(in string) string {
 	if len(in) <= 8 {
 		return in
 	}
