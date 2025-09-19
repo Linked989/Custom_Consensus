@@ -295,7 +295,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		cells, regions, auditsPassed, auditsFailed := svc.MetricsForBlock(blockID)
 		resp := map[string]any{
 			"block":         blockHex,
-			"status":        l3StatusToString(status),
+			"status":        status.String(),
 			"ready":         ready,
 			"cells":         cells,
 			"regions":       regions,
@@ -364,6 +364,27 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
+	// GET /helios/l3/overview?limit=10
+	mux.HandleFunc("/helios/l3/overview", func(w http.ResponseWriter, r *http.Request) {
+		if getL3 == nil {
+			http.Error(w, "helios l3 not available", http.StatusServiceUnavailable)
+			return
+		}
+		svc := getL3()
+		if svc == nil {
+			http.Error(w, "helios l3 not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		limit := 0
+		if qs := r.URL.Query().Get("limit"); qs != "" {
+			if v, err := strconv.Atoi(qs); err == nil && v > 0 {
+				limit = v
+			}
+		}
+		blocks := svc.Snapshot(limit)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"blocks": blocks})
+	})
 	// GET /iot/devices
 	mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -416,15 +437,4 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 	}()
 	return srv
-}
-
-func l3StatusToString(st helios.L3Status) string {
-	switch st {
-	case helios.L3StatusFinal:
-		return "final"
-	case helios.L3StatusPending:
-		return "pending"
-	default:
-		return "none"
-	}
 }

@@ -5,6 +5,9 @@
 
 - [x] Enforce minimum HotStuff quorum of three validators in L2 service
 
-- [ ] Design L3 finality scaffolding in helios module
-- [ ] Implement L3 finality core data structures and flows
-- [ ] Update L3 to-do list after implementation
+- [x] Design L3 finality scaffolding in helios module
+- [x] Implement L3 finality core data structures and flows
+- [x] Update L3 to-do list after implementation
+
+- [x] Add HTTP endpoint exposing consolidated L3 finality health
+- [x] Add console logging around L3 readiness and envelope broadcasting

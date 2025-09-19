@@ -243,6 +243,17 @@ const (
 	L3StatusFinal
 )
 
+func (st L3Status) String() string {
+	switch st {
+	case L3StatusFinal:
+		return "final"
+	case L3StatusPending:
+		return "pending"
+	default:
+		return "none"
+	}
+}
+
 type blockCounters struct {
 	cells        map[string]struct{}
 	regions      map[string]struct{}
@@ -433,8 +444,9 @@ func (s *L3Service) RecordBlockMeta(blockID []byte, parent []byte, height int64,
 	blk.height = height
 	blk.epoch = epoch
 	blk.daCommitment = append([]byte(nil), commitment...)
-	if l2Committed {
+	if l2Committed && !blk.l2Committed {
 		blk.l2Committed = true
+		logx.Info("helios l3 l2 commit", "block", shortHex(hexID), "height", height)
 	}
 }
 
@@ -591,6 +603,11 @@ func (s *L3Service) RecordDescendantQC(blockID []byte, ref ValidatorQCRef) {
 	blk := s.ensureBlock(hexID)
 	blk.qcs = append(blk.qcs, ref)
 	blk.qcWeight += ref.Weight
+	var ratio float64
+	if s.params.TotalStake > 0 {
+		ratio = blk.qcWeight / s.params.TotalStake
+	}
+	logx.Info("helios l3 qc weight", "block", shortHex(hexID), "weight", blk.qcWeight, "ratio", ratio, "target", s.params.StakeThreshold)
 	s.maybeFinalizeLocked(hexID, blk)
 }
 
@@ -663,6 +680,7 @@ func (s *L3Service) broadcastEnvelope(env *FinalityEnvelope) {
 		logx.Warn("helios l3 envelope marshal failed", "err", err)
 		return
 	}
+	logx.Info("helios l3 envelope broadcast", "block", shortHex(hex.EncodeToString(env.BlockID)), "height", env.Height, "cells", len(env.CellBitmap), "regions", len(env.RegionBitmap))
 	if err := s.tEnv.Publish(s.ctx, payload); err != nil {
 		logx.Warn("helios l3 envelope publish failed", "err", err)
 	}
@@ -730,6 +748,64 @@ func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, regions int, aud
 		return
 	}
 	return len(blk.cells), len(blk.regions), blk.auditsPassed, blk.auditsFailed
+}
+
+// L3BlockProgress summarizes tracked blocks for monitoring.
+type L3BlockProgress struct {
+	Block        string     `json:"block"`
+	Height       int64      `json:"height"`
+	Epoch        uint64     `json:"epoch"`
+	Status       string     `json:"status"`
+	Cells        int        `json:"cells"`
+	Regions      int        `json:"regions"`
+	AuditsPassed int        `json:"audits_passed"`
+	AuditsFailed int        `json:"audits_failed"`
+	L2Committed  bool       `json:"l2_committed"`
+	Ready        bool       `json:"ready"`
+	QCWeight     float64    `json:"qc_weight"`
+	StakeTarget  float64    `json:"stake_target"`
+	FirstSeen    time.Time  `json:"first_seen"`
+	FinalizedAt  *time.Time `json:"finalized_at,omitempty"`
+}
+
+// Snapshot returns up to limit block progress entries ordered by height desc.
+func (s *L3Service) Snapshot(limit int) []L3BlockProgress {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]L3BlockProgress, 0, len(s.blocks))
+	target := s.params.StakeThreshold * s.params.TotalStake
+	for hash, blk := range s.blocks {
+		progress := L3BlockProgress{
+			Block:        hash,
+			Height:       blk.height,
+			Epoch:        blk.epoch,
+			Status:       blk.status.String(),
+			Cells:        len(blk.cells),
+			Regions:      len(blk.regions),
+			AuditsPassed: blk.auditsPassed,
+			AuditsFailed: blk.auditsFailed,
+			L2Committed:  blk.l2Committed,
+			Ready:        s.isReadyLocked(blk),
+			QCWeight:     blk.qcWeight,
+			StakeTarget:  target,
+			FirstSeen:    blk.firstSeen,
+		}
+		if blk.envelope != nil {
+			final := blk.envelope.FinalizedAt
+			progress.FinalizedAt = &final
+		}
+		items = append(items, progress)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Height == items[j].Height {
+			return items[i].FirstSeen.After(items[j].FirstSeen)
+		}
+		return items[i].Height > items[j].Height
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items
 }
 
 // Short helper for logs.
