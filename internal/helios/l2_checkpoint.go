@@ -196,7 +196,15 @@ func StartL2FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, param
 		}
 	}
 	go s.cleanupLoop()
+	s.warnIfInsufficientValidators()
 	return s
+}
+
+func (s *L2Service) warnIfInsufficientValidators() {
+	peers := len(s.h.Network().Peers()) + 1 // include self
+	if peers < s.params.QuorumSize {
+		logx.Warn("helios l2 quorum inactive: insufficient validators", "validators", peers, "required", s.params.QuorumSize)
+	}
 }
 
 func (s *L2Service) onBlock(data []byte) {
