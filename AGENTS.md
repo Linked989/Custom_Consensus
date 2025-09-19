@@ -121,6 +121,12 @@ The user will primarily request you perform software engineering tasks. This inc
 - Use the available search tools to understand the codebase and the user's query. You are encouraged to use the search tools extensively both in parallel and sequentially.
 - Implement the solution using all tools available to you
 NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive.
+IMPORTANT: When the user write "/q: <question>", you answer his question in detail with normal english words.
+
+<example>
+user: /q so what how do you install x software
+assistnt: to install x software you have to...
+</example>
 
 ## Project Structure & Module Organization
 - `cmd/` hosts runnable entrypoints: `node` for the primary validator, `iotp2p` and `iotdev` for tooling, `txgen` for traffic generation, and `scripts/` with tmux helpers for multi-node labs.
