@@ -257,9 +257,11 @@ func main() {
 	// HELIOS L1 notarization: start and observe the same block topic handle used by subscriber
 	l1svc = helios.StartL1FromTopic(ctx, h, ps, aionSvc, helios.L1Params{MinAttesters: *l1Min}, blkTopic)
 	// HELIOS L2 checkpointing: aggregate quorum votes for deterministic commits
-	l2Params := helios.L2Params{QuorumSize: 2}
+	totalNodes := members.CountAndSweep()
+	l2Quorum := helios.HotstuffQuorumSize(totalNodes)
+	l2Params := helios.L2Params{QuorumSize: l2Quorum}
 	l2svc = helios.StartL2FromTopic(ctx, h, ps, l2Params, blkTopic)
-	logx.Info("helios l2 params", "quorum", l2Params.QuorumSize)
+	logx.Info("helios l2 params", "validators", totalNodes, "quorum", l2Params.QuorumSize)
 	// Always start builder; AllowProduceSlot gates production to elected leader.
 	{
 		allow := func() bool { return aionSvc.AllowProduceSlot() }

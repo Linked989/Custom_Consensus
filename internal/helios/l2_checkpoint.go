@@ -32,6 +32,18 @@ type L2Params struct {
 
 func defaultL2Params() L2Params { return L2Params{QuorumSize: 2, VoteExpiry: 15 * time.Second} }
 
+// HotstuffQuorumSize returns ceil(2n/3) for n validators (minimum 1).
+func HotstuffQuorumSize(validators int) int {
+	if validators <= 0 {
+		return 1
+	}
+	quorum := (2*validators + 2) / 3
+	if quorum < 1 {
+		quorum = 1
+	}
+	return quorum
+}
+
 type votePayload struct {
 	Block  []byte `cbor:"0,keyasint"`
 	Parent []byte `cbor:"1,keyasint"`
@@ -99,6 +111,9 @@ type L2Service struct {
 	committed map[string]commitInfo            // blockHex -> commit info
 	commitMsg map[string]commitMsg             // blockHex -> commit payload
 	sentVote  map[string]bool                  // local vote tracking
+	lockedBlk string                           // highest locked block hex
+	lockedH   int64                            // height of locked block
+	pending   map[string]struct{}              // blocks awaiting safe vote conditions
 }
 
 // StartL2FromTopic launches the L2 checkpoint service using an existing block topic handle.
@@ -125,6 +140,8 @@ func StartL2FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, param
 		committed: make(map[string]commitInfo),
 		commitMsg: make(map[string]commitMsg),
 		sentVote:  make(map[string]bool),
+		lockedH:   -1,
+		pending:   make(map[string]struct{}),
 	}
 
 	tV, _ := ps.Join(topicL2Vote)
@@ -207,14 +224,13 @@ func (s *L2Service) onBlock(data []byte) {
 }
 
 func (s *L2Service) voteForBlock(hashHex string, height int64, parentHex string) {
-	s.mu.Lock()
-	if s.sentVote[hashHex] {
-		s.mu.Unlock()
+	if !s.markVoteIfSafe(hashHex, parentHex, height) {
 		return
 	}
-	s.sentVote[hashHex] = true
-	s.mu.Unlock()
+	s.publishVote(hashHex, height, parentHex)
+}
 
+func (s *L2Service) publishVote(hashHex string, height int64, parentHex string) {
 	priv := s.h.Peerstore().PrivKey(s.h.ID())
 	if priv == nil {
 		return
@@ -248,6 +264,114 @@ func (s *L2Service) voteForBlock(hashHex string, height int64, parentHex string)
 		_ = s.tVote.Publish(s.ctx, by)
 	} else {
 		_ = s.publish(topicL2Vote, by)
+	}
+}
+
+func (s *L2Service) markVoteIfSafe(blockHex, parentHex string, height int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sentVote[blockHex] {
+		return false
+	}
+	if !s.safeToVoteLocked(blockHex, parentHex, height) {
+		s.pending[blockHex] = struct{}{}
+		return false
+	}
+	delete(s.pending, blockHex)
+	s.sentVote[blockHex] = true
+	return true
+}
+
+func (s *L2Service) safeToVoteLocked(blockHex, parentHex string, height int64) bool {
+	if parentHex == "" {
+		return true
+	}
+	if s.lockedBlk == "" {
+		return true
+	}
+	if parentHex == s.lockedBlk {
+		return true
+	}
+	if !s.extendsLockedLocked(parentHex) {
+		return false
+	}
+	if meta, ok := s.blocks[parentHex]; ok {
+		return meta.height >= s.lockedH
+	}
+	if qc, ok := s.qcs[parentHex]; ok {
+		return qc.Height >= s.lockedH
+	}
+	return false
+}
+
+func (s *L2Service) extendsLockedLocked(blockHex string) bool {
+	if blockHex == "" {
+		return true
+	}
+	if s.lockedBlk == "" || blockHex == s.lockedBlk {
+		return true
+	}
+	cur := blockHex
+	for steps := 0; steps < 1024 && cur != ""; steps++ {
+		if cur == s.lockedBlk {
+			return true
+		}
+		meta, ok := s.blocks[cur]
+		if !ok {
+			break
+		}
+		cur = meta.parentHex
+	}
+	return false
+}
+
+func (s *L2Service) retryPendingVotes() {
+	type pendingInfo struct {
+		blockHex string
+		height   int64
+		parent   string
+	}
+	for {
+		var info pendingInfo
+		s.mu.Lock()
+		for blk := range s.pending {
+			if s.sentVote[blk] {
+				delete(s.pending, blk)
+				continue
+			}
+			meta, ok := s.blocks[blk]
+			if !ok {
+				delete(s.pending, blk)
+				continue
+			}
+			if s.safeToVoteLocked(blk, meta.parentHex, meta.height) {
+				delete(s.pending, blk)
+				s.sentVote[blk] = true
+				info = pendingInfo{blockHex: blk, height: meta.height, parent: meta.parentHex}
+				break
+			}
+		}
+		s.mu.Unlock()
+		if info.blockHex == "" {
+			return
+		}
+		s.publishVote(info.blockHex, info.height, info.parent)
+	}
+}
+
+func (s *L2Service) updateLockForQCLocked(blockHex string, qcHeight int64) {
+	height := qcHeight
+	if meta, ok := s.blocks[blockHex]; ok && meta.height > height {
+		height = meta.height
+	}
+	if s.lockedBlk == "" {
+		s.lockedBlk = blockHex
+		s.lockedH = height
+		return
+	}
+	if height > s.lockedH && s.extendsLockedLocked(blockHex) {
+		s.lockedBlk = blockHex
+		s.lockedH = height
 	}
 }
 
@@ -349,6 +473,7 @@ func (s *L2Service) onQC(data []byte) {
 
 func (s *L2Service) storeQC(blockHex string, qc qcMsg, parentHex string) bool {
 	stored := false
+	grandParent := ""
 	s.mu.Lock()
 	if _, ok := s.qcs[blockHex]; !ok {
 		s.qcs[blockHex] = qc
@@ -357,13 +482,21 @@ func (s *L2Service) storeQC(blockHex string, qc qcMsg, parentHex string) bool {
 				s.childQCs[parentHex] = make(map[string]struct{})
 			}
 			s.childQCs[parentHex][blockHex] = struct{}{}
+			if meta, ok := s.blocks[parentHex]; ok {
+				grandParent = meta.parentHex
+			}
 		}
+		s.updateLockForQCLocked(blockHex, qc.Height)
 		stored = true
 	}
 	s.mu.Unlock()
 	if stored {
+		s.retryPendingVotes()
 		s.checkCommitFor(parentHex)
 		s.checkCommitFor(blockHex)
+		if grandParent != "" {
+			s.checkCommitFor(grandParent)
+		}
 	}
 	return stored
 }
@@ -385,11 +518,31 @@ func (s *L2Service) checkCommitFor(blockHex string) {
 		return
 	}
 	kids := s.childQCs[blockHex]
-	if len(kids) == 0 {
+	grandChain := false
+	for childHex := range kids {
+		if _, ok := s.qcs[childHex]; !ok {
+			continue
+		}
+		grandkids := s.childQCs[childHex]
+		for grandHex := range grandkids {
+			if _, ok := s.qcs[grandHex]; ok {
+				grandChain = true
+				break
+			}
+		}
+		if grandChain {
+			break
+		}
+	}
+	if !grandChain {
 		s.mu.Unlock()
 		return
 	}
-	meta := s.blocks[blockHex]
+	meta, ok := s.blocks[blockHex]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
 	blockBytes, err := hex.DecodeString(blockHex)
 	if err != nil {
 		s.mu.Unlock()
@@ -603,6 +756,11 @@ func (s *L2Service) pruneExpired() {
 	for blockHex := range s.blocks {
 		if _, committed := s.committed[blockHex]; committed {
 			delete(s.blocks, blockHex)
+		}
+	}
+	for blockHex := range s.pending {
+		if _, committed := s.committed[blockHex]; committed {
+			delete(s.pending, blockHex)
 		}
 	}
 	for parentHex, kids := range s.childQCs {
