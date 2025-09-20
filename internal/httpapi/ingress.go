@@ -537,12 +537,8 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 	// GET /iot/capacity: report device counts and availability.
 	mux.HandleFunc("/iot/capacity", func(w http.ResponseWriter, r *http.Request) {
 		count := devReg.Count()
-		maxDevices := 0
-		accepting := true
-		if cellMgr != nil {
-			maxDevices = cellMgr.MaxDevices()
-			accepting = cellMgr.CanAccept(count)
-		}
+		maxDevices := devReg.Max()
+		accepting := maxDevices == 0 || count < maxDevices
 		resp := map[string]any{
 			"node_id":     h.ID().String(),
 			"connected":   count,

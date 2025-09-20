@@ -77,8 +77,7 @@ func main() {
 	// AION: enabled by default (no dev flags)
 	listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
 	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
-	cellMin := flag.Int("cell-min-devices", 3, "minimum devices to form a Cell")
-	cellMax := flag.Int("cell-max-devices", 0, "maximum devices to include in a Cell (0 = unlimited)")
+	iotMax := flag.Int("iot-max-devices", 0, "maximum IoT devices this node accepts (0 = unlimited)")
 	// HELIOS L1
 	l1Min := flag.Int("l1-min-attesters", 2, "minimum distinct attesters required to notarize")
 	var bootstraps multiFlag
@@ -151,10 +150,17 @@ func main() {
 	p2p.RegisterHelloHandler(h)
 	// IoT registry and libp2p device registration protocol
 	devReg := iot.NewRegistry(*chainID)
+	devReg.SetMax(*iotMax)
 	iot.RegisterIotHandler(h, devReg)
 	// Cell manager (uses registry)
-	cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin, *cellMax)
-	devReg.SetMax(*cellMax)
+	cellThreshold := 3
+	if *iotMax > 0 && *iotMax < cellThreshold {
+		cellThreshold = *iotMax
+	}
+	if cellThreshold <= 0 {
+		cellThreshold = 1
+	}
+	cellMgr := cell.NewManager(*chainID, h.ID().String(), cellThreshold, *iotMax)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
@@ -248,7 +254,7 @@ func main() {
 		peers := len(h.Network().Peers())
 		devs := devReg.List()
 		haveNodes := total >= 2 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
-		haveDevices := len(devs) >= *cellMin
+		haveDevices := len(devs) >= cellThreshold
 		if haveDevices {
 			if c := cellMgr.TryForm(devReg); c != nil && c.Active {
 				// formed; proceed to node start after both conditions satisfied
@@ -256,10 +262,10 @@ func main() {
 			}
 		}
 		if haveNodes && haveDevices {
-			logx.Info("preflight ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs))
+			logx.Info("preflight ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "cell_threshold", cellThreshold)
 			break
 		}
-		logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", *cellMin)
+		logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", cellThreshold)
 		time.Sleep(1 * time.Second)
 	}
 
@@ -302,7 +308,7 @@ func main() {
 	l2Params := helios.L2Params{QuorumSize: l2Quorum}
 	l2svc = helios.StartL2FromTopic(ctx, h, ps, l2Params, blkTopic)
 	logx.Info("helios l2 params", "validators", totalNodes, "quorum", l2Params.QuorumSize)
-	l3Params := helios.L3Params{MinCells: *cellMin, MinRegions: 1, TotalStake: float64(totalNodes)}
+	l3Params := helios.L3Params{MinCells: cellThreshold, MinRegions: 1, TotalStake: float64(totalNodes)}
 	if l3Params.MinCells < 1 {
 		l3Params.MinCells = 1
 	}
@@ -397,7 +403,7 @@ func main() {
 						logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch, "l2_commit_height", l2Commit)
 					}
 					// Try to form a cell when threshold is met
-					if c := cellMgr.TryForm(devReg); c != nil {
+		if c := cellMgr.TryForm(devReg); c != nil {
 						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
 						registerCell(c)
 					}

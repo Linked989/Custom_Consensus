@@ -166,10 +166,6 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
 		if _, err := hex.DecodeString(msg.Pub); err != nil {
 			return
 		}
-		limit := reg.Max()
-		// if limit == 0 {
-		// 	limit = -1
-		// }
 		dev := Device{
 			DeviceID:  msg.DeviceID,
 			Firmware:  msg.Firmware,
@@ -182,7 +178,7 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
 			LastSeen:  time.Now(),
 			PeerID:    peer.ID(s.Conn().RemotePeer()).String(),
 		}
-		if err := reg.UpsertWithLimit(dev, limit); err != nil {
+		if err := reg.UpsertWithLimit(dev, reg.Max()); err != nil {
 			if errors.Is(err, ErrRegistryFull) {
 				_, _ = s.Write([]byte("full\n"))
 			}
