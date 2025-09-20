@@ -11,3 +11,10 @@
 
 - [x] Add HTTP endpoint exposing consolidated L3 finality health
 - [x] Add console logging around L3 readiness and envelope broadcasting
+
+- [x] Catalog HTTP endpoints across project
+- [x] Summarize HTTP endpoints with descriptions
+
+- [x] Inspect L service status data for debug endpoint
+- [x] Implement consolidated L debug endpoint
+- [x] Format code if needed

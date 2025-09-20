@@ -808,6 +808,103 @@ func (s *L2Service) Status() L2Status {
 	}
 }
 
+// L2BlockDebug summarizes a tracked block for debugging.
+type L2BlockDebug struct {
+	Block        string     `json:"block"`
+	Height       int64      `json:"height"`
+	Parent       string     `json:"parent"`
+	FirstSeen    time.Time  `json:"first_seen"`
+	Pending      bool       `json:"pending"`
+	VoteCount    int        `json:"vote_count"`
+	VotePeers    []string   `json:"vote_peers,omitempty"`
+	HasQC        bool       `json:"has_qc"`
+	QCStep       int        `json:"qc_step"`
+	QCVotes      int        `json:"qc_votes"`
+	QCCreatedAt  *time.Time `json:"qc_created_at,omitempty"`
+	ChildQCs     []string   `json:"child_qcs,omitempty"`
+	Committed    bool       `json:"committed"`
+	CommitHeight int64      `json:"commit_height,omitempty"`
+	CommittedAt  *time.Time `json:"committed_at,omitempty"`
+}
+
+// L2DebugState captures current lock/pending state plus tracked blocks.
+type L2DebugState struct {
+	LockedBlock  string         `json:"locked_block"`
+	LockedHeight int64          `json:"locked_height"`
+	PendingCount int            `json:"pending_count"`
+	Blocks       []L2BlockDebug `json:"blocks"`
+}
+
+// DebugState returns a snapshot tuned for HTTP debugging endpoints.
+func (s *L2Service) DebugState(limit int) L2DebugState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	blks := make([]L2BlockDebug, 0, len(s.blocks))
+	for hash, meta := range s.blocks {
+		item := L2BlockDebug{
+			Block:     hash,
+			Height:    meta.height,
+			Parent:    meta.parentHex,
+			FirstSeen: meta.firstSeen,
+		}
+		if _, pending := s.pending[hash]; pending {
+			item.Pending = true
+		}
+		if votes, ok := s.votes[hash]; ok {
+			item.VoteCount = len(votes)
+			if len(votes) > 0 {
+				peers := make([]string, 0, len(votes))
+				for peerID := range votes {
+					peers = append(peers, peerID)
+				}
+				sort.Strings(peers)
+				item.VotePeers = peers
+			}
+		}
+		if qc, ok := s.qcs[hash]; ok {
+			item.HasQC = true
+			item.QCStep = int(qc.Step)
+			item.QCVotes = len(qc.Votes)
+			t := qc.CreatedAt
+			item.QCCreatedAt = &t
+		}
+		if children, ok := s.childQCs[hash]; ok && len(children) > 0 {
+			list := make([]string, 0, len(children))
+			for child := range children {
+				list = append(list, child)
+			}
+			sort.Strings(list)
+			item.ChildQCs = list
+		}
+		if info, ok := s.committed[hash]; ok {
+			item.Committed = true
+			item.CommitHeight = info.height
+			when := info.when
+			item.CommittedAt = &when
+		} else if msg, ok := s.commitMsg[hash]; ok {
+			when := msg.CommittedAt
+			item.CommitHeight = msg.Height
+			item.CommittedAt = &when
+		}
+		blks = append(blks, item)
+	}
+	sort.Slice(blks, func(i, j int) bool {
+		if blks[i].Height == blks[j].Height {
+			return blks[i].FirstSeen.After(blks[j].FirstSeen)
+		}
+		return blks[i].Height > blks[j].Height
+	})
+	if limit > 0 && len(blks) > limit {
+		blks = blks[:limit]
+	}
+	return L2DebugState{
+		LockedBlock:  s.lockedBlk,
+		LockedHeight: s.lockedH,
+		PendingCount: len(s.pending),
+		Blocks:       blks,
+	}
+}
+
 func (s *L2Service) highestCommitLocked() int64 {
 	var best int64
 	for _, info := range s.committed {

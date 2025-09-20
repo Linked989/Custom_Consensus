@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,14 @@ import (
 	"pose/internal/mempool"
 	// AION status endpoint disabled here; use blockchain and gossip for status
 )
+
+type layerBlockView struct {
+	Block  string                  `json:"block"`
+	Height int64                   `json:"height"`
+	L1     *helios.L1Record        `json:"l1,omitempty"`
+	L2     *helios.L2BlockDebug    `json:"l2,omitempty"`
+	L3     *helios.L3BlockProgress `json:"l3,omitempty"`
+}
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
 // StartHTTPAPI starts the HTTP server. getAION/getHELIOS/getL2/getL3 may be nil; if provided, they should return the current services.
@@ -253,6 +262,115 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		recs := svc.RecentStatus()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"recent": recs})
+	})
+	// GET /helios/debug/layers?limit=10
+	mux.HandleFunc("/helios/debug/layers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		limit := 10
+		if qs := r.URL.Query().Get("limit"); qs != "" {
+			if v, err := strconv.Atoi(qs); err == nil && v >= 0 {
+				limit = v
+			}
+		}
+		resp := map[string]any{"limit": limit}
+		var l1Records []helios.L1Record
+		if getHELIOS == nil {
+			resp["l1"] = map[string]any{"available": false, "reason": "helios l1 not available"}
+		} else if svc := getHELIOS(); svc == nil {
+			resp["l1"] = map[string]any{"available": false, "reason": "helios l1 not initialized"}
+		} else {
+			recs := svc.RecentStatus()
+			if limit > 0 && len(recs) > limit {
+				recs = recs[:limit]
+			}
+			l1Records = recs
+			resp["l1"] = map[string]any{"available": true, "recent": recs}
+		}
+		var l2Debug helios.L2DebugState
+		var l2Status helios.L2Status
+		if getL2 == nil {
+			resp["l2"] = map[string]any{"available": false, "reason": "helios l2 not available"}
+		} else if svc := getL2(); svc == nil {
+			resp["l2"] = map[string]any{"available": false, "reason": "helios l2 not initialized"}
+		} else {
+			l2Status = svc.Status()
+			l2Debug = svc.DebugState(limit)
+			resp["l2"] = map[string]any{"available": true, "status": l2Status, "debug": l2Debug}
+		}
+		var l3Blocks []helios.L3BlockProgress
+		if getL3 == nil {
+			resp["l3"] = map[string]any{"available": false, "reason": "helios l3 not available"}
+		} else if svc := getL3(); svc == nil {
+			resp["l3"] = map[string]any{"available": false, "reason": "helios l3 not initialized"}
+		} else {
+			blocks := svc.Snapshot(limit)
+			l3Blocks = blocks
+			resp["l3"] = map[string]any{"available": true, "blocks": blocks}
+		}
+		blockMap := make(map[string]*layerBlockView)
+		ensure := func(hash string) *layerBlockView {
+			h := strings.ToLower(strings.TrimSpace(hash))
+			if h == "" {
+				return nil
+			}
+			if entry, ok := blockMap[h]; ok {
+				return entry
+			}
+			entry := &layerBlockView{Block: h}
+			blockMap[h] = entry
+			return entry
+		}
+		for i := range l1Records {
+			rec := l1Records[i]
+			entry := ensure(rec.Hash)
+			if entry == nil {
+				continue
+			}
+			recCopy := rec
+			entry.L1 = &recCopy
+			if recCopy.Height > entry.Height {
+				entry.Height = recCopy.Height
+			}
+		}
+		if l2Debug.Blocks != nil {
+			for i := range l2Debug.Blocks {
+				blk := l2Debug.Blocks[i]
+				entry := ensure(blk.Block)
+				if entry == nil {
+					continue
+				}
+				blkCopy := blk
+				entry.L2 = &blkCopy
+				if blkCopy.Height > entry.Height {
+					entry.Height = blkCopy.Height
+				}
+			}
+		}
+		for i := range l3Blocks {
+			blk := l3Blocks[i]
+			entry := ensure(blk.Block)
+			if entry == nil {
+				continue
+			}
+			blkCopy := blk
+			entry.L3 = &blkCopy
+			if blkCopy.Height > entry.Height {
+				entry.Height = blkCopy.Height
+			}
+		}
+		combined := make([]layerBlockView, 0, len(blockMap))
+		for _, entry := range blockMap {
+			combined = append(combined, *entry)
+		}
+		sort.Slice(combined, func(i, j int) bool {
+			if combined[i].Height == combined[j].Height {
+				return combined[i].Block < combined[j].Block
+			}
+			return combined[i].Height > combined[j].Height
+		})
+		resp["blocks"] = combined
+		resp["generated_at"] = time.Now().UTC()
+		json.NewEncoder(w).Encode(resp)
 	})
 	// GET /helios/l2/status: checkpoint/quorum diagnostics
 	mux.HandleFunc("/helios/l2/status", func(w http.ResponseWriter, r *http.Request) {
