@@ -154,6 +154,7 @@ func main() {
 	iot.RegisterIotHandler(h, devReg)
 	// Cell manager (uses registry)
 	cellMgr := cell.NewManager(*chainID, h.ID().String(), *cellMin, *cellMax)
+	devReg.SetMax(*cellMax)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}

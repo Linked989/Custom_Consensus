@@ -50,6 +50,7 @@ type Registry struct {
 	mu      sync.Mutex
 	chainID string
 	byID    map[string]Device
+	max     int
 }
 
 // ErrRegistryFull indicates the node cannot accept more device registrations.
@@ -59,6 +60,20 @@ func NewRegistry(chainID string) *Registry {
 	r := &Registry{chainID: chainID, byID: make(map[string]Device)}
 	_ = r.load()
 	return r
+}
+
+// SetMax updates the maximum allowed devices (0 = unlimited).
+func (r *Registry) SetMax(max int) {
+	r.mu.Lock()
+	r.max = max
+	r.mu.Unlock()
+}
+
+// Max returns the configured device limit.
+func (r *Registry) Max() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.max
 }
 
 // List returns a snapshot of registered devices.
@@ -100,6 +115,9 @@ func (r *Registry) Remove(deviceID string) {
 func (r *Registry) UpsertWithLimit(d Device, max int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if max <= 0 {
+		max = r.max
+	}
 	if prev, ok := r.byID[d.DeviceID]; ok {
 		if d.FirstSeen.IsZero() {
 			d.FirstSeen = prev.FirstSeen
@@ -148,7 +166,11 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
 		if _, err := hex.DecodeString(msg.Pub); err != nil {
 			return
 		}
-		reg.Upsert(Device{
+		limit := reg.Max()
+		if limit == 0 {
+			limit = -1
+		}
+		dev := Device{
 			DeviceID:  msg.DeviceID,
 			Firmware:  msg.Firmware,
 			Model:     msg.Model,
@@ -159,7 +181,13 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
 			FirstSeen: time.Now(),
 			LastSeen:  time.Now(),
 			PeerID:    peer.ID(s.Conn().RemotePeer()).String(),
-		})
+		}
+		if err := reg.UpsertWithLimit(dev, limit); err != nil {
+			if errors.Is(err, ErrRegistryFull) {
+				_, _ = s.Write([]byte("full\n"))
+			}
+			return
+		}
 		// ack
 		_, _ = s.Write([]byte("ok\n"))
 	})

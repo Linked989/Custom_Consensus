@@ -589,10 +589,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		// save in device registry and key registry for tx validation
 		// Derive kid from pub (sha256(pub)[:8]) if none, and register for COSE validation
 		kid := sha256.Sum256(pub)
-		limit := 0
-		if cellMgr != nil {
-			limit = cellMgr.MaxDevices()
-		}
+		limit := devReg.Max()
 		device := iot.Device{
 			DeviceID:  req.DeviceID,
 			Firmware:  req.Firmware,
