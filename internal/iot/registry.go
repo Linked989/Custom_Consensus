@@ -112,13 +112,19 @@ func (r *Registry) Remove(deviceID string) {
 
 // UpsertWithLimit inserts or updates a device entry while enforcing the
 // provided maximum count (0 = unlimited). Existing devices always update.
+// UpsertWithLimit inserts or updates a device entry while enforcing the
+// provided maximum count. Use -1 to inherit registry default.
 func (r *Registry) UpsertWithLimit(d Device, max int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if max <= 0 {
+
+	// Use registry default only when explicitly requested with -1
+	if max < 0 {
 		max = r.max
 	}
+
 	if prev, ok := r.byID[d.DeviceID]; ok {
+		// Existing device - always allow updates
 		if d.FirstSeen.IsZero() {
 			d.FirstSeen = prev.FirstSeen
 		}
@@ -126,6 +132,7 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 			d.PeerID = prev.PeerID
 		}
 	} else {
+		// New device - check capacity if limit is set
 		if max > 0 && len(r.byID) >= max {
 			return ErrRegistryFull
 		}
@@ -133,6 +140,7 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 			d.FirstSeen = time.Now()
 		}
 	}
+
 	if d.LastSeen.IsZero() {
 		d.LastSeen = time.Now()
 	}
@@ -140,12 +148,7 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 	return r.saveLocked()
 }
 
-// Upsert adds or updates a device entry without capacity enforcement.
-func (r *Registry) Upsert(d Device) {
-	_ = r.UpsertWithLimit(d, 0)
-}
-
-// RegisterIotHandler installs a libp2p handler that accepts IoT hello messages.
+// Update the handler to pass the limit directly
 func RegisterIotHandler(h host.Host, reg *Registry) {
 	h.SetStreamHandler(IotProto, func(s network.Stream) {
 		defer s.Close()
@@ -178,9 +181,11 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
 			LastSeen:  time.Now(),
 			PeerID:    peer.ID(s.Conn().RemotePeer()).String(),
 		}
-		limit := reg.Max()
-		if err := reg.UpsertWithLimit(dev, limit); err != nil {
+
+		// Use -1 to inherit registry's configured limit
+		if err := reg.UpsertWithLimit(dev, -1); err != nil {
 			if errors.Is(err, ErrRegistryFull) {
+				limit := reg.Max()
 				msg := map[string]any{
 					"error":       "iot_limit_reached",
 					"max_devices": limit,
