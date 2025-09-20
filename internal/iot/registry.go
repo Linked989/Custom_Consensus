@@ -167,9 +167,9 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
 			return
 		}
 		limit := reg.Max()
-		if limit == 0 {
-			limit = -1
-		}
+		// if limit == 0 {
+		// 	limit = -1
+		// }
 		dev := Device{
 			DeviceID:  msg.DeviceID,
 			Firmware:  msg.Firmware,
