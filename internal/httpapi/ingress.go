@@ -22,6 +22,7 @@ import (
 	"pose/internal/cell"
 	"pose/internal/coseutil"
 	"pose/internal/entropy"
+	"pose/internal/gossip"
 	"pose/internal/helios"
 	"pose/internal/iot"
 	"pose/internal/logx"
@@ -39,7 +40,7 @@ type layerBlockView struct {
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
 // StartHTTPAPI starts the HTTP server. getAION/getHELIOS/getL2/getL3 may be nil; if provided, they should return the current services.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service, getL3 func() *helios.L3Service) *http.Server {
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, dir *gossip.NodeDirectory, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service, getL3 func() *helios.L3Service) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -75,6 +76,17 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		th, thash := blockchain.GetTip(chainID)
 		peers := h.Network().Peers()
 		out := map[string]any{"chain_id": chainID, "tip_height": th, "tip_hash": thash, "peers": len(peers), "mempool": pool.Len()}
+		if dir != nil {
+			nodes := dir.List()
+			online := 0
+			for _, node := range nodes {
+				if node.Status == "online" {
+					online++
+				}
+			}
+			out["nodes_online"] = online
+			out["nodes_known"] = len(nodes)
+		}
 		if getL2 != nil {
 			if svc := getL2(); svc != nil {
 				st := svc.Status()
@@ -262,6 +274,19 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		recs := svc.RecentStatus()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"recent": recs})
+	})
+	// GET /network/members: directory of nodes and statuses.
+	mux.HandleFunc("/network/members", func(w http.ResponseWriter, r *http.Request) {
+		if dir == nil {
+			http.Error(w, "directory not available", http.StatusServiceUnavailable)
+			return
+		}
+		resp := map[string]any{
+			"nodes":        dir.List(),
+			"generated_at": time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
 	})
 	// GET /helios/debug/layers?limit=10
 	mux.HandleFunc("/helios/debug/layers", func(w http.ResponseWriter, r *http.Request) {
@@ -508,6 +533,25 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(devReg.List())
 	})
+	// GET /iot/capacity: report device counts and availability.
+	mux.HandleFunc("/iot/capacity", func(w http.ResponseWriter, r *http.Request) {
+		count := devReg.Count()
+		maxDevices := 0
+		accepting := true
+		if cellMgr != nil {
+			maxDevices = cellMgr.MaxDevices()
+			accepting = cellMgr.CanAccept(count)
+		}
+		resp := map[string]any{
+			"node_id":     h.ID().String(),
+			"connected":   count,
+			"max_devices": maxDevices,
+			"accepting":   accepting,
+			"timestamp":   time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
 	// POST /iot/register: {device_id, firmware, model, kid, pub, sensors[], caps[]}
 	mux.HandleFunc("/iot/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -532,6 +576,14 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			http.Error(w, "missing fields", http.StatusBadRequest)
 			return
 		}
+		if cellMgr != nil {
+			if _, exists := devReg.Get(req.DeviceID); !exists {
+				if !cellMgr.CanAccept(devReg.Count()) {
+					http.Error(w, "cell full", http.StatusConflict)
+					return
+				}
+			}
+		}
 		pub, err := hex.DecodeString(req.Pub)
 		if err != nil || len(pub) != ed25519.PublicKeySize {
 			http.Error(w, "bad pub", http.StatusBadRequest)
@@ -546,6 +598,20 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		kid := sha256.Sum256(pub)
 		devReg.Upsert(iot.Device{DeviceID: req.DeviceID, Firmware: req.Firmware, Model: req.Model, KidHex: strings.ToLower(hex.EncodeToString(kid[:8])), PubHex: strings.ToLower(req.Pub), Sensors: req.Sensors, Caps: req.Caps, FirstSeen: time.Now(), LastSeen: time.Now()})
 		coseutil.RegistryRegister(kid[:8], ed25519.PublicKey(pub))
+		w.WriteHeader(http.StatusNoContent)
+	})
+	// DELETE /iot/session/{device_id}: remove device from local registry.
+	mux.HandleFunc("/iot/session/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "DELETE only", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimPrefix(r.URL.Path, "/iot/session/")
+		if strings.TrimSpace(deviceID) == "" {
+			http.NotFound(w, r)
+			return
+		}
+		devReg.Remove(deviceID)
 		w.WriteHeader(http.StatusNoContent)
 	})
 	srv := &http.Server{Addr: addr, Handler: mux}

@@ -18,3 +18,9 @@
 - [x] Inspect L service status data for debug endpoint
 - [x] Implement consolidated L debug endpoint
 - [x] Format code if needed
+
+- [x] Review current IoT/cell/node membership flows
+- [x] Design updates for device/node behavior
+- [x] Implement IoT join/retry/state changes
+- [x] Update tests or add new ones if feasible
+- [x] Format code and finalize

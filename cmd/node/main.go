@@ -29,6 +29,7 @@ import (
 const mdnsServiceTag = "pose-simple-mdns"
 const heartbeatTopic = "pose/heartbeat/1.0.0"
 const txTopicDefault = "pose/tx/1.0.0"
+const networkTopic = "pose/network/status/1.0.0"
 
 func main() {
 	// Flags
@@ -173,6 +174,19 @@ func main() {
 		logx.Error("pubsub init", "err", err)
 		os.Exit(1)
 	}
+	directory, dirTopic, err := gossip.StartNodeDirectory(ctx, h, ps, networkTopic, *memberTTL)
+	if err != nil {
+		logx.Error("directory start", "err", err)
+		os.Exit(1)
+	}
+	if err := gossip.PublishNodeStatus(ctx, dirTopic, h.ID().String(), "online"); err != nil {
+		logx.Debug("directory announce failed", "err", err)
+	}
+	defer func() {
+		offCtx, cancelOff := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelOff()
+		_ = gossip.PublishNodeStatus(offCtx, dirTopic, h.ID().String(), "offline")
+	}()
 	// Local mempool
 	pool := mempool.New(*memCapacity, *memTTL, *memBytesCap)
 
@@ -218,7 +232,7 @@ func main() {
 	}
 	// Start HTTP API early so devices can register while we wait for preflight.
 	if *httpIn != "" {
-		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, devReg, cellMgr, getAION, getHELIOS, getL2, getL3)
+		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, directory, devReg, cellMgr, getAION, getHELIOS, getL2, getL3)
 		defer srv.Shutdown(ctx)
 		logx.Info("http api", "listen", *httpIn)
 	}
@@ -306,6 +320,39 @@ func main() {
 	}
 	if l3svc != nil {
 		logx.Info("helios l3 params", "min_cells", l3Params.MinCells, "min_regions", l3Params.MinRegions, "total_stake", l3Params.TotalStake)
+	}
+	if members != nil {
+		go func() {
+			interval := 5 * time.Second
+			if memberTTL != nil && *memberTTL > 0 && *memberTTL/2 > interval {
+				interval = *memberTTL / 2
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			lastCount := 0
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					total := members.CountAndSweep()
+					if total <= 0 {
+						total = 1
+					}
+					if total == lastCount {
+						continue
+					}
+					lastCount = total
+					quorum := helios.HotstuffQuorumSize(total)
+					if svc := getL2(); svc != nil {
+						svc.UpdateQuorumSize(quorum)
+					}
+					if svc := getL3(); svc != nil {
+						svc.UpdateTotalStake(float64(total))
+					}
+				}
+			}
+		}()
 	}
 	// Always start builder; AllowProduceSlot gates production to elected leader.
 	{

@@ -905,6 +905,21 @@ func (s *L2Service) DebugState(limit int) L2DebugState {
 	}
 }
 
+// UpdateQuorumSize adjusts the quorum threshold for dynamic memberships.
+func (s *L2Service) UpdateQuorumSize(quorum int) {
+	if quorum <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.params.QuorumSize == quorum {
+		s.mu.Unlock()
+		return
+	}
+	s.params.QuorumSize = quorum
+	s.mu.Unlock()
+	logx.Info("helios l2 quorum update", "quorum", quorum)
+}
+
 func (s *L2Service) highestCommitLocked() int64 {
 	var best int64
 	for _, info := range s.committed {

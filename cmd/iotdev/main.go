@@ -7,6 +7,7 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -33,12 +35,19 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
+const joinRetry = 5 * time.Minute
+
+var errCellFull = errors.New("cell full")
+
 type device struct {
-	id   string
-	pub  ed25519.PublicKey
-	priv ed25519.PrivateKey
-	kid  []byte
-	seq  uint64
+	id         string
+	pub        ed25519.PublicKey
+	priv       ed25519.PrivateKey
+	kid        []byte
+	seq        uint64
+	assigned   string
+	nextJoin   time.Time
+	baseOffset int
 }
 
 func main() {
@@ -81,6 +90,10 @@ func main() {
 	// Create devices and register
 	devs := make([]device, *n)
 	assign := planAssignments(*n, regBases, regCaps)
+	baseIndex := make(map[string]int)
+	for i, b := range regBases {
+		baseIndex[b] = i
+	}
 	for i := 0; i < *n; i++ {
 		pub, priv, err := ed25519.GenerateKey(crand.Reader)
 		if err != nil {
@@ -88,18 +101,30 @@ func main() {
 		}
 		kid := kidFromPub(pub)
 		id := fmt.Sprintf("did:iot:SIM-%x", kid)
-		devs[i] = device{id: id, pub: pub, priv: priv, kid: kid, seq: 0}
-		// Register device to assigned registration base for cell membership
-		regBase := assign[i]
-		if err := registerDevice(ctx, regBase, devs[i]); err != nil {
-			log.Fatalf("register %d at %s: %v", i+1, regBase, err)
+		offset := baseIndex[assign[i]]
+		devs[i] = device{id: id, pub: pub, priv: priv, kid: kid, seq: 0, nextJoin: time.Now(), baseOffset: offset}
+		keyTarget := *txBase
+		if keyTarget == "" && len(regBases) > 0 {
+			keyTarget = regBases[offset%len(regBases)]
 		}
-		// Also register key on TX node so this device can send TXs there regardless of cell
-		if err := registerKey(ctx, *txBase, devs[i]); err != nil {
-			log.Fatalf("register key %d at %s: %v", i+1, *txBase, err)
+		if keyTarget != "" {
+			if err := registerKey(ctx, keyTarget, devs[i]); err != nil {
+				log.Fatalf("register key %d at %s: %v", i+1, keyTarget, err)
+			}
 		}
 	}
-	log.Printf("registered %d devices (cell assign=%v) and keys on tx-base=%s", *n, summarizeAssignments(assign), *txBase)
+	log.Printf("initialized %d devices (preferred=%v)", *n, summarizeAssignments(assign))
+	for i := range devs {
+		if len(regBases) == 0 {
+			continue
+		}
+		if attemptJoin(ctx, &devs[i], regBases) {
+			log.Printf("device=%s joined %s", short(devs[i].id), devs[i].assigned)
+		} else {
+			devs[i].nextJoin = time.Now().Add(joinRetry)
+			log.Printf("device=%s tx-only until %s", short(devs[i].id), devs[i].nextJoin.Format(time.RFC3339))
+		}
+	}
 
 	// Start senders
 	var wg sync.WaitGroup
@@ -114,31 +139,68 @@ func main() {
 					return
 				default:
 				}
-				// Build COSE tx and POST /tx (always to tx-base)
+				if len(regBases) > 0 && d.assigned == "" && time.Now().After(d.nextJoin) {
+					if attemptJoin(ctx, d, regBases) {
+						log.Printf("device=%s joined %s", short(d.id), d.assigned)
+					} else {
+						d.nextJoin = time.Now().Add(joinRetry)
+						log.Printf("device=%s retry join at %s", short(d.id), d.nextJoin.Format(time.RFC3339))
+					}
+				}
+				sendBase := d.assigned
+				if sendBase == "" {
+					sendBase = *txBase
+				}
+				if sendBase == "" && len(regBases) > 0 {
+					sendBase = regBases[d.baseOffset%len(regBases)]
+				}
+				if sendBase == "" {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(2 * time.Second):
+					}
+					continue
+				}
 				d.seq++
 				cose, txid, err := buildCOSE(d.priv, d.kid, *chain, d.id, d.seq)
 				if err != nil {
 					log.Printf("build error (%s): %v", d.id, err)
-					return
+					continue
 				}
-				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, *txBase+"/tx", bytes.NewReader(cose))
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, sendBase+"/tx", bytes.NewReader(cose))
 				req.Header.Set("Content-Type", "application/cbor")
 
-				// Retry until success or context canceled.
 				resp, err := doHTTPWithRetry(ctx, cli, req)
 				if err != nil {
-					// Happens on context cancellation; exit cleanly.
-					log.Printf("post aborted (%s): %v", d.id, err)
-					return
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+					log.Printf("send failed (%s -> %s): %v", short(d.id), sendBase, err)
+					markForRejoin(d, sendBase)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Second):
+					}
+					continue
 				}
 				io.Copy(io.Discard, resp.Body)
+				status := resp.StatusCode
 				resp.Body.Close()
+				if status >= 500 {
+					log.Printf("send failed (%s -> %s): status=%s", short(d.id), sendBase, http.StatusText(status))
+					markForRejoin(d, sendBase)
+					continue
+				}
+				if status >= 300 {
+					log.Printf("send warning (%s -> %s): status=%s", short(d.id), sendBase, resp.Status)
+				}
 				log.Printf("sent device=%s txid=%s status=%s", short(d.id), txid[:12], resp.Status)
 
 				if *once {
 					return
 				}
-				// Sleep with jitter
 				delay := *interval + time.Duration(rand.Int63n(int64(*jitter)))
 				select {
 				case <-ctx.Done():
@@ -153,10 +215,11 @@ func main() {
 }
 
 func registerDevice(ctx context.Context, base string, d device) error {
+	base = strings.TrimRight(base, "/")
 	// HTTP: POST /iot/register {device_id, firmware, model, kid, pub}
 	body := fmt.Sprintf(`{"device_id":"%s","firmware":"1.0.0","model":"sim-sensor","kid":"%s","pub":"%s","sensors":["temp","humidity"],"caps":["push"]}`,
 		d.id, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/iot/register", bytes.NewReader([]byte(body)))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/iot/register", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	cli := &http.Client{Timeout: 5 * time.Second}
 
@@ -166,6 +229,9 @@ func registerDevice(ctx context.Context, base string, d device) error {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return errCellFull
+	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("status %s", resp.Status)
 	}
@@ -189,6 +255,111 @@ func registerKey(ctx context.Context, base string, d device) error {
 		return fmt.Errorf("status %s", resp.Status)
 	}
 	return nil
+}
+
+type capacityInfo struct {
+	NodeID     string    `json:"node_id"`
+	Connected  int       `json:"connected"`
+	MaxDevices int       `json:"max_devices"`
+	Accepting  bool      `json:"accepting"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+func fetchCapacity(ctx context.Context, base string) (capacityInfo, error) {
+	base = strings.TrimRight(base, "/")
+	url := base + "/iot/capacity"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	cli := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return capacityInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return capacityInfo{NodeID: base, Accepting: true}, nil
+	}
+	if resp.StatusCode >= 300 {
+		io.Copy(io.Discard, resp.Body)
+		return capacityInfo{}, fmt.Errorf("capacity status %s", resp.Status)
+	}
+	var info capacityInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return capacityInfo{}, err
+	}
+	if info.NodeID == "" {
+		info.NodeID = base
+	}
+	if info.MaxDevices > 0 && info.Connected >= info.MaxDevices {
+		info.Accepting = false
+	} else if info.MaxDevices == 0 {
+		info.Accepting = true
+	}
+	return info, nil
+}
+
+func rotateBases(bases []string, offset int) []string {
+	l := len(bases)
+	if l == 0 {
+		return nil
+	}
+	out := make([]string, l)
+	for i := 0; i < l; i++ {
+		idx := (offset + i) % l
+		out[i] = strings.TrimRight(bases[idx], "/")
+	}
+	return out
+}
+
+func attemptJoin(ctx context.Context, d *device, bases []string) bool {
+	order := rotateBases(bases, d.baseOffset)
+	for _, base := range order {
+		info, err := fetchCapacity(ctx, base)
+		if err != nil {
+			log.Printf("capacity check failed (%s): %v", base, err)
+			continue
+		}
+		if !info.Accepting {
+			continue
+		}
+		if err := registerDevice(ctx, base, *d); err != nil {
+			if errors.Is(err, errCellFull) {
+				continue
+			}
+			log.Printf("register failed (%s -> %s): %v", short(d.id), base, err)
+			continue
+		}
+		if err := registerKey(ctx, base, *d); err != nil {
+			log.Printf("register key failed (%s -> %s): %v", short(d.id), base, err)
+			continue
+		}
+		if d.assigned != "" && d.assigned != base {
+			leaveNode(ctx, d.assigned, *d)
+		}
+		d.assigned = base
+		d.nextJoin = time.Now().Add(joinRetry)
+		return true
+	}
+	return false
+}
+
+func leaveNode(ctx context.Context, base string, d device) {
+	base = strings.TrimRight(base, "/")
+	endpoint := base + "/iot/session/" + neturl.PathEscape(d.id)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	cli := &http.Client{Timeout: 3 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
+func markForRejoin(d *device, base string) {
+	if d.assigned == base {
+		d.assigned = ""
+		d.nextJoin = time.Now()
+	}
 }
 
 func listDevices(ctx context.Context, base string) error {

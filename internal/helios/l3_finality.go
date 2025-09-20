@@ -371,6 +371,17 @@ func StartL3Finality(ctx context.Context, h host.Host, ps *pubsub.PubSub, params
 	return svc
 }
 
+// UpdateTotalStake refreshes the expected validator stake for readiness checks.
+func (s *L3Service) UpdateTotalStake(stake float64) {
+	if stake <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.params.TotalStake = stake
+	s.mu.Unlock()
+	logx.Info("helios l3 stake update", "total_stake", stake)
+}
+
 func (s *L3Service) consumeAttestations(sub *pubsub.Subscription) {
 	for {
 		msg, err := sub.Next(s.ctx)
