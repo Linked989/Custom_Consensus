@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +52,9 @@ type Registry struct {
 	byID    map[string]Device
 }
 
+// ErrRegistryFull indicates the node cannot accept more device registrations.
+var ErrRegistryFull = errors.New("iot registry full")
+
 func NewRegistry(chainID string) *Registry {
 	r := &Registry{chainID: chainID, byID: make(map[string]Device)}
 	_ = r.load()
@@ -91,24 +95,36 @@ func (r *Registry) Remove(deviceID string) {
 	_ = r.saveLocked()
 }
 
-// Upsert adds or updates a device entry.
-func (r *Registry) Upsert(d Device) {
+// UpsertWithLimit inserts or updates a device entry while enforcing the
+// provided maximum count (0 = unlimited). Existing devices always update.
+func (r *Registry) UpsertWithLimit(d Device, max int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	prev, ok := r.byID[d.DeviceID]
-	if ok {
-		d.FirstSeen = prev.FirstSeen
+	if prev, ok := r.byID[d.DeviceID]; ok {
+		if d.FirstSeen.IsZero() {
+			d.FirstSeen = prev.FirstSeen
+		}
 		if d.PeerID == "" {
 			d.PeerID = prev.PeerID
 		}
-	} else if d.FirstSeen.IsZero() {
-		d.FirstSeen = time.Now()
+	} else {
+		if max > 0 && len(r.byID) >= max {
+			return ErrRegistryFull
+		}
+		if d.FirstSeen.IsZero() {
+			d.FirstSeen = time.Now()
+		}
 	}
 	if d.LastSeen.IsZero() {
 		d.LastSeen = time.Now()
 	}
 	r.byID[d.DeviceID] = d
-	_ = r.saveLocked()
+	return r.saveLocked()
+}
+
+// Upsert adds or updates a device entry without capacity enforcement.
+func (r *Registry) Upsert(d Device) {
+	_ = r.UpsertWithLimit(d, 0)
 }
 
 // RegisterIotHandler installs a libp2p handler that accepts IoT hello messages.

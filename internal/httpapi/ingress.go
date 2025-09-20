@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"sort"
@@ -576,14 +577,6 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			http.Error(w, "missing fields", http.StatusBadRequest)
 			return
 		}
-		if cellMgr != nil {
-			if _, exists := devReg.Get(req.DeviceID); !exists {
-				if !cellMgr.CanAccept(devReg.Count()) {
-					http.Error(w, "cell full", http.StatusConflict)
-					return
-				}
-			}
-		}
 		pub, err := hex.DecodeString(req.Pub)
 		if err != nil || len(pub) != ed25519.PublicKeySize {
 			http.Error(w, "bad pub", http.StatusBadRequest)
@@ -596,7 +589,29 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		// save in device registry and key registry for tx validation
 		// Derive kid from pub (sha256(pub)[:8]) if none, and register for COSE validation
 		kid := sha256.Sum256(pub)
-		devReg.Upsert(iot.Device{DeviceID: req.DeviceID, Firmware: req.Firmware, Model: req.Model, KidHex: strings.ToLower(hex.EncodeToString(kid[:8])), PubHex: strings.ToLower(req.Pub), Sensors: req.Sensors, Caps: req.Caps, FirstSeen: time.Now(), LastSeen: time.Now()})
+		limit := 0
+		if cellMgr != nil {
+			limit = cellMgr.MaxDevices()
+		}
+		device := iot.Device{
+			DeviceID:  req.DeviceID,
+			Firmware:  req.Firmware,
+			Model:     req.Model,
+			KidHex:    strings.ToLower(hex.EncodeToString(kid[:8])),
+			PubHex:    strings.ToLower(req.Pub),
+			Sensors:   req.Sensors,
+			Caps:      req.Caps,
+			FirstSeen: time.Now(),
+			LastSeen:  time.Now(),
+		}
+		if err := devReg.UpsertWithLimit(device, limit); err != nil {
+			if errors.Is(err, iot.ErrRegistryFull) {
+				http.Error(w, "cell full", http.StatusConflict)
+				return
+			}
+			http.Error(w, "registry error", http.StatusInternalServerError)
+			return
+		}
 		coseutil.RegistryRegister(kid[:8], ed25519.PublicKey(pub))
 		w.WriteHeader(http.StatusNoContent)
 	})
