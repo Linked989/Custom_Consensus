@@ -227,12 +227,26 @@ func registerDevice(ctx context.Context, base string, d device) error {
 	if err != nil {
 		return err
 	}
-	io.Copy(io.Discard, resp.Body)
+	payload, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusConflict {
+		var msg struct {
+			Error      string `json:"error"`
+			Message    string `json:"message"`
+			MaxDevices int    `json:"max_devices"`
+			Connected  int    `json:"connected"`
+		}
+		if len(payload) > 0 && json.Unmarshal(payload, &msg) == nil {
+			log.Printf("node %s full (connected=%d max=%d)", base, msg.Connected, msg.MaxDevices)
+		} else if len(payload) > 0 {
+			log.Printf("node %s full: %s", base, strings.TrimSpace(string(payload)))
+		}
 		return errCellFull
 	}
 	if resp.StatusCode >= 300 {
+		if len(payload) > 0 {
+			return fmt.Errorf("status %s body=%s", resp.Status, strings.TrimSpace(string(payload)))
+		}
 		return fmt.Errorf("status %s", resp.Status)
 	}
 	return nil

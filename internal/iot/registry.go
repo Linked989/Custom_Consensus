@@ -178,9 +178,19 @@ func RegisterIotHandler(h host.Host, reg *Registry) {
 			LastSeen:  time.Now(),
 			PeerID:    peer.ID(s.Conn().RemotePeer()).String(),
 		}
-		if err := reg.UpsertWithLimit(dev, reg.Max()); err != nil {
+		limit := reg.Max()
+		if err := reg.UpsertWithLimit(dev, limit); err != nil {
 			if errors.Is(err, ErrRegistryFull) {
-				_, _ = s.Write([]byte("full\n"))
+				msg := map[string]any{
+					"error":       "iot_limit_reached",
+					"max_devices": limit,
+					"connected":   reg.Count(),
+				}
+				if data, err := json.Marshal(msg); err == nil {
+					_, _ = s.Write(append(data, '\n'))
+				} else {
+					_, _ = s.Write([]byte("full\n"))
+				}
 			}
 			return
 		}

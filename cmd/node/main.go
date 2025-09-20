@@ -78,6 +78,8 @@ func main() {
 	listIot := flag.Bool("list-iot", false, "periodically log IoT devices registered")
 	listIotInterval := flag.Duration("list-iot-interval", 10*time.Second, "interval to log IoT devices when -list-iot is set")
 	iotMax := flag.Int("iot-max-devices", 0, "maximum IoT devices this node accepts (0 = unlimited)")
+	legacyCellMin := flag.Int("cell-min-devices", -1, "deprecated; ignored (use -iot-max-devices)")
+	legacyCellMax := flag.Int("cell-max-devices", -1, "deprecated; use -iot-max-devices")
 	// HELIOS L1
 	l1Min := flag.Int("l1-min-attesters", 2, "minimum distinct attesters required to notarize")
 	var bootstraps multiFlag
@@ -92,6 +94,15 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	maxDevices := *iotMax
+	if maxDevices <= 0 && *legacyCellMax >= 0 {
+		maxDevices = *legacyCellMax
+		logx.Warn("-cell-max-devices is deprecated; use -iot-max-devices instead", "value", maxDevices)
+	}
+	if *legacyCellMin >= 0 {
+		logx.Warn("-cell-min-devices is deprecated; minimum derives from -iot-max-devices", "value", *legacyCellMin)
+	}
 
 	if *genSwarmKey != "" {
 		if err := generateSwarmKey(*genSwarmKey); err != nil {
@@ -150,17 +161,17 @@ func main() {
 	p2p.RegisterHelloHandler(h)
 	// IoT registry and libp2p device registration protocol
 	devReg := iot.NewRegistry(*chainID)
-	devReg.SetMax(*iotMax)
+	devReg.SetMax(maxDevices)
 	iot.RegisterIotHandler(h, devReg)
 	// Cell manager (uses registry)
 	cellThreshold := 3
-	if *iotMax > 0 && *iotMax < cellThreshold {
-		cellThreshold = *iotMax
+	if maxDevices > 0 && maxDevices < cellThreshold {
+		cellThreshold = maxDevices
 	}
 	if cellThreshold <= 0 {
 		cellThreshold = 1
 	}
-	cellMgr := cell.NewManager(*chainID, h.ID().String(), cellThreshold, *iotMax)
+	cellMgr := cell.NewManager(*chainID, h.ID().String(), cellThreshold, maxDevices)
 
 	if *enableMDNS {
 		n := &p2p.MDNSNotifee{H: h}
@@ -403,7 +414,7 @@ func main() {
 						logx.Info(magenta+"STATS"+reset, "all_nodes", all, "connected_nodes_counter", connected, "tip_height", tipH, "epoch", ns.Epoch, "slot", ns.Slot, "slot_epoch", ns.SlotEpoch, "l2_commit_height", l2Commit)
 					}
 					// Try to form a cell when threshold is met
-		if c := cellMgr.TryForm(devReg); c != nil {
+					if c := cellMgr.TryForm(devReg); c != nil {
 						logx.Info("cell formed", "id", c.ID, "devices", len(c.Devices))
 						registerCell(c)
 					}

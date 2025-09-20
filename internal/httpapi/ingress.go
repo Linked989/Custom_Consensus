@@ -599,7 +599,15 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 		if err := devReg.UpsertWithLimit(device, limit); err != nil {
 			if errors.Is(err, iot.ErrRegistryFull) {
-				http.Error(w, "cell full", http.StatusConflict)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]any{
+					"error":       "iot_limit_reached",
+					"message":     "node at capacity",
+					"max_devices": limit,
+					"connected":   devReg.Count(),
+					"hint":        "retry later or select another node",
+				})
 				return
 			}
 			http.Error(w, "registry error", http.StatusInternalServerError)
