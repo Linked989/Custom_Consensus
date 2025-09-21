@@ -62,9 +62,10 @@ func NewHost(listenAddr string, psk []byte) (host.Host, error) {
 
 // MDNSNotifee connects to discovered peers and sends hello.
 type MDNSNotifee struct {
-	H    host.Host
-	Mu   sync.Mutex
-	Seen map[peer.ID]struct{}
+	H      host.Host
+	Mu     sync.Mutex
+	Seen   map[peer.ID]struct{}
+	OnPeer func(peer.AddrInfo)
 }
 
 func (m *MDNSNotifee) HandlePeerFound(pi peer.AddrInfo) {
@@ -87,6 +88,9 @@ func (m *MDNSNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	if err := m.H.Connect(ctx, pi); err != nil {
 		logx.Debug("mdns connect failed", "peer", pi.ID.String(), "err", err)
 		return
+	}
+	if m.OnPeer != nil {
+		m.OnPeer(pi)
 	}
 	s, err := m.H.NewStream(ctx, pi.ID, ProtocolID)
 	if err != nil {

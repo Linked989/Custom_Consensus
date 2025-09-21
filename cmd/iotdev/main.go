@@ -36,7 +36,8 @@ func init() {
 }
 
 const (
-	joinRetry       = 5 * time.Minute
+	joinRetry       = 45 * time.Second
+	discoveryRetry  = 5 * time.Second
 	txTopicDefault  = "pose/tx/1.0.0"
 	defaultFirmware = "1.0.0"
 	defaultModel    = "sim-sensor"
@@ -62,16 +63,22 @@ type peerBook struct {
 
 func newPeerBook() *peerBook { return &peerBook{seeds: make(map[string]struct{})} }
 
-func (pb *peerBook) add(addrs []string) {
+func (pb *peerBook) add(addrs []string) bool {
 	pb.mu.Lock()
+	added := false
 	for _, addr := range addrs {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
 			continue
 		}
+		if _, ok := pb.seeds[addr]; ok {
+			continue
+		}
 		pb.seeds[addr] = struct{}{}
+		added = true
 	}
 	pb.mu.Unlock()
+	return added
 }
 
 func (pb *peerBook) list(h host.Host) []peer.AddrInfo {
@@ -147,7 +154,14 @@ func main() {
 	})
 
 	if *enableMDNS {
-		n := &p2p.MDNSNotifee{H: h}
+		n := &p2p.MDNSNotifee{H: h, OnPeer: func(pi peer.AddrInfo) {
+			ma, _ := peer.AddrInfoToP2pAddrs(&pi)
+			addrs := make([]string, 0, len(ma))
+			for _, m := range ma {
+				addrs = append(addrs, m.String())
+			}
+			book.add(addrs)
+		}}
 		svc, err := p2p.SetupMDNS(h, *mdnsTag, n)
 		if err != nil {
 			log.Fatalf("mdns: %v", err)
@@ -209,7 +223,12 @@ func main() {
 	log.Printf("initialized %d devices", *devices)
 
 	for i := range devs {
-		attemptJoinWithBackoff(ctx, h, book.list(h), *chain, &devs[i])
+		if ok, retry := attemptJoinWithBackoff(ctx, h, book.list(h), *chain, &devs[i]); !ok {
+			if retry <= 0 {
+				retry = joinRetry
+			}
+			devs[i].nextJoin = time.Now().Add(retry)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -232,12 +251,22 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *peer
 		default:
 		}
 
-		if !d.registered && time.Now().After(d.nextJoin) {
-			if attemptJoinWithBackoff(ctx, h, book.list(h), chain, d) {
-				log.Printf("device=%s joined peer=%s", short(d.id), d.assigned)
-			} else {
-				d.nextJoin = time.Now().Add(joinRetry)
-				log.Printf("device=%s retry join at %s", short(d.id), d.nextJoin.Format(time.RFC3339))
+		peers := book.list(h)
+		if !d.registered {
+			if len(peers) > 0 && time.Until(d.nextJoin) > 5*time.Second {
+				d.nextJoin = time.Now()
+			}
+			if time.Now().After(d.nextJoin) {
+				if ok, retry := attemptJoinWithBackoff(ctx, h, peers, chain, d); ok {
+					log.Printf("device=%s joined peer=%s", short(d.id), d.assigned)
+					d.nextJoin = time.Now().Add(joinRetry)
+				} else {
+					if retry <= 0 {
+						retry = joinRetry
+					}
+					d.nextJoin = time.Now().Add(retry)
+					log.Printf("device=%s retry join in %s", short(d.id), retry)
+				}
 			}
 		}
 		if !d.registered {
@@ -280,15 +309,15 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *peer
 	}
 }
 
-func attemptJoinWithBackoff(ctx context.Context, h host.Host, peers []peer.AddrInfo, chain string, d *device) bool {
+func attemptJoinWithBackoff(ctx context.Context, h host.Host, peers []peer.AddrInfo, chain string, d *device) (bool, time.Duration) {
 	if len(peers) == 0 {
 		log.Printf("no peers available for device=%s", short(d.id))
-		return false
+		return false, discoveryRetry
 	}
 	order := rotatePeers(peers, d.baseOffset)
 	for _, pi := range order {
 		if ctx.Err() != nil {
-			return false
+			return false, discoveryRetry
 		}
 		if err := ensureConnected(ctx, h, pi); err != nil {
 			log.Printf("connect failed (%s -> %s): %v", short(d.id), pi.ID, err)
@@ -334,10 +363,9 @@ func attemptJoinWithBackoff(ctx context.Context, h host.Host, peers []peer.AddrI
 		}
 		d.registered = true
 		d.assigned = pi.ID
-		d.nextJoin = time.Now().Add(joinRetry)
-		return true
+		return true, joinRetry
 	}
-	return false
+	return false, joinRetry
 }
 
 func listDevices(ctx context.Context, h host.Host, target peer.AddrInfo) error {
