@@ -214,34 +214,22 @@ func main() {
 	}
 	log.Printf("initialized %d devices", *devices)
 
-	for i := range devs {
-		if ok, retry := registerViaNodes(ctx, h, client, book, endpoints, *chain, &devs[i]); !ok {
-			if retry <= 0 {
-				retry = joinRetry
-			}
-			devs[i].nextJoin = time.Now().Add(retry)
-		} else {
-			if devs[i].fallback {
-				log.Printf("device=%s fallback mode active", short(devs[i].id))
-			} else {
-				log.Printf("device=%s registered via node=%s", short(devs[i].id), devs[i].assignedNode)
-			}
-		}
-	}
+	reg := newRegistrar(h, book, client, *chain, endpoints)
+	reg.start(ctx)
 
 	var wg sync.WaitGroup
 	for i := range devs {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			runDevice(ctx, h, txTopic, book, client, endpoints, *chain, interval, jitter, once, d)
+			runDevice(ctx, txTopic, reg, *chain, interval, jitter, once, d)
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addrBook, client *http.Client, nodes []*nodeEndpoint, chain string, interval, jitter *time.Duration, once *bool, d *device) {
+func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, chain string, interval, jitter *time.Duration, once *bool, d *device) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -250,17 +238,22 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addr
 		}
 
 		if (!d.registered || d.fallback) && time.Now().After(d.nextJoin) {
-			if ok, retry := registerViaNodes(ctx, h, client, book, nodes, chain, d); ok {
-				if d.fallback {
+			res, ok := reg.Register(ctx, d)
+			if !ok {
+				return
+			}
+			retry := res.retry
+			if retry <= 0 {
+				retry = joinRetry
+			}
+			d.nextJoin = time.Now().Add(retry)
+			if res.ok {
+				if res.fallback {
 					log.Printf("device=%s fallback mode active", short(d.id))
 				} else {
 					log.Printf("device=%s registered via node=%s", short(d.id), d.assignedNode)
 				}
 			} else {
-				if retry <= 0 {
-					retry = joinRetry
-				}
-				d.nextJoin = time.Now().Add(retry)
 				log.Printf("device=%s retry register in %s", short(d.id), retry)
 			}
 		}
@@ -308,86 +301,6 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addr
 		case <-time.After(delay):
 		}
 	}
-}
-
-func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, book *addrBook, nodes []*nodeEndpoint, chain string, d *device) (bool, time.Duration) {
-	if len(nodes) == 0 {
-		log.Printf("no HTTP nodes available for device=%s", short(d.id))
-		return false, joinRetry
-	}
-	req := httpRegisterRequest{
-		DeviceID: d.id,
-		Firmware: defaultFirmware,
-		Model:    defaultModel,
-		Kid:      hex.EncodeToString(d.kid),
-		Pub:      hex.EncodeToString(d.pub),
-		Sensors:  []string{"temp", "humidity"},
-		Caps:     []string{"push"},
-		ChainID:  chain,
-	}
-	delay := discoveryRetry
-	order := rotateIndices(len(nodes), d.baseOffset)
-	limitHits := 0
-	attempts := 0
-	blocked := 0
-	now := time.Now()
-	for _, idx := range order {
-		ep := nodes[idx]
-		if ep == nil {
-			continue
-		}
-		if now.Before(ep.retryAt) {
-			blocked++
-			continue
-		}
-		resp, err := httpRegisterDevice(ctx, client, ep.base, req)
-		if err != nil {
-			log.Printf("register error (%s -> %s): %v", short(d.id), ep.label(), err)
-			continue
-		}
-		attempts++
-		if !resp.OK {
-			if resp.Error == "iot_limit_reached" {
-				delay = joinRetry
-				limitHits++
-				ep.retryAt = time.Now().Add(joinRetry)
-				log.Printf("device=%s cell full for node=%s", short(d.id), ep.label())
-				continue
-			}
-			log.Printf("register rejected (%s -> %s): %s", short(d.id), ep.label(), firstNonEmpty(resp.Message, resp.Error))
-			continue
-		}
-		if len(resp.P2PAddrs) > 0 {
-			if newAddrs := book.add(resp.P2PAddrs); len(newAddrs) > 0 {
-				p2p.ConnectToAddrs(h, newAddrs)
-			}
-		}
-		if resp.NodeID != "" {
-			if pid, err := peer.Decode(resp.NodeID); err == nil {
-				d.assigned = pid
-			}
-		}
-		d.assignedNode = ep.label()
-		d.registered = true
-		d.fallback = false
-		if resp.Accepting {
-			ep.retryAt = time.Now().Add(discoveryRetry)
-		} else {
-			ep.retryAt = time.Now().Add(joinRetry)
-		}
-		d.nextJoin = time.Now().Add(joinRetry)
-		return true, joinRetry
-	}
-	if (attempts == 0 && blocked == len(nodes)) || (attempts > 0 && limitHits+blocked == len(nodes)) {
-		d.registered = true
-		d.fallback = true
-		d.assignedNode = ""
-		d.assigned = ""
-		d.nextJoin = time.Now().Add(joinRetry)
-		log.Printf("device=%s all nodes are full, start send only tx, try connection later", short(d.id))
-		return true, joinRetry
-	}
-	return false, delay
 }
 
 func httpRegisterDevice(ctx context.Context, client *http.Client, base string, req httpRegisterRequest) (httpRegisterResponse, error) {
@@ -582,6 +495,145 @@ func (n *nodeEndpoint) label() string {
 		return fmt.Sprintf("%s:%s", n.host, n.port)
 	}
 	return n.host
+}
+
+type regRequest struct {
+	device *device
+	resp   chan regResult
+}
+
+type regResult struct {
+	ok       bool
+	fallback bool
+	retry    time.Duration
+}
+
+type registrar struct {
+	host      host.Host
+	book      *addrBook
+	client    *http.Client
+	chain     string
+	endpoints []*nodeEndpoint
+	reqCh     chan regRequest
+}
+
+func newRegistrar(h host.Host, book *addrBook, client *http.Client, chain string, endpoints []*nodeEndpoint) *registrar {
+	return &registrar{
+		host:      h,
+		book:      book,
+		client:    client,
+		chain:     chain,
+		endpoints: endpoints,
+		reqCh:     make(chan regRequest),
+	}
+}
+
+func (r *registrar) start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-r.reqCh:
+				res := r.handle(req.device)
+				req.resp <- res
+			}
+		}
+	}()
+}
+
+func (r *registrar) Register(ctx context.Context, d *device) (regResult, bool) {
+	respCh := make(chan regResult, 1)
+	select {
+	case <-ctx.Done():
+		return regResult{}, false
+	case r.reqCh <- regRequest{device: d, resp: respCh}:
+	}
+	select {
+	case <-ctx.Done():
+		return regResult{}, false
+	case res := <-respCh:
+		return res, true
+	}
+}
+
+func (r *registrar) handle(d *device) regResult {
+	req := httpRegisterRequest{
+		DeviceID: d.id,
+		Firmware: defaultFirmware,
+		Model:    defaultModel,
+		Kid:      hex.EncodeToString(d.kid),
+		Pub:      hex.EncodeToString(d.pub),
+		Sensors:  []string{"temp", "humidity"},
+		Caps:     []string{"push"},
+		ChainID:  r.chain,
+	}
+
+	delay := discoveryRetry
+	order := rotateIndices(len(r.endpoints), d.baseOffset)
+	limitHits := 0
+	attempts := 0
+	blocked := 0
+	now := time.Now()
+	for _, idx := range order {
+		ep := r.endpoints[idx]
+		if ep == nil {
+			continue
+		}
+		if now.Before(ep.retryAt) {
+			blocked++
+			continue
+		}
+		resp, err := httpRegisterDevice(context.Background(), r.client, ep.base, req)
+		if err != nil {
+			log.Printf("register error (%s -> %s): %v", short(d.id), ep.label(), err)
+			continue
+		}
+		attempts++
+		if !resp.OK {
+			if resp.Error == "iot_limit_reached" {
+				delay = joinRetry
+				limitHits++
+				ep.retryAt = time.Now().Add(joinRetry)
+				log.Printf("device=%s cell full for node=%s", short(d.id), ep.label())
+				continue
+			}
+			log.Printf("register rejected (%s -> %s): %s", short(d.id), ep.label(), firstNonEmpty(resp.Message, resp.Error))
+			continue
+		}
+		if len(resp.P2PAddrs) > 0 {
+			if newAddrs := r.book.add(resp.P2PAddrs); len(newAddrs) > 0 {
+				p2p.ConnectToAddrs(r.host, newAddrs)
+			}
+		}
+		if resp.NodeID != "" {
+			if pid, err := peer.Decode(resp.NodeID); err == nil {
+				d.assigned = pid
+			}
+		}
+		d.assignedNode = ep.label()
+		d.registered = true
+		d.fallback = false
+		if resp.Accepting {
+			ep.retryAt = time.Now().Add(discoveryRetry)
+		} else {
+			ep.retryAt = time.Now().Add(joinRetry)
+		}
+		d.nextJoin = time.Now().Add(joinRetry)
+		return regResult{ok: true, fallback: false, retry: joinRetry}
+	}
+
+	if len(r.endpoints) > 0 && (attempts == 0 && blocked == len(r.endpoints) || (attempts > 0 && limitHits+blocked == len(r.endpoints))) {
+		d.assigned = ""
+		d.assignedNode = ""
+		d.registered = true
+		d.fallback = true
+		d.nextJoin = time.Now().Add(joinRetry)
+		log.Printf("device=%s all nodes are full, start send only tx, try connection later", short(d.id))
+		return regResult{ok: true, fallback: true, retry: joinRetry}
+	}
+
+	return regResult{ok: false, fallback: false, retry: delay}
 }
 
 func loadSwarmKey(path string) ([]byte, error) {
