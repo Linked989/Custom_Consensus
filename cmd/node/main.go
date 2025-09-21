@@ -159,10 +159,9 @@ func main() {
 
 	// Hello stream handler: register announced device keys and peer addrs
 	p2p.RegisterHelloHandler(h)
-	// IoT registry and libp2p device registration protocol
+	// IoT registry (HTTP only)
 	devReg := iot.NewRegistry(*chainID)
 	devReg.SetMax(maxDevices)
-	iot.RegisterIotHandler(h, devReg)
 	// Cell manager (uses registry)
 	cellThreshold := 3
 	if maxDevices > 0 && maxDevices < cellThreshold {

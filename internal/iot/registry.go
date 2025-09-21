@@ -1,7 +1,6 @@
 package iot
 
 import (
-	"bufio"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,25 +9,22 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// IotProto is the libp2p stream protocol for device→gateway registration.
+// IotProto is retained for compatibility with tooling that still references the
+// legacy libp2p registration flow. Servers no longer listen on this protocol.
 const IotProto = "/pose/iot/1.0.0"
 
-// Hello is the device registration message.
-// Sent as one JSON line on a new stream to IotProto.
+// Hello mirrors the historical libp2p registration payload so existing clients
+// can reuse the struct when calling HTTP registration.
 type Hello struct {
-	Type     string   `json:"type"` // "iot_hello"
+	Type     string   `json:"type"`
 	ChainID  string   `json:"chain_id"`
 	DeviceID string   `json:"device_id"`
 	Firmware string   `json:"firmware"`
 	Model    string   `json:"model"`
-	Kid      string   `json:"kid"` // hex of key id (e.g., sha256(pub)[:8])
-	Pub      string   `json:"pub"` // hex ed25519 public key
+	Kid      string   `json:"kid"`
+	Pub      string   `json:"pub"`
 	Sensors  []string `json:"sensors,omitempty"`
 	Caps     []string `json:"caps,omitempty"`
 }
@@ -43,7 +39,6 @@ type Device struct {
 	Caps      []string  `json:"caps,omitempty"`
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
-	PeerID    string    `json:"peer_id"`
 }
 
 type Registry struct {
@@ -111,9 +106,7 @@ func (r *Registry) Remove(deviceID string) {
 }
 
 // UpsertWithLimit inserts or updates a device entry while enforcing the
-// provided maximum count (0 = unlimited). Existing devices always update.
-// UpsertWithLimit inserts or updates a device entry while enforcing the
-// provided maximum count. Use -1 to inherit registry default.
+// provided maximum count. Use -1 to inherit registry default; 0 skips limits.
 func (r *Registry) UpsertWithLimit(d Device, max int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -127,9 +120,6 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 		// Existing device - always allow updates
 		if d.FirstSeen.IsZero() {
 			d.FirstSeen = prev.FirstSeen
-		}
-		if d.PeerID == "" {
-			d.PeerID = prev.PeerID
 		}
 	} else {
 		// New device - check capacity if limit is set
@@ -146,62 +136,6 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 	}
 	r.byID[d.DeviceID] = d
 	return r.saveLocked()
-}
-
-// Update the handler to pass the limit directly
-func RegisterIotHandler(h host.Host, reg *Registry) {
-	h.SetStreamHandler(IotProto, func(s network.Stream) {
-		defer s.Close()
-		rd := bufio.NewReader(s)
-		line, _ := rd.ReadString('\n')
-		var msg Hello
-		if json.Unmarshal([]byte(strings.TrimSpace(line)), &msg) != nil || msg.Type != "iot_hello" {
-			return
-		}
-		if reg.chainID != "" && msg.ChainID != "" && msg.ChainID != reg.chainID {
-			_ = s.Close()
-			return
-		}
-		// Basic sanity on key material.
-		if _, err := hex.DecodeString(msg.Kid); err != nil {
-			return
-		}
-		if _, err := hex.DecodeString(msg.Pub); err != nil {
-			return
-		}
-		dev := Device{
-			DeviceID:  msg.DeviceID,
-			Firmware:  msg.Firmware,
-			Model:     msg.Model,
-			KidHex:    strings.ToLower(msg.Kid),
-			PubHex:    strings.ToLower(msg.Pub),
-			Sensors:   msg.Sensors,
-			Caps:      msg.Caps,
-			FirstSeen: time.Now(),
-			LastSeen:  time.Now(),
-			PeerID:    peer.ID(s.Conn().RemotePeer()).String(),
-		}
-
-		// Use -1 to inherit registry's configured limit
-		if err := reg.UpsertWithLimit(dev, -1); err != nil {
-			if errors.Is(err, ErrRegistryFull) {
-				limit := reg.Max()
-				msg := map[string]any{
-					"error":       "iot_limit_reached",
-					"max_devices": limit,
-					"connected":   reg.Count(),
-				}
-				if data, err := json.Marshal(msg); err == nil {
-					_, _ = s.Write(append(data, '\n'))
-				} else {
-					_, _ = s.Write([]byte("full\n"))
-				}
-			}
-			return
-		}
-		// ack
-		_, _ = s.Write([]byte("ok\n"))
-	})
 }
 
 // ---- persistence ----
