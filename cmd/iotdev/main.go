@@ -574,6 +574,7 @@ func (r *registrar) handle(d *device) regResult {
 	limitHits := 0
 	attempts := 0
 	blocked := 0
+	var earliest time.Time
 	now := time.Now()
 	for _, idx := range order {
 		ep := r.endpoints[idx]
@@ -582,6 +583,9 @@ func (r *registrar) handle(d *device) regResult {
 		}
 		if now.Before(ep.retryAt) {
 			blocked++
+			if earliest.IsZero() || ep.retryAt.Before(earliest) {
+				earliest = ep.retryAt
+			}
 			continue
 		}
 		resp, err := httpRegisterDevice(context.Background(), r.client, ep.base, req)
@@ -623,7 +627,7 @@ func (r *registrar) handle(d *device) regResult {
 		return regResult{ok: true, fallback: false, retry: joinRetry}
 	}
 
-	if len(r.endpoints) > 0 && (attempts == 0 && blocked == len(r.endpoints) || (attempts > 0 && limitHits+blocked == len(r.endpoints))) {
+	if attempts > 0 && limitHits == attempts {
 		d.assigned = ""
 		d.assignedNode = ""
 		d.registered = true
@@ -631,6 +635,20 @@ func (r *registrar) handle(d *device) regResult {
 		d.nextJoin = time.Now().Add(joinRetry)
 		log.Printf("device=%s all nodes are full, start send only tx, try connection later", short(d.id))
 		return regResult{ok: true, fallback: true, retry: joinRetry}
+	}
+
+	if blocked > 0 {
+		wait := delay
+		if !earliest.IsZero() {
+			wait = time.Until(earliest)
+			if wait < discoveryRetry {
+				wait = discoveryRetry
+			}
+			if wait > joinRetry {
+				wait = joinRetry
+			}
+		}
+		return regResult{ok: false, fallback: false, retry: wait}
 	}
 
 	return regResult{ok: false, fallback: false, retry: delay}
