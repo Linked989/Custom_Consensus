@@ -1,12 +1,10 @@
 package iot
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
