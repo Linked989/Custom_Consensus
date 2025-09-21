@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -47,15 +48,17 @@ const (
 )
 
 type device struct {
-	id         string
-	pub        ed25519.PublicKey
-	priv       ed25519.PrivateKey
-	kid        []byte
-	seq        uint64
-	assigned   peer.ID
-	registered bool
-	nextJoin   time.Time
-	baseOffset int
+	id           string
+	pub          ed25519.PublicKey
+	priv         ed25519.PrivateKey
+	kid          []byte
+	seq          uint64
+	assigned     peer.ID
+	assignedNode string
+	fallback     bool
+	registered   bool
+	nextJoin     time.Time
+	baseOffset   int
 }
 
 type addrBook struct {
@@ -213,6 +216,12 @@ func main() {
 				retry = joinRetry
 			}
 			devs[i].nextJoin = time.Now().Add(retry)
+		} else {
+			if devs[i].fallback {
+				log.Printf("device=%s fallback mode active", short(devs[i].id))
+			} else {
+				log.Printf("device=%s registered via node=%s", short(devs[i].id), devs[i].assignedNode)
+			}
 		}
 	}
 
@@ -236,9 +245,13 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addr
 		default:
 		}
 
-		if !d.registered && time.Now().After(d.nextJoin) {
+		if (!d.registered || d.fallback) && time.Now().After(d.nextJoin) {
 			if ok, retry := registerViaNodes(ctx, h, client, book, nodes, chain, d); ok {
-				log.Printf("device=%s registered via HTTP", short(d.id))
+				if d.fallback {
+					log.Printf("device=%s fallback mode active", short(d.id))
+				} else {
+					log.Printf("device=%s registered via node=%s", short(d.id), d.assignedNode)
+				}
 			} else {
 				if retry <= 0 {
 					retry = joinRetry
@@ -271,7 +284,13 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addr
 			d.nextJoin = time.Now().Add(discoveryRetry)
 			continue
 		}
-		log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
+		if d.assignedNode != "" {
+			log.Printf("sent device=%s node=%s txid=%s", short(d.id), d.assignedNode, txid[:12])
+		} else if d.fallback {
+			log.Printf("sent device=%s node=fallback txid=%s", short(d.id), txid[:12])
+		} else {
+			log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
+		}
 		if *once {
 			return
 		}
@@ -303,15 +322,20 @@ func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, boo
 		ChainID:  chain,
 	}
 	delay := discoveryRetry
-	for _, base := range nodes {
+	order := rotateStrings(nodes, d.baseOffset)
+	limitHits := 0
+	attempts := 0
+	for _, base := range order {
 		resp, err := httpRegisterDevice(ctx, client, base, req)
 		if err != nil {
 			log.Printf("register error (%s -> %s): %v", short(d.id), base, err)
 			continue
 		}
+		attempts++
 		if !resp.OK {
 			if resp.Error == "iot_limit_reached" {
 				delay = joinRetry
+				limitHits++
 				continue
 			}
 			log.Printf("register rejected (%s -> %s): %s", short(d.id), base, firstNonEmpty(resp.Message, resp.Error))
@@ -327,8 +351,18 @@ func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, boo
 				d.assigned = pid
 			}
 		}
+		d.assignedNode = fmt.Sprintf("%s:%s", nodeHost(base), nodePort(base))
 		d.registered = true
+		d.fallback = false
 		d.nextJoin = time.Now().Add(joinRetry)
+		return true, joinRetry
+	}
+	if attempts > 0 && limitHits == attempts {
+		d.registered = true
+		d.fallback = true
+		d.assignedNode = ""
+		d.nextJoin = time.Now().Add(joinRetry)
+		log.Printf("device=%s all nodes are full, start send only tx, try connection later", short(d.id))
 		return true, joinRetry
 	}
 	return false, delay
@@ -400,6 +434,52 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func nodeHost(base string) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		return host
+	}
+	parts := strings.Split(host, ":")
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return host
+}
+
+func nodePort(base string) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return ""
+	}
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
+	}
+}
+
+func rotateStrings(in []string, offset int) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i := range in {
+		idx := (offset + i) % len(in)
+		out[i] = in[idx]
+	}
+	return out
 }
 
 func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID string, seq uint64) ([]byte, string, error) {
