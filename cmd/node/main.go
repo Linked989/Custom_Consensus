@@ -167,7 +167,7 @@ func main() {
 	logx.Info("iot capacity", "max_devices", iotMax)
 	p2p.RegisterIoTHandler(h, devReg)
 	// Cell manager (uses registry)
-	cellThreshold := 3
+	cellThreshold := 2
 	if maxDevices > 0 {
 		cellThreshold = *iotMax
 	}

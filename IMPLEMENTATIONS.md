@@ -36,3 +36,5 @@
 - [x] Restore HTTP registration path for IoT devices with registry limits
 - [x] Update IoT device client to use HTTP registration then libp2p telemetry
 - [x] Build binaries to verify changes
+- [x] Investigate `cellThreshold` handling in `cmd/node/node.go`
+- [ ] Verify `iotMax` enforcement when `iot-max-devices` flag changes
