@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"sort"
@@ -26,6 +28,7 @@ import (
 	"pose/internal/iot"
 	"pose/internal/logx"
 	"pose/internal/mempool"
+	"pose/internal/p2p"
 	// AION status endpoint disabled here; use blockchain and gossip for status
 )
 
@@ -39,7 +42,7 @@ type layerBlockView struct {
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
 // StartHTTPAPI starts the HTTP server. getAION/getHELIOS/getL2/getL3 may be nil; if provided, they should return the current services.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, dir *gossip.NodeDirectory, _ *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service, getL3 func() *helios.L3Service) *http.Server {
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, dir *gossip.NodeDirectory, reg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service, getL3 func() *helios.L3Service) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -526,6 +529,140 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		blocks := svc.Snapshot(limit)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"blocks": blocks})
+	})
+
+	mux.HandleFunc("/iot/capacity", func(w http.ResponseWriter, r *http.Request) {
+		if reg == nil {
+			http.Error(w, "iot registry disabled", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		count := reg.Count()
+		max := reg.Max()
+		accepting := max == 0 || count < max
+		resp := map[string]any{
+			"ok":          true,
+			"node_id":     h.ID().String(),
+			"connected":   count,
+			"max_devices": max,
+			"accepting":   accepting,
+			"p2p_addrs":   p2p.LocalAddrs(h),
+			"timestamp":   time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc("/iot/register", func(w http.ResponseWriter, r *http.Request) {
+		if reg == nil {
+			http.Error(w, "iot registry disabled", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			DeviceID string   `json:"device_id"`
+			Firmware string   `json:"firmware,omitempty"`
+			Model    string   `json:"model,omitempty"`
+			Kid      string   `json:"kid,omitempty"`
+			Pub      string   `json:"pub"`
+			Sensors  []string `json:"sensors,omitempty"`
+			Caps     []string `json:"caps,omitempty"`
+			ChainID  string   `json:"chain_id,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if req.DeviceID == "" || req.Pub == "" {
+			http.Error(w, "device_id and pub required", http.StatusBadRequest)
+			return
+		}
+		pubBytes, err := hex.DecodeString(req.Pub)
+		if err != nil || len(pubBytes) != ed25519.PublicKeySize {
+			http.Error(w, "pub must be ed25519 hex", http.StatusBadRequest)
+			return
+		}
+		kidBytes := sha256.Sum256(pubBytes)
+		kidHex := strings.ToLower(hex.EncodeToString(kidBytes[:8]))
+		if req.Kid != "" && !strings.EqualFold(req.Kid, kidHex) {
+			http.Error(w, "kid mismatch", http.StatusBadRequest)
+			return
+		}
+		limit := reg.Max()
+		device := iot.Device{
+			DeviceID:  req.DeviceID,
+			Firmware:  req.Firmware,
+			Model:     req.Model,
+			KidHex:    kidHex,
+			PubHex:    strings.ToLower(req.Pub),
+			Sensors:   req.Sensors,
+			Caps:      req.Caps,
+			FirstSeen: time.Now(),
+			LastSeen:  time.Now(),
+		}
+		if err := reg.UpsertWithLimit(device, limit); err != nil {
+			if errors.Is(err, iot.ErrRegistryFull) {
+				resp := map[string]any{
+					"ok":          false,
+					"error":       "iot_limit_reached",
+					"message":     "node at capacity",
+					"node_id":     h.ID().String(),
+					"connected":   reg.Count(),
+					"max_devices": limit,
+					"accepting":   false,
+					"timestamp":   time.Now().UTC(),
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				json.NewEncoder(w).Encode(resp)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
+		count := reg.Count()
+		accepting := limit == 0 || count < limit
+		resp := map[string]any{
+			"ok":          true,
+			"node_id":     h.ID().String(),
+			"connected":   count,
+			"max_devices": limit,
+			"accepting":   accepting,
+			"p2p_addrs":   p2p.LocalAddrs(h),
+			"timestamp":   time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
+		if reg == nil {
+			http.Error(w, "iot registry disabled", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		list := reg.List()
+		sort.Slice(list, func(i, j int) bool { return list[i].DeviceID < list[j].DeviceID })
+		resp := map[string]any{
+			"ok":          true,
+			"node_id":     h.ID().String(),
+			"devices":     list,
+			"connected":   len(list),
+			"max_devices": reg.Max(),
+			"timestamp":   time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
 	})
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {

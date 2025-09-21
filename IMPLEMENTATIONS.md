@@ -33,3 +33,6 @@
 - [x] Review IoT device connection/discovery implementation
 - [x] Implement automatic node discovery for IoT devices
 - [x] Validate IoT connectivity and update docs/tests if needed
+- [x] Restore HTTP registration path for IoT devices with registry limits
+- [x] Update IoT device client to use HTTP registration then libp2p telemetry
+- [x] Build binaries to verify changes

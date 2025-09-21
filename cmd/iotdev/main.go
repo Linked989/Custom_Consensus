@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
@@ -12,8 +13,10 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +44,6 @@ const (
 	txTopicDefault  = "pose/tx/1.0.0"
 	defaultFirmware = "1.0.0"
 	defaultModel    = "sim-sensor"
-	mdnsServiceTag  = "pose-simple-mdns"
 )
 
 type device struct {
@@ -56,68 +58,82 @@ type device struct {
 	baseOffset int
 }
 
-type peerBook struct {
+type addrBook struct {
 	mu    sync.RWMutex
-	seeds map[string]struct{}
+	addrs map[string]struct{}
 }
 
-func newPeerBook() *peerBook { return &peerBook{seeds: make(map[string]struct{})} }
+func newAddrBook() *addrBook { return &addrBook{addrs: make(map[string]struct{})} }
 
-func (pb *peerBook) add(addrs []string) bool {
-	pb.mu.Lock()
-	added := false
+func (ab *addrBook) add(addrs []string) []string {
+	ab.mu.Lock()
+	defer ab.mu.Unlock()
+	var fresh []string
 	for _, addr := range addrs {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
 			continue
 		}
-		if _, ok := pb.seeds[addr]; ok {
+		if _, ok := ab.addrs[addr]; ok {
 			continue
 		}
-		pb.seeds[addr] = struct{}{}
-		added = true
+		ab.addrs[addr] = struct{}{}
+		fresh = append(fresh, addr)
 	}
-	pb.mu.Unlock()
-	return added
+	return fresh
 }
 
-func (pb *peerBook) list(h host.Host) []peer.AddrInfo {
-	seen := make(map[peer.ID]peer.AddrInfo)
-	pb.mu.RLock()
-	for addr := range pb.seeds {
-		if pi, err := peer.AddrInfoFromString(addr); err == nil {
-			seen[pi.ID] = *pi
-		}
+func (ab *addrBook) list() []string {
+	ab.mu.RLock()
+	defer ab.mu.RUnlock()
+	out := make([]string, 0, len(ab.addrs))
+	for addr := range ab.addrs {
+		out = append(out, addr)
 	}
-	pb.mu.RUnlock()
-	for _, pid := range h.Network().Peers() {
-		seen[pid] = peer.AddrInfo{ID: pid, Addrs: h.Peerstore().Addrs(pid)}
-	}
-	out := make([]peer.AddrInfo, 0, len(seen))
-	for _, info := range seen {
-		out = append(out, info)
-	}
+	sort.Strings(out)
 	return out
+}
+
+type httpRegisterRequest struct {
+	DeviceID string   `json:"device_id"`
+	Firmware string   `json:"firmware,omitempty"`
+	Model    string   `json:"model,omitempty"`
+	Kid      string   `json:"kid,omitempty"`
+	Pub      string   `json:"pub"`
+	Sensors  []string `json:"sensors,omitempty"`
+	Caps     []string `json:"caps,omitempty"`
+	ChainID  string   `json:"chain_id,omitempty"`
+}
+
+type httpRegisterResponse struct {
+	OK         bool     `json:"ok"`
+	Error      string   `json:"error,omitempty"`
+	Message    string   `json:"message,omitempty"`
+	NodeID     string   `json:"node_id,omitempty"`
+	Connected  int      `json:"connected,omitempty"`
+	MaxDevices int      `json:"max_devices,omitempty"`
+	Accepting  bool     `json:"accepting,omitempty"`
+	P2PAddrs   []string `json:"p2p_addrs,omitempty"`
 }
 
 func main() {
 	listen := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr")
 	var peers multiFlag
 	flag.Var(&peers, "peer", "target node multiaddr (repeatable)")
+	var nodes multiFlag
+	flag.Var(&nodes, "node", "node HTTP base URL for registration (repeatable)")
 	chain := flag.String("chain", "iotnet-main", "chain/network id")
 	devices := flag.Int("devices", 5, "number of simulated devices")
 	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
 	jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
 	once := flag.Bool("once", false, "send just one reading per device then exit")
-	list := flag.Bool("list", false, "list devices registered on first peer and exit")
+	list := flag.Bool("list", false, "list devices from first HTTP node and exit")
 	topicName := flag.String("topic", txTopicDefault, "pubsub topic for COSE telemetry")
 	pnetPath := flag.String("pnet", "", "path to swarm.key for private network")
-	enableMDNS := flag.Bool("mdns", true, "enable mDNS discovery")
-	mdnsTag := flag.String("mdns-tag", mdnsServiceTag, "mDNS service tag")
 	flag.Parse()
 
-	if len(peers) == 0 {
-		log.Printf("no -peer addresses provided; waiting for discovery")
+	if len(nodes) == 0 {
+		log.Fatalf("at least one -node HTTP address is required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -132,8 +148,11 @@ func main() {
 		psk = key
 	}
 
-	book := newPeerBook()
-	book.add([]string(peers))
+	client := &http.Client{Timeout: 5 * time.Second}
+	book := newAddrBook()
+	if newAddrs := book.add([]string(peers)); len(newAddrs) > 0 {
+		log.Printf("seeded %d libp2p peers from flags", len(newAddrs))
+	}
 
 	p2p.SetChainID(*chain)
 	h, err := p2p.NewHost(*listen, psk)
@@ -147,30 +166,9 @@ func main() {
 		log.Printf("listen %s/p2p/%s", a.String(), h.ID())
 	}
 
-	p2p.RegisterHelloHandlerWithCallback(h, func(pm p2p.PeerMsg) {
-		if len(pm.Addrs) > 0 {
-			book.add(pm.Addrs)
-		}
-	})
-
-	if *enableMDNS {
-		n := &p2p.MDNSNotifee{H: h, OnPeer: func(pi peer.AddrInfo) {
-			ma, _ := peer.AddrInfoToP2pAddrs(&pi)
-			addrs := make([]string, 0, len(ma))
-			for _, m := range ma {
-				addrs = append(addrs, m.String())
-			}
-			book.add(addrs)
-		}}
-		svc, err := p2p.SetupMDNS(h, *mdnsTag, n)
-		if err != nil {
-			log.Fatalf("mdns: %v", err)
-		}
-		defer svc.Close()
-	}
-
-	if len(peers) > 0 {
-		p2p.ConnectToAddrs(h, []string(peers))
+	p2p.RegisterHelloHandler(h)
+	if existing := book.list(); len(existing) > 0 {
+		p2p.ConnectToAddrs(h, existing)
 	}
 
 	ps, err := gossip.InitPubSub(ctx, h)
@@ -184,23 +182,10 @@ func main() {
 	defer txTopic.Close()
 
 	if *list {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			candidates := book.list(h)
-			if len(candidates) == 0 {
-				log.Printf("waiting for peers to list devices")
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			if err := listDevices(ctx, h, candidates[0]); err != nil {
-				log.Fatalf("list: %v", err)
-			}
-			return
+		if err := listDevicesHTTP(ctx, client, nodes[0]); err != nil {
+			log.Fatalf("list: %v", err)
 		}
+		return
 	}
 
 	devs := make([]device, *devices)
@@ -223,7 +208,7 @@ func main() {
 	log.Printf("initialized %d devices", *devices)
 
 	for i := range devs {
-		if ok, retry := attemptJoinWithBackoff(ctx, h, book.list(h), *chain, &devs[i]); !ok {
+		if ok, retry := registerViaNodes(ctx, h, client, book, nodes, *chain, &devs[i]); !ok {
 			if retry <= 0 {
 				retry = joinRetry
 			}
@@ -236,14 +221,14 @@ func main() {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			runDevice(ctx, h, txTopic, book, *chain, interval, jitter, once, d)
+			runDevice(ctx, h, txTopic, book, client, nodes, *chain, interval, jitter, once, d)
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *peerBook, chain string, interval, jitter *time.Duration, once *bool, d *device) {
+func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addrBook, client *http.Client, nodes []string, chain string, interval, jitter *time.Duration, once *bool, d *device) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -251,22 +236,15 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *peer
 		default:
 		}
 
-		peers := book.list(h)
-		if !d.registered {
-			if len(peers) > 0 && time.Until(d.nextJoin) > 5*time.Second {
-				d.nextJoin = time.Now()
-			}
-			if time.Now().After(d.nextJoin) {
-				if ok, retry := attemptJoinWithBackoff(ctx, h, peers, chain, d); ok {
-					log.Printf("device=%s joined peer=%s", short(d.id), d.assigned)
-					d.nextJoin = time.Now().Add(joinRetry)
-				} else {
-					if retry <= 0 {
-						retry = joinRetry
-					}
-					d.nextJoin = time.Now().Add(retry)
-					log.Printf("device=%s retry join in %s", short(d.id), retry)
+		if !d.registered && time.Now().After(d.nextJoin) {
+			if ok, retry := registerViaNodes(ctx, h, client, book, nodes, chain, d); ok {
+				log.Printf("device=%s registered via HTTP", short(d.id))
+			} else {
+				if retry <= 0 {
+					retry = joinRetry
 				}
+				d.nextJoin = time.Now().Add(retry)
+				log.Printf("device=%s retry register in %s", short(d.id), retry)
 			}
 		}
 		if !d.registered {
@@ -290,7 +268,7 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *peer
 		if err != nil {
 			log.Printf("publish failed (%s): %v", short(d.id), err)
 			d.registered = false
-			d.nextJoin = time.Now().Add(10 * time.Second)
+			d.nextJoin = time.Now().Add(discoveryRetry)
 			continue
 		}
 		log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
@@ -309,102 +287,119 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *peer
 	}
 }
 
-func attemptJoinWithBackoff(ctx context.Context, h host.Host, peers []peer.AddrInfo, chain string, d *device) (bool, time.Duration) {
-	if len(peers) == 0 {
-		log.Printf("no peers available for device=%s", short(d.id))
-		return false, discoveryRetry
+func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, book *addrBook, nodes []string, chain string, d *device) (bool, time.Duration) {
+	if len(nodes) == 0 {
+		log.Printf("no HTTP nodes available for device=%s", short(d.id))
+		return false, joinRetry
 	}
-	order := rotatePeers(peers, d.baseOffset)
-	for _, pi := range order {
-		if ctx.Err() != nil {
-			return false, discoveryRetry
-		}
-		if err := ensureConnected(ctx, h, pi); err != nil {
-			log.Printf("connect failed (%s -> %s): %v", short(d.id), pi.ID, err)
-			continue
-		}
-		capCtx, cancelCap := context.WithTimeout(ctx, 5*time.Second)
-		capResp, err := p2p.SendIoTRequest(capCtx, h, pi.ID, p2p.IoTRequest{Action: "capacity"})
-		cancelCap()
+	req := httpRegisterRequest{
+		DeviceID: d.id,
+		Firmware: defaultFirmware,
+		Model:    defaultModel,
+		Kid:      hex.EncodeToString(d.kid),
+		Pub:      hex.EncodeToString(d.pub),
+		Sensors:  []string{"temp", "humidity"},
+		Caps:     []string{"push"},
+		ChainID:  chain,
+	}
+	delay := discoveryRetry
+	for _, base := range nodes {
+		resp, err := httpRegisterDevice(ctx, client, base, req)
 		if err != nil {
-			log.Printf("capacity failed (%s -> %s): %v", short(d.id), pi.ID, err)
+			log.Printf("register error (%s -> %s): %v", short(d.id), base, err)
 			continue
 		}
-		if !capResp.Accepting {
-			continue
-		}
-		regCtx, cancelReg := context.WithTimeout(ctx, 5*time.Second)
-		regResp, err := p2p.SendIoTRequest(regCtx, h, pi.ID, p2p.IoTRequest{
-			Action:   "register",
-			DeviceID: d.id,
-			Firmware: defaultFirmware,
-			Model:    defaultModel,
-			Kid:      hex.EncodeToString(d.kid),
-			Pub:      hex.EncodeToString(d.pub),
-			Sensors:  []string{"temp", "humidity"},
-			Caps:     []string{"push"},
-		})
-		cancelReg()
-		if err != nil {
-			log.Printf("register failed (%s -> %s): %v", short(d.id), pi.ID, err)
-			continue
-		}
-		if !regResp.OK {
-			if regResp.Error == "iot_limit_reached" {
+		if !resp.OK {
+			if resp.Error == "iot_limit_reached" {
+				delay = joinRetry
 				continue
 			}
-			log.Printf("register rejected (%s -> %s): %s", short(d.id), pi.ID, regResp.Error)
+			log.Printf("register rejected (%s -> %s): %s", short(d.id), base, firstNonEmpty(resp.Message, resp.Error))
 			continue
 		}
-		if d.registered && d.assigned != pi.ID {
-			removeCtx, cancelRemove := context.WithTimeout(ctx, 3*time.Second)
-			_, _ = p2p.SendIoTRequest(removeCtx, h, d.assigned, p2p.IoTRequest{Action: "remove", DeviceID: d.id})
-			cancelRemove()
+		if len(resp.P2PAddrs) > 0 {
+			if newAddrs := book.add(resp.P2PAddrs); len(newAddrs) > 0 {
+				p2p.ConnectToAddrs(h, newAddrs)
+			}
+		}
+		if resp.NodeID != "" {
+			if pid, err := peer.Decode(resp.NodeID); err == nil {
+				d.assigned = pid
+			}
 		}
 		d.registered = true
-		d.assigned = pi.ID
+		d.nextJoin = time.Now().Add(joinRetry)
 		return true, joinRetry
 	}
-	return false, joinRetry
+	return false, delay
 }
 
-func listDevices(ctx context.Context, h host.Host, target peer.AddrInfo) error {
-	if err := ensureConnected(ctx, h, target); err != nil {
-		return err
+func httpRegisterDevice(ctx context.Context, client *http.Client, base string, req httpRegisterRequest) (httpRegisterResponse, error) {
+	var resp httpRegisterResponse
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return resp, err
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	resp, err := p2p.SendIoTRequest(reqCtx, h, target.ID, p2p.IoTRequest{Action: "list"})
+	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, requestURL(base, "/iot/register"), bytes.NewReader(payload))
+	if err != nil {
+		return resp, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return resp, err
+	}
+	defer httpResp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	if err != nil {
+		return resp, err
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return resp, err
+	}
+	if !resp.OK && httpResp.StatusCode >= 400 && resp.Error == "" {
+		resp.Error = httpResp.Status
+	}
+	return resp, nil
+}
+
+func listDevicesHTTP(ctx context.Context, client *http.Client, base string) error {
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, requestURL(base, "/iot/devices"), nil)
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(resp.Devices, "", "  ")
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	fmt.Println(string(data))
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(body))
 	return nil
 }
 
-func ensureConnected(ctx context.Context, h host.Host, pi peer.AddrInfo) error {
-	if len(h.Network().ConnsToPeer(pi.ID)) > 0 {
-		return nil
+func requestURL(base, path string) string {
+	trim := strings.TrimRight(base, "/")
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return h.Connect(dialCtx, pi)
+	return trim + path
 }
 
-func rotatePeers(peers []peer.AddrInfo, offset int) []peer.AddrInfo {
-	if len(peers) == 0 {
-		return nil
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
 	}
-	out := make([]peer.AddrInfo, len(peers))
-	for i := range peers {
-		idx := (offset + i) % len(peers)
-		out[i] = peers[idx]
-	}
-	return out
+	return ""
 }
 
 func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID string, seq uint64) ([]byte, string, error) {
@@ -488,5 +483,5 @@ func loadSwarmKey(path string) ([]byte, error) {
 	if len(data) == 32 {
 		return data, nil
 	}
-	return nil, fmt.Errorf("unsupported swarm.key format")
+	return nil, fmt.Errorf("invalid swarm.key format")
 }
