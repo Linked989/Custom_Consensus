@@ -276,7 +276,7 @@ func main() {
 			}
 		}
 		if haveNodes && haveDevices {
-			logx.Info("preflight ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "cell_threshold", cellThreshold)
+			logx.Info("preflight Ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "cell_threshold", cellThreshold)
 			break
 		}
 		logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", cellThreshold)
