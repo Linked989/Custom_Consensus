@@ -24,3 +24,8 @@
 - [x] Implement IoT join/retry/state changes
 - [x] Update tests or add new ones if feasible
 - [x] Format code and finalize
+- [x] Analyze IoT HTTP flows and libp2p support
+- [x] Design libp2p protocols for device registration and data
+- [x] Implement node-side libp2p handlers for IoT
+- [x] Update IoT device client to use libp2p channels
+- [x] Remove HTTP-based IoT pathways and validate build

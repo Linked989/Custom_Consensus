@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"sort"
@@ -41,7 +39,7 @@ type layerBlockView struct {
 
 // StartHTTPIngress runs a simple HTTP server that validates COSE txs and publishes them to gossip.
 // StartHTTPAPI starts the HTTP server. getAION/getHELIOS/getL2/getL3 may be nil; if provided, they should return the current services.
-func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, dir *gossip.NodeDirectory, devReg *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service, getL3 func() *helios.L3Service) *http.Server {
+func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h host.Host, pool *mempool.Pool, chainID string, dir *gossip.NodeDirectory, _ *iot.Registry, cellMgr *cell.Manager, getAION func() *aion.Service, getHELIOS func() *helios.L1Service, getL2 func() *helios.L2Service, getL3 func() *helios.L3Service) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -528,107 +526,6 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		blocks := svc.Snapshot(limit)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"blocks": blocks})
-	})
-	// GET /iot/devices
-	mux.HandleFunc("/iot/devices", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(devReg.List())
-	})
-	// GET /iot/capacity: report device counts and availability.
-	mux.HandleFunc("/iot/capacity", func(w http.ResponseWriter, r *http.Request) {
-		count := devReg.Count()
-		maxDevices := devReg.Max()
-		accepting := maxDevices == 0 || count < maxDevices
-		resp := map[string]any{
-			"node_id":     h.ID().String(),
-			"connected":   count,
-			"max_devices": maxDevices,
-			"accepting":   accepting,
-			"timestamp":   time.Now().UTC(),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-	// POST /iot/register: {device_id, firmware, model, kid, pub, sensors[], caps[]}
-	mux.HandleFunc("/iot/register", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			DeviceID string   `json:"device_id"`
-			Firmware string   `json:"firmware"`
-			Model    string   `json:"model"`
-			Kid      string   `json:"kid"`
-			Pub      string   `json:"pub"`
-			Sensors  []string `json:"sensors"`
-			Caps     []string `json:"caps"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		// basic checks
-		if req.DeviceID == "" || req.Kid == "" || req.Pub == "" {
-			http.Error(w, "missing fields", http.StatusBadRequest)
-			return
-		}
-		pub, err := hex.DecodeString(req.Pub)
-		if err != nil || len(pub) != ed25519.PublicKeySize {
-			http.Error(w, "bad pub", http.StatusBadRequest)
-			return
-		}
-		if _, err := hex.DecodeString(req.Kid); err != nil {
-			http.Error(w, "bad kid", http.StatusBadRequest)
-			return
-		}
-		// save in device registry and key registry for tx validation
-		// Derive kid from pub (sha256(pub)[:8]) if none, and register for COSE validation
-		kid := sha256.Sum256(pub)
-		limit := devReg.Max()
-		device := iot.Device{
-			DeviceID:  req.DeviceID,
-			Firmware:  req.Firmware,
-			Model:     req.Model,
-			KidHex:    strings.ToLower(hex.EncodeToString(kid[:8])),
-			PubHex:    strings.ToLower(req.Pub),
-			Sensors:   req.Sensors,
-			Caps:      req.Caps,
-			FirstSeen: time.Now(),
-			LastSeen:  time.Now(),
-		}
-		if err := devReg.UpsertWithLimit(device, limit); err != nil {
-			if errors.Is(err, iot.ErrRegistryFull) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusConflict)
-				json.NewEncoder(w).Encode(map[string]any{
-					"error":       "iot_limit_reached",
-					"message":     "node at capacity",
-					"max_devices": limit,
-					"connected":   devReg.Count(),
-					"hint":        "retry later or select another node",
-				})
-				return
-			}
-			http.Error(w, "registry error", http.StatusInternalServerError)
-			return
-		}
-		coseutil.RegistryRegister(kid[:8], ed25519.PublicKey(pub))
-		w.WriteHeader(http.StatusNoContent)
-	})
-	// DELETE /iot/session/{device_id}: remove device from local registry.
-	mux.HandleFunc("/iot/session/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			http.Error(w, "DELETE only", http.StatusMethodNotAllowed)
-			return
-		}
-		deviceID := strings.TrimPrefix(r.URL.Path, "/iot/session/")
-		if strings.TrimSpace(deviceID) == "" {
-			http.NotFound(w, r)
-			return
-		}
-		devReg.Remove(deviceID)
-		w.WriteHeader(http.StatusNoContent)
 	})
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {

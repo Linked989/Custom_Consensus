@@ -1,22 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
-	"net"
-	"net/http"
-	neturl "net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -24,9 +19,14 @@ import (
 	"time"
 
 	cbor "github.com/fxamacker/cbor/v2"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+
+	"pose/internal/gossip"
+	"pose/internal/p2p"
 )
 
-// Deterministic CBOR mode (matches server).
 var encMode cbor.EncMode
 
 func init() {
@@ -35,9 +35,12 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-const joinRetry = 5 * time.Minute
-
-var errCellFull = errors.New("cell full")
+const (
+	joinRetry       = 5 * time.Minute
+	txTopicDefault  = "pose/tx/1.0.0"
+	defaultFirmware = "1.0.0"
+	defaultModel    = "sim-sensor"
+)
 
 type device struct {
 	id         string
@@ -45,436 +48,282 @@ type device struct {
 	priv       ed25519.PrivateKey
 	kid        []byte
 	seq        uint64
-	assigned   string
+	assigned   peer.ID
+	registered bool
 	nextJoin   time.Time
 	baseOffset int
 }
 
 func main() {
-	// Flags
-	base := flag.String("base", "http://localhost:14000", "default base URL (no trailing slash); used for TX unless -tx-base provided")
-	txBase := flag.String("tx-base", "", "HTTP base URL to POST /tx and /keys/register (defaults to -base)")
-	regBasesCSV := flag.String("reg-bases", "", "comma-separated HTTP base URLs for /iot/register assignment (defaults to -base)")
-	regCapsCSV := flag.String("reg-caps", "", "comma-separated caps per -reg-bases (0=unlimited). Example: 3,0 means first base gets up to 3, rest unlimited on second")
+	listen := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr")
+	var peers multiFlag
+	flag.Var(&peers, "peer", "target node multiaddr (repeatable)")
 	chain := flag.String("chain", "iotnet-main", "chain/network id")
-	n := flag.Int("devices", 5, "number of simulated devices")
+	devices := flag.Int("devices", 5, "number of simulated devices")
 	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
 	jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
 	once := flag.Bool("once", false, "send just one reading per device then exit")
-	list := flag.Bool("list", false, "list devices connected to the node and exit")
+	list := flag.Bool("list", false, "list devices registered on first peer and exit")
+	topicName := flag.String("topic", txTopicDefault, "pubsub topic for COSE telemetry")
+	pnetPath := flag.String("pnet", "", "path to swarm.key for private network")
 	flag.Parse()
 
-	// Context and signals
+	if len(peers) == 0 {
+		log.Fatalf("at least one -peer address is required")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	var psk []byte
+	if *pnetPath != "" {
+		key, err := loadSwarmKey(*pnetPath)
+		if err != nil {
+			log.Fatalf("pnet: %v", err)
+		}
+		psk = key
+	}
+
+	p2p.SetChainID(*chain)
+	h, err := p2p.NewHost(*listen, psk)
+	if err != nil {
+		log.Fatalf("host: %v", err)
+	}
+	defer h.Close()
+
+	log.Printf("host id=%s", h.ID())
+	for _, a := range h.Addrs() {
+		log.Printf("listen %s/p2p/%s", a.String(), h.ID())
+	}
+
+	peerInfos, err := parsePeerInfos(peers)
+	if err != nil {
+		log.Fatalf("peers: %v", err)
+	}
+
+	p2p.ConnectToAddrs(h, []string(peers))
+
+	ps, err := gossip.InitPubSub(ctx, h)
+	if err != nil {
+		log.Fatalf("pubsub: %v", err)
+	}
+	txTopic, err := ps.Join(*topicName)
+	if err != nil {
+		log.Fatalf("topic join: %v", err)
+	}
+	defer txTopic.Close()
+
 	if *list {
-		if err := listDevices(ctx, *base); err != nil {
+		if err := listDevices(ctx, h, peerInfos[0]); err != nil {
 			log.Fatalf("list: %v", err)
 		}
 		return
 	}
 
-	// Resolve TX and registration bases
-	regBases := parseCSV(*regBasesCSV)
-	if len(regBases) == 0 {
-		regBases = []string{strings.TrimRight(*base, "/")}
-	}
-	if *txBase == "" {
-		*txBase = strings.TrimRight(*base, "/")
-	} else {
-		*txBase = strings.TrimRight(*txBase, "/")
-	}
-	regCaps := parseCaps(*regCapsCSV, len(regBases))
-
-	// Create devices and register
-	devs := make([]device, *n)
-	assign := planAssignments(*n, regBases, regCaps)
-	baseIndex := make(map[string]int)
-	for i, b := range regBases {
-		baseIndex[b] = i
-	}
-	for i := 0; i < *n; i++ {
+	devs := make([]device, *devices)
+	for i := 0; i < *devices; i++ {
 		pub, priv, err := ed25519.GenerateKey(crand.Reader)
 		if err != nil {
 			log.Fatalf("keygen: %v", err)
 		}
 		kid := kidFromPub(pub)
-		id := fmt.Sprintf("did:iot:SIM-%x", kid)
-		offset := baseIndex[assign[i]]
-		devs[i] = device{id: id, pub: pub, priv: priv, kid: kid, seq: 0, nextJoin: time.Now(), baseOffset: offset}
-		keyTarget := *txBase
-		if keyTarget == "" && len(regBases) > 0 {
-			keyTarget = regBases[offset%len(regBases)]
-		}
-		if keyTarget != "" {
-			if err := registerKey(ctx, keyTarget, devs[i]); err != nil {
-				log.Fatalf("register key %d at %s: %v", i+1, keyTarget, err)
-			}
+		devs[i] = device{
+			id:         fmt.Sprintf("did:iot:SIM-%x", kid),
+			pub:        pub,
+			priv:       priv,
+			kid:        kid,
+			seq:        0,
+			nextJoin:   time.Now(),
+			baseOffset: i,
 		}
 	}
-	log.Printf("initialized %d devices (preferred=%v)", *n, summarizeAssignments(assign))
+	log.Printf("initialized %d devices", *devices)
+
 	for i := range devs {
-		if len(regBases) == 0 {
-			continue
-		}
-		if attemptJoin(ctx, &devs[i], regBases) {
-			log.Printf("device=%s joined %s", short(devs[i].id), devs[i].assigned)
-		} else {
-			devs[i].nextJoin = time.Now().Add(joinRetry)
-			log.Printf("device=%s tx-only until %s", short(devs[i].id), devs[i].nextJoin.Format(time.RFC3339))
-		}
+		attemptJoinWithBackoff(ctx, h, peerInfos, *chain, &devs[i])
 	}
 
-	// Start senders
 	var wg sync.WaitGroup
 	for i := range devs {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			cli := &http.Client{Timeout: 5 * time.Second}
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				if len(regBases) > 0 && d.assigned == "" && time.Now().After(d.nextJoin) {
-					if attemptJoin(ctx, d, regBases) {
-						log.Printf("device=%s joined %s", short(d.id), d.assigned)
-					} else {
-						d.nextJoin = time.Now().Add(joinRetry)
-						log.Printf("device=%s retry join at %s", short(d.id), d.nextJoin.Format(time.RFC3339))
-					}
-				}
-				sendBase := d.assigned
-				if sendBase == "" {
-					sendBase = *txBase
-				}
-				if sendBase == "" && len(regBases) > 0 {
-					sendBase = regBases[d.baseOffset%len(regBases)]
-				}
-				if sendBase == "" {
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(2 * time.Second):
-					}
-					continue
-				}
-				d.seq++
-				cose, txid, err := buildCOSE(d.priv, d.kid, *chain, d.id, d.seq)
-				if err != nil {
-					log.Printf("build error (%s): %v", d.id, err)
-					continue
-				}
-				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, sendBase+"/tx", bytes.NewReader(cose))
-				req.Header.Set("Content-Type", "application/cbor")
-
-				resp, err := doHTTPWithRetry(ctx, cli, req)
-				if err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						return
-					}
-					log.Printf("send failed (%s -> %s): %v", short(d.id), sendBase, err)
-					markForRejoin(d, sendBase)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(time.Second):
-					}
-					continue
-				}
-				io.Copy(io.Discard, resp.Body)
-				status := resp.StatusCode
-				resp.Body.Close()
-				if status >= 500 {
-					log.Printf("send failed (%s -> %s): status=%s", short(d.id), sendBase, http.StatusText(status))
-					markForRejoin(d, sendBase)
-					continue
-				}
-				if status >= 300 {
-					log.Printf("send warning (%s -> %s): status=%s", short(d.id), sendBase, resp.Status)
-				}
-				log.Printf("sent device=%s txid=%s status=%s", short(d.id), txid[:12], resp.Status)
-
-				if *once {
-					return
-				}
-				delay := *interval + time.Duration(rand.Int63n(int64(*jitter)))
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(delay):
-				}
-			}
+			runDevice(ctx, h, txTopic, peerInfos, *chain, interval, jitter, once, d)
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func registerDevice(ctx context.Context, base string, d device) error {
-	base = strings.TrimRight(base, "/")
-	// HTTP: POST /iot/register {device_id, firmware, model, kid, pub}
-	body := fmt.Sprintf(`{"device_id":"%s","firmware":"1.0.0","model":"sim-sensor","kid":"%s","pub":"%s","sensors":["temp","humidity"],"caps":["push"]}`,
-		d.id, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/iot/register", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	cli := &http.Client{Timeout: 5 * time.Second}
-
-	resp, err := doHTTPWithRetry(ctx, cli, req)
-	if err != nil {
-		return err
-	}
-	payload, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode == http.StatusConflict {
-		var msg struct {
-			Error      string `json:"error"`
-			Message    string `json:"message"`
-			MaxDevices int    `json:"max_devices"`
-			Connected  int    `json:"connected"`
+func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, peers []peer.AddrInfo, chain string, interval, jitter *time.Duration, once *bool, d *device) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
-		if len(payload) > 0 && json.Unmarshal(payload, &msg) == nil {
-			log.Printf("node %s full (connected=%d max=%d)", base, msg.Connected, msg.MaxDevices)
-		} else if len(payload) > 0 {
-			log.Printf("node %s full: %s", base, strings.TrimSpace(string(payload)))
+
+		if !d.registered && time.Now().After(d.nextJoin) {
+			if attemptJoinWithBackoff(ctx, h, peers, chain, d) {
+				log.Printf("device=%s joined peer=%s", short(d.id), d.assigned)
+			} else {
+				d.nextJoin = time.Now().Add(joinRetry)
+				log.Printf("device=%s retry join at %s", short(d.id), d.nextJoin.Format(time.RFC3339))
+			}
 		}
-		return errCellFull
-	}
-	if resp.StatusCode >= 300 {
-		if len(payload) > 0 {
-			return fmt.Errorf("status %s body=%s", resp.Status, strings.TrimSpace(string(payload)))
+		if !d.registered {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
 		}
-		return fmt.Errorf("status %s", resp.Status)
-	}
-	return nil
-}
 
-func registerKey(ctx context.Context, base string, d device) error {
-	// HTTP: POST /keys/register {kid: hex, pub: hex}
-	body := fmt.Sprintf(`{"kid":"%s","pub":"%s"}`, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/keys/register", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	cli := &http.Client{Timeout: 5 * time.Second}
-
-	resp, err := doHTTPWithRetry(ctx, cli, req)
-	if err != nil {
-		return err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("status %s", resp.Status)
-	}
-	return nil
-}
-
-type capacityInfo struct {
-	NodeID     string    `json:"node_id"`
-	Connected  int       `json:"connected"`
-	MaxDevices int       `json:"max_devices"`
-	Accepting  bool      `json:"accepting"`
-	Timestamp  time.Time `json:"timestamp"`
-}
-
-func fetchCapacity(ctx context.Context, base string) (capacityInfo, error) {
-	base = strings.TrimRight(base, "/")
-	url := base + "/iot/capacity"
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	cli := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cli.Do(req)
-	if err != nil {
-		return capacityInfo{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return capacityInfo{NodeID: base, Accepting: true}, nil
-	}
-	if resp.StatusCode >= 300 {
-		io.Copy(io.Discard, resp.Body)
-		return capacityInfo{}, fmt.Errorf("capacity status %s", resp.Status)
-	}
-	var info capacityInfo
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return capacityInfo{}, err
-	}
-	if info.NodeID == "" {
-		info.NodeID = base
-	}
-	if info.MaxDevices > 0 && info.Connected >= info.MaxDevices {
-		info.Accepting = false
-	} else if info.MaxDevices == 0 {
-		info.Accepting = true
-	}
-	return info, nil
-}
-
-func rotateBases(bases []string, offset int) []string {
-	l := len(bases)
-	if l == 0 {
-		return nil
-	}
-	out := make([]string, l)
-	for i := 0; i < l; i++ {
-		idx := (offset + i) % l
-		out[i] = strings.TrimRight(bases[idx], "/")
-	}
-	return out
-}
-
-func attemptJoin(ctx context.Context, d *device, bases []string) bool {
-	order := rotateBases(bases, d.baseOffset)
-	for _, base := range order {
-		info, err := fetchCapacity(ctx, base)
+		d.seq++
+		cose, txid, err := buildCOSE(d.priv, d.kid, chain, d.id, d.seq)
 		if err != nil {
-			log.Printf("capacity check failed (%s): %v", base, err)
+			log.Printf("build error (%s): %v", short(d.id), err)
 			continue
 		}
-		if !info.Accepting {
+		sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = topic.Publish(sendCtx, cose)
+		cancel()
+		if err != nil {
+			log.Printf("publish failed (%s): %v", short(d.id), err)
+			d.registered = false
+			d.nextJoin = time.Now().Add(10 * time.Second)
 			continue
 		}
-		if err := registerDevice(ctx, base, *d); err != nil {
-			if errors.Is(err, errCellFull) {
+		log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
+		if *once {
+			return
+		}
+		delay := *interval
+		if jitter != nil && *jitter > 0 {
+			delay += time.Duration(rand.Int63n(int64(*jitter)))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+}
+
+func attemptJoinWithBackoff(ctx context.Context, h host.Host, peers []peer.AddrInfo, chain string, d *device) bool {
+	order := rotatePeers(peers, d.baseOffset)
+	for _, pi := range order {
+		if ctx.Err() != nil {
+			return false
+		}
+		if err := ensureConnected(ctx, h, pi); err != nil {
+			log.Printf("connect failed (%s -> %s): %v", short(d.id), pi.ID, err)
+			continue
+		}
+		capCtx, cancelCap := context.WithTimeout(ctx, 5*time.Second)
+		capResp, err := p2p.SendIoTRequest(capCtx, h, pi.ID, p2p.IoTRequest{Action: "capacity"})
+		cancelCap()
+		if err != nil {
+			log.Printf("capacity failed (%s -> %s): %v", short(d.id), pi.ID, err)
+			continue
+		}
+		if !capResp.Accepting {
+			continue
+		}
+		regCtx, cancelReg := context.WithTimeout(ctx, 5*time.Second)
+		regResp, err := p2p.SendIoTRequest(regCtx, h, pi.ID, p2p.IoTRequest{
+			Action:   "register",
+			DeviceID: d.id,
+			Firmware: defaultFirmware,
+			Model:    defaultModel,
+			Kid:      hex.EncodeToString(d.kid),
+			Pub:      hex.EncodeToString(d.pub),
+			Sensors:  []string{"temp", "humidity"},
+			Caps:     []string{"push"},
+		})
+		cancelReg()
+		if err != nil {
+			log.Printf("register failed (%s -> %s): %v", short(d.id), pi.ID, err)
+			continue
+		}
+		if !regResp.OK {
+			if regResp.Error == "iot_limit_reached" {
 				continue
 			}
-			log.Printf("register failed (%s -> %s): %v", short(d.id), base, err)
+			log.Printf("register rejected (%s -> %s): %s", short(d.id), pi.ID, regResp.Error)
 			continue
 		}
-		if err := registerKey(ctx, base, *d); err != nil {
-			log.Printf("register key failed (%s -> %s): %v", short(d.id), base, err)
-			continue
+		if d.registered && d.assigned != pi.ID {
+			removeCtx, cancelRemove := context.WithTimeout(ctx, 3*time.Second)
+			_, _ = p2p.SendIoTRequest(removeCtx, h, d.assigned, p2p.IoTRequest{Action: "remove", DeviceID: d.id})
+			cancelRemove()
 		}
-		if d.assigned != "" && d.assigned != base {
-			leaveNode(ctx, d.assigned, *d)
-		}
-		d.assigned = base
+		d.registered = true
+		d.assigned = pi.ID
 		d.nextJoin = time.Now().Add(joinRetry)
 		return true
 	}
 	return false
 }
 
-func leaveNode(ctx context.Context, base string, d device) {
-	base = strings.TrimRight(base, "/")
-	endpoint := base + "/iot/session/" + neturl.PathEscape(d.id)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
-	cli := &http.Client{Timeout: 3 * time.Second}
-	resp, err := cli.Do(req)
-	if err != nil {
-		return
+func listDevices(ctx context.Context, h host.Host, target peer.AddrInfo) error {
+	if err := ensureConnected(ctx, h, target); err != nil {
+		return err
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-}
-
-func markForRejoin(d *device, base string) {
-	if d.assigned == base {
-		d.assigned = ""
-		d.nextJoin = time.Now()
-	}
-}
-
-func listDevices(ctx context.Context, base string) error {
-	cli := &http.Client{Timeout: 5 * time.Second}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/iot/devices", nil)
-	resp, err := doHTTPWithRetry(ctx, cli, req)
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := p2p.SendIoTRequest(reqCtx, h, target.ID, p2p.IoTRequest{Action: "list"})
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("status %s", resp.Status)
+	data, err := json.MarshalIndent(resp.Devices, "", "  ")
+	if err != nil {
+		return err
 	}
-	io.Copy(os.Stdout, resp.Body)
+	fmt.Println(string(data))
 	return nil
 }
 
-// --- Retry machinery ---
-
-func retryable(resp *http.Response, err error) bool {
-	if err != nil {
-		var ne net.Error
-		if errors.As(err, &ne) {
-			return true // timeouts, temporary, etc.
-		}
-		msg := strings.ToLower(err.Error())
-		// Canonical dial/transport failures worth retrying.
-		if strings.Contains(msg, "connection refused") ||
-			strings.Contains(msg, "dial tcp") ||
-			strings.Contains(msg, "no such host") ||
-			strings.Contains(msg, "connection reset") ||
-			strings.Contains(msg, "tls handshake timeout") ||
-			strings.Contains(msg, "server misbehaving") {
-			return true
-		}
-		return false
+func ensureConnected(ctx context.Context, h host.Host, pi peer.AddrInfo) error {
+	if len(h.Network().ConnsToPeer(pi.ID)) > 0 {
+		return nil
 	}
-	// Retry on 425/429/5xx
-	if resp.StatusCode == 425 || resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode <= 599) {
-		return true
-	}
-	return false
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return h.Connect(dialCtx, pi)
 }
 
-func doHTTPWithRetry(ctx context.Context, cli *http.Client, req *http.Request) (*http.Response, error) {
-	const (
-		base   = 500 * time.Millisecond
-		max    = 30 * time.Second
-		factor = 2.0
-	)
-	backoff := base
-
-	for attempt := 0; ; attempt++ {
-		// Ensure the request carries the latest context on each attempt.
-		r := req.Clone(ctx)
-		resp, err := cli.Do(r)
-		if !retryable(resp, err) {
-			return resp, err
-		}
-		// Drain/close on retry to free connection.
-		if resp != nil && resp.Body != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-
-		log.Printf("retrying %s %s (attempt=%d, next=%s): %s",
-			req.Method, req.URL.String(), attempt+1, backoff, errOrStatus(err, resp))
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(backoff + time.Duration(rand.Int63n(int64(backoff/2)))):
-		}
-
-		// Exponential backoff with cap.
-		next := time.Duration(float64(backoff) * factor)
-		if next > max {
-			next = max
-		}
-		backoff = next
+func rotatePeers(peers []peer.AddrInfo, offset int) []peer.AddrInfo {
+	if len(peers) == 0 {
+		return nil
 	}
+	out := make([]peer.AddrInfo, len(peers))
+	for i := range peers {
+		idx := (offset + i) % len(peers)
+		out[i] = peers[idx]
+	}
+	return out
 }
 
-func errOrStatus(err error, resp *http.Response) string {
-	if err != nil {
-		return err.Error()
+func parsePeerInfos(addrs []string) ([]peer.AddrInfo, error) {
+	infos := make([]peer.AddrInfo, 0, len(addrs))
+	for _, addr := range addrs {
+		pi, err := peer.AddrInfoFromString(addr)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", addr, err)
+		}
+		infos = append(infos, *pi)
 	}
-	if resp != nil {
-		return resp.Status
-	}
-	return "unknown"
+	return infos, nil
 }
-
-// --- Payload/COSE ---
 
 func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID string, seq uint64) ([]byte, string, error) {
 	payload := map[int]interface{}{
 		0: int64(1),
 		1: chain,
 		2: "data",
-		3: map[int]interface{}{0: deviceID, 1: "1.0.0", 2: "ed25519:SIM"},
+		3: map[int]interface{}{0: deviceID, 1: defaultFirmware, 2: "ed25519:SIM"},
 		4: int64(seq),
 		5: time.Now().UTC(),
 		6: map[int]interface{}{0: int64(25), 1: "uCR"},
@@ -511,94 +360,44 @@ func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID strin
 	return out, hex.EncodeToString(txid[:]), nil
 }
 
-// --- Misc helpers ---
-
 func kidFromPub(pub ed25519.PublicKey) []byte { sum := sha256.Sum256(pub); return sum[:8] }
 
 func randBytes(n int) []byte { b := make([]byte, n); io.ReadFull(crand.Reader, b); return b }
 
 func short(s string) string {
-	if len(s) > 12 {
-		return s[len(s)-12:]
+	if len(s) <= 12 {
+		return s
 	}
-	return s
+	return s[:12]
 }
 
-// parseCSV splits a comma-separated list and trims empties/spaces.
-func parseCSV(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		out = append(out, strings.TrimRight(p, "/"))
-	}
-	return out
-}
+type multiFlag []string
 
-// parseCaps parses caps CSV into a slice of length n (or 0s if empty).
-func parseCaps(s string, n int) []int {
-	if strings.TrimSpace(s) == "" {
-		return make([]int, n)
-	}
-	parts := strings.Split(s, ",")
-	caps := make([]int, n)
-	for i := 0; i < n; i++ {
-		if i < len(parts) {
-			v := strings.TrimSpace(parts[i])
-			if v == "" {
-				caps[i] = 0
-				continue
-			}
-			var val int
-			_, err := fmt.Sscanf(v, "%d", &val)
-			if err != nil {
-				val = 0
-			}
-			if val < 0 {
-				val = 0
-			}
-			caps[i] = val
-		} else {
-			caps[i] = 0
-		}
-	}
-	return caps
-}
+func (m *multiFlag) String() string     { return fmt.Sprint([]string(*m)) }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
-// planAssignments returns a per-device chosen registration base URL,
-// honoring caps (0 = unlimited). Devices are assigned in order, filling
-// the first base up to its cap, then the next, etc.
-func planAssignments(n int, bases []string, caps []int) []string {
-	assign := make([]string, n)
-	counts := make([]int, len(bases))
-	for i := 0; i < n; i++ {
-		chosen := -1
-		for j := 0; j < len(bases); j++ {
-			if caps[j] == 0 || counts[j] < caps[j] {
-				chosen = j
-				break
-			}
-		}
-		if chosen == -1 {
-			chosen = len(bases) - 1
-		}
-		assign[i] = bases[chosen]
-		counts[chosen]++
+func loadSwarmKey(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
-	return assign
-}
-
-// summarizeAssignments prints counts per base for logging.
-func summarizeAssignments(assign []string) map[string]int {
-	counts := map[string]int{}
-	for _, b := range assign {
-		counts[b]++
+	s := strings.TrimSpace(string(data))
+	lines := strings.Split(s, "\n")
+	var keyHex string
+	if len(lines) >= 3 && strings.HasPrefix(lines[0], "/key/swarm/psk/") {
+		keyHex = strings.TrimSpace(lines[2])
+	} else if len(lines) == 1 && len(lines[0]) >= 64 {
+		keyHex = strings.TrimSpace(lines[0])
 	}
-	return counts
+	if keyHex != "" {
+		b, err := hex.DecodeString(keyHex)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
+	if len(data) == 32 {
+		return data, nil
+	}
+	return nil, fmt.Errorf("unsupported swarm.key format")
 }
