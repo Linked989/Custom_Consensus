@@ -168,7 +168,7 @@ func main() {
 	p2p.RegisterIoTHandler(h, devReg)
 	// Cell manager (uses registry)
 	cellThreshold := 3
-	if maxDevices > 0 && maxDevices < cellThreshold {
+	if maxDevices > 0 {
 		cellThreshold = maxDevices
 	}
 	if cellThreshold <= 0 {

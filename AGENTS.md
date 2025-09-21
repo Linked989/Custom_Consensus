@@ -124,6 +124,7 @@ The user will primarily request you perform software engineering tasks. This inc
 NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive.
 IMPORTANT: When the user write "/q: <question>", you answer his question in detail with normal english words.
 IMPORTANT: No scaffolding!!!!!
+IMPORTANT: do not build the code!!!!
 
 <example>
 user: /q so what how do you install x software
@@ -133,7 +134,6 @@ assistnt: to install x software you have to...
 ## Project Structure & Module Organization
 - `cmd/` hosts runnable entrypoints: `node` for the primary validator, `iotp2p` and `iotdev` for tooling, `txgen` for traffic generation, and `scripts/` with tmux helpers for multi-node labs.
 - `internal/` contains layered modules: `blockchain/` for ledger state, `mempool/` for transaction admission, `merkle/` for proofs, `p2p/` and `gossip/` for networking, plus domain packages such as `iot/`, `cell/`, and `entropy/`. Keep new code in an existing package or create a focused subdirectory.
-- Tests live alongside code as `*_test.go`; heavy fixtures belong in package-local `testdata/` folders.
 
 ## Environment & Configuration Tips
 - Target Go toolchain `go1.24.7`; run `go env` to confirm before building.
