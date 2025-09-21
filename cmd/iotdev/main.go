@@ -40,7 +40,7 @@ func init() {
 }
 
 const (
-	joinRetry       = 45 * time.Second
+	joinRetry       = 5 * time.Minute
 	discoveryRetry  = 5 * time.Second
 	txTopicDefault  = "pose/tx/1.0.0"
 	defaultFirmware = "1.0.0"
@@ -138,6 +138,10 @@ func main() {
 	if len(nodes) == 0 {
 		log.Fatalf("at least one -node HTTP address is required")
 	}
+	endpoints := make([]*nodeEndpoint, len(nodes))
+	for i, base := range nodes {
+		endpoints[i] = newNodeEndpoint(base)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -185,7 +189,7 @@ func main() {
 	defer txTopic.Close()
 
 	if *list {
-		if err := listDevicesHTTP(ctx, client, nodes[0]); err != nil {
+		if err := listDevicesHTTP(ctx, client, endpoints[0].base); err != nil {
 			log.Fatalf("list: %v", err)
 		}
 		return
@@ -211,7 +215,7 @@ func main() {
 	log.Printf("initialized %d devices", *devices)
 
 	for i := range devs {
-		if ok, retry := registerViaNodes(ctx, h, client, book, nodes, *chain, &devs[i]); !ok {
+		if ok, retry := registerViaNodes(ctx, h, client, book, endpoints, *chain, &devs[i]); !ok {
 			if retry <= 0 {
 				retry = joinRetry
 			}
@@ -230,14 +234,14 @@ func main() {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			runDevice(ctx, h, txTopic, book, client, nodes, *chain, interval, jitter, once, d)
+			runDevice(ctx, h, txTopic, book, client, endpoints, *chain, interval, jitter, once, d)
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addrBook, client *http.Client, nodes []string, chain string, interval, jitter *time.Duration, once *bool, d *device) {
+func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addrBook, client *http.Client, nodes []*nodeEndpoint, chain string, interval, jitter *time.Duration, once *bool, d *device) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -306,7 +310,7 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *addr
 	}
 }
 
-func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, book *addrBook, nodes []string, chain string, d *device) (bool, time.Duration) {
+func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, book *addrBook, nodes []*nodeEndpoint, chain string, d *device) (bool, time.Duration) {
 	if len(nodes) == 0 {
 		log.Printf("no HTTP nodes available for device=%s", short(d.id))
 		return false, joinRetry
@@ -322,13 +326,23 @@ func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, boo
 		ChainID:  chain,
 	}
 	delay := discoveryRetry
-	order := rotateStrings(nodes, d.baseOffset)
+	order := rotateIndices(len(nodes), d.baseOffset)
 	limitHits := 0
 	attempts := 0
-	for _, base := range order {
-		resp, err := httpRegisterDevice(ctx, client, base, req)
+	blocked := 0
+	now := time.Now()
+	for _, idx := range order {
+		ep := nodes[idx]
+		if ep == nil {
+			continue
+		}
+		if now.Before(ep.retryAt) {
+			blocked++
+			continue
+		}
+		resp, err := httpRegisterDevice(ctx, client, ep.base, req)
 		if err != nil {
-			log.Printf("register error (%s -> %s): %v", short(d.id), base, err)
+			log.Printf("register error (%s -> %s): %v", short(d.id), ep.label(), err)
 			continue
 		}
 		attempts++
@@ -336,9 +350,11 @@ func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, boo
 			if resp.Error == "iot_limit_reached" {
 				delay = joinRetry
 				limitHits++
+				ep.retryAt = time.Now().Add(joinRetry)
+				log.Printf("device=%s cell full for node=%s", short(d.id), ep.label())
 				continue
 			}
-			log.Printf("register rejected (%s -> %s): %s", short(d.id), base, firstNonEmpty(resp.Message, resp.Error))
+			log.Printf("register rejected (%s -> %s): %s", short(d.id), ep.label(), firstNonEmpty(resp.Message, resp.Error))
 			continue
 		}
 		if len(resp.P2PAddrs) > 0 {
@@ -351,16 +367,22 @@ func registerViaNodes(ctx context.Context, h host.Host, client *http.Client, boo
 				d.assigned = pid
 			}
 		}
-		d.assignedNode = fmt.Sprintf("%s:%s", nodeHost(base), nodePort(base))
+		d.assignedNode = ep.label()
 		d.registered = true
 		d.fallback = false
+		if resp.Accepting {
+			ep.retryAt = time.Now().Add(discoveryRetry)
+		} else {
+			ep.retryAt = time.Now().Add(joinRetry)
+		}
 		d.nextJoin = time.Now().Add(joinRetry)
 		return true, joinRetry
 	}
-	if attempts > 0 && limitHits == attempts {
+	if (attempts == 0 && blocked == len(nodes)) || (attempts > 0 && limitHits+blocked == len(nodes)) {
 		d.registered = true
 		d.fallback = true
 		d.assignedNode = ""
+		d.assigned = ""
 		d.nextJoin = time.Now().Add(joinRetry)
 		log.Printf("device=%s all nodes are full, start send only tx, try connection later", short(d.id))
 		return true, joinRetry
@@ -470,14 +492,13 @@ func nodePort(base string) string {
 	}
 }
 
-func rotateStrings(in []string, offset int) []string {
-	if len(in) == 0 {
+func rotateIndices(length, offset int) []int {
+	if length == 0 {
 		return nil
 	}
-	out := make([]string, len(in))
-	for i := range in {
-		idx := (offset + i) % len(in)
-		out[i] = in[idx]
+	out := make([]int, length)
+	for i := 0; i < length; i++ {
+		out[i] = (offset + i) % length
 	}
 	return out
 }
@@ -539,6 +560,29 @@ type multiFlag []string
 
 func (m *multiFlag) String() string     { return fmt.Sprint([]string(*m)) }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+type nodeEndpoint struct {
+	base    string
+	host    string
+	port    string
+	retryAt time.Time
+}
+
+func newNodeEndpoint(base string) *nodeEndpoint {
+	host := nodeHost(base)
+	port := nodePort(base)
+	return &nodeEndpoint{base: base, host: host, port: port}
+}
+
+func (n *nodeEndpoint) label() string {
+	if n == nil {
+		return ""
+	}
+	if n.port != "" {
+		return fmt.Sprintf("%s:%s", n.host, n.port)
+	}
+	return n.host
+}
 
 func loadSwarmKey(path string) ([]byte, error) {
 	data, err := os.ReadFile(path)
