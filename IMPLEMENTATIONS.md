@@ -39,3 +39,6 @@
 - [x] Investigate `cellThreshold` handling in `cmd/node/node.go`
 - [x] Fix `cellThreshold` usage to respect `-iot-max-devices`
 - [x] Verify `iotMax` enforcement when `iot-max-devices` flag changes
+- [x] Reproduce missing `-iot-max-devices` effect in `cellThreshold`
+- [x] Implement fix so `cellThreshold` honors `iotMax`
+- [x] Validate runtime logs reflect configured IoT device limit

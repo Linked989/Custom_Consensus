@@ -167,13 +167,17 @@ func main() {
 	logx.Info("iot capacity", "max_devices", maxDevices)
 	p2p.RegisterIoTHandler(h, devReg)
 	// Cell manager (uses registry)
-	cellThreshold := 2
-	if maxDevices > 0 {
-		cellThreshold = maxDevices
+	cellThreshold := maxDevices
+	if cellThreshold <= 0 && *iotMax > 0 {
+		cellThreshold = *iotMax
+	}
+	if cellThreshold <= 0 && *legacyCellMax > 0 {
+		cellThreshold = *legacyCellMax
 	}
 	if cellThreshold <= 0 {
-		cellThreshold = 1
+		cellThreshold = 2
 	}
+	logx.Info("cell threshold", "min_devices", cellThreshold)
 	cellMgr := cell.NewManager(*chainID, h.ID().String(), cellThreshold, maxDevices)
 
 	if *enableMDNS {
