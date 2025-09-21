@@ -263,7 +263,7 @@ func main() {
 		total := members.CountAndSweep()
 		peers := len(h.Network().Peers())
 		devs := devReg.List()
-		haveNodes := total >= 2 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
+		haveNodes := total >= 3 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
 		haveDevices := len(devs) >= cellThreshold
 		if haveDevices {
 			if c := cellMgr.TryForm(devReg); c != nil && c.Active {
