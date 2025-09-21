@@ -100,6 +100,8 @@ func main() {
 		maxDevices = *legacyCellMax
 		logx.Warn("-cell-max-devices is deprecated; use -iot-max-devices instead", "value", maxDevices)
 	}
+	logx.Info("Device limit configuration", "maxDevices", maxDevices, "iotMax", *iotMax, "legacyCellMax", *legacyCellMax)
+
 	if *legacyCellMin >= 0 {
 		logx.Warn("-cell-min-devices is deprecated; minimum derives from -iot-max-devices", "value", *legacyCellMin)
 	}
