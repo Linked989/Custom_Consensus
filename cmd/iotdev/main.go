@@ -40,6 +40,7 @@ const (
 	txTopicDefault  = "pose/tx/1.0.0"
 	defaultFirmware = "1.0.0"
 	defaultModel    = "sim-sensor"
+	mdnsServiceTag  = "pose-simple-mdns"
 )
 
 type device struct {
@@ -54,6 +55,44 @@ type device struct {
 	baseOffset int
 }
 
+type peerBook struct {
+	mu    sync.RWMutex
+	seeds map[string]struct{}
+}
+
+func newPeerBook() *peerBook { return &peerBook{seeds: make(map[string]struct{})} }
+
+func (pb *peerBook) add(addrs []string) {
+	pb.mu.Lock()
+	for _, addr := range addrs {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		pb.seeds[addr] = struct{}{}
+	}
+	pb.mu.Unlock()
+}
+
+func (pb *peerBook) list(h host.Host) []peer.AddrInfo {
+	seen := make(map[peer.ID]peer.AddrInfo)
+	pb.mu.RLock()
+	for addr := range pb.seeds {
+		if pi, err := peer.AddrInfoFromString(addr); err == nil {
+			seen[pi.ID] = *pi
+		}
+	}
+	pb.mu.RUnlock()
+	for _, pid := range h.Network().Peers() {
+		seen[pid] = peer.AddrInfo{ID: pid, Addrs: h.Peerstore().Addrs(pid)}
+	}
+	out := make([]peer.AddrInfo, 0, len(seen))
+	for _, info := range seen {
+		out = append(out, info)
+	}
+	return out
+}
+
 func main() {
 	listen := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr")
 	var peers multiFlag
@@ -66,10 +105,12 @@ func main() {
 	list := flag.Bool("list", false, "list devices registered on first peer and exit")
 	topicName := flag.String("topic", txTopicDefault, "pubsub topic for COSE telemetry")
 	pnetPath := flag.String("pnet", "", "path to swarm.key for private network")
+	enableMDNS := flag.Bool("mdns", true, "enable mDNS discovery")
+	mdnsTag := flag.String("mdns-tag", mdnsServiceTag, "mDNS service tag")
 	flag.Parse()
 
 	if len(peers) == 0 {
-		log.Fatalf("at least one -peer address is required")
+		log.Printf("no -peer addresses provided; waiting for discovery")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -84,6 +125,9 @@ func main() {
 		psk = key
 	}
 
+	book := newPeerBook()
+	book.add([]string(peers))
+
 	p2p.SetChainID(*chain)
 	h, err := p2p.NewHost(*listen, psk)
 	if err != nil {
@@ -96,12 +140,24 @@ func main() {
 		log.Printf("listen %s/p2p/%s", a.String(), h.ID())
 	}
 
-	peerInfos, err := parsePeerInfos(peers)
-	if err != nil {
-		log.Fatalf("peers: %v", err)
+	p2p.RegisterHelloHandlerWithCallback(h, func(pm p2p.PeerMsg) {
+		if len(pm.Addrs) > 0 {
+			book.add(pm.Addrs)
+		}
+	})
+
+	if *enableMDNS {
+		n := &p2p.MDNSNotifee{H: h}
+		svc, err := p2p.SetupMDNS(h, *mdnsTag, n)
+		if err != nil {
+			log.Fatalf("mdns: %v", err)
+		}
+		defer svc.Close()
 	}
 
-	p2p.ConnectToAddrs(h, []string(peers))
+	if len(peers) > 0 {
+		p2p.ConnectToAddrs(h, []string(peers))
+	}
 
 	ps, err := gossip.InitPubSub(ctx, h)
 	if err != nil {
@@ -114,10 +170,23 @@ func main() {
 	defer txTopic.Close()
 
 	if *list {
-		if err := listDevices(ctx, h, peerInfos[0]); err != nil {
-			log.Fatalf("list: %v", err)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			candidates := book.list(h)
+			if len(candidates) == 0 {
+				log.Printf("waiting for peers to list devices")
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			if err := listDevices(ctx, h, candidates[0]); err != nil {
+				log.Fatalf("list: %v", err)
+			}
+			return
 		}
-		return
 	}
 
 	devs := make([]device, *devices)
@@ -140,7 +209,7 @@ func main() {
 	log.Printf("initialized %d devices", *devices)
 
 	for i := range devs {
-		attemptJoinWithBackoff(ctx, h, peerInfos, *chain, &devs[i])
+		attemptJoinWithBackoff(ctx, h, book.list(h), *chain, &devs[i])
 	}
 
 	var wg sync.WaitGroup
@@ -148,14 +217,14 @@ func main() {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			runDevice(ctx, h, txTopic, peerInfos, *chain, interval, jitter, once, d)
+			runDevice(ctx, h, txTopic, book, *chain, interval, jitter, once, d)
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, peers []peer.AddrInfo, chain string, interval, jitter *time.Duration, once *bool, d *device) {
+func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, book *peerBook, chain string, interval, jitter *time.Duration, once *bool, d *device) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -164,7 +233,7 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, peers []pe
 		}
 
 		if !d.registered && time.Now().After(d.nextJoin) {
-			if attemptJoinWithBackoff(ctx, h, peers, chain, d) {
+			if attemptJoinWithBackoff(ctx, h, book.list(h), chain, d) {
 				log.Printf("device=%s joined peer=%s", short(d.id), d.assigned)
 			} else {
 				d.nextJoin = time.Now().Add(joinRetry)
@@ -212,6 +281,10 @@ func runDevice(ctx context.Context, h host.Host, topic *pubsub.Topic, peers []pe
 }
 
 func attemptJoinWithBackoff(ctx context.Context, h host.Host, peers []peer.AddrInfo, chain string, d *device) bool {
+	if len(peers) == 0 {
+		log.Printf("no peers available for device=%s", short(d.id))
+		return false
+	}
 	order := rotatePeers(peers, d.baseOffset)
 	for _, pi := range order {
 		if ctx.Err() != nil {
@@ -304,18 +377,6 @@ func rotatePeers(peers []peer.AddrInfo, offset int) []peer.AddrInfo {
 		out[i] = peers[idx]
 	}
 	return out
-}
-
-func parsePeerInfos(addrs []string) ([]peer.AddrInfo, error) {
-	infos := make([]peer.AddrInfo, 0, len(addrs))
-	for _, addr := range addrs {
-		pi, err := peer.AddrInfoFromString(addr)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", addr, err)
-		}
-		infos = append(infos, *pi)
-	}
-	return infos, nil
 }
 
 func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID string, seq uint64) ([]byte, string, error) {

@@ -29,3 +29,7 @@
 - [x] Implement node-side libp2p handlers for IoT
 - [x] Update IoT device client to use libp2p channels
 - [x] Remove HTTP-based IoT pathways and validate build
+
+- [x] Review IoT device connection/discovery implementation
+- [x] Implement automatic node discovery for IoT devices
+- [x] Validate IoT connectivity and update docs/tests if needed
