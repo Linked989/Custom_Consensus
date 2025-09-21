@@ -84,7 +84,26 @@ func main() {
 	l1Min := flag.Int("l1-min-attesters", 2, "minimum distinct attesters required to notarize")
 	var bootstraps multiFlag
 	flag.Var(&bootstraps, "bootstrap", "bootstrap peer multiaddr (repeatable)")
-	flag.Parse()
+	boolFlags := map[string]struct{}{
+		"mdns":              {},
+		"log-heartbeats":    {},
+		"log-tx":            {},
+		"log-dev":           {},
+		"log-block-queue":   {},
+		"log-mempool-prune": {},
+		"log-mempool":       {},
+		"dev-gen-tx":        {},
+		"dev-reuse-key":     {},
+		"verbose":           {},
+		"list-iot":          {},
+	}
+	if err := flag.CommandLine.Parse(normalizeBoolFlags(os.Args[1:], boolFlags)); err != nil {
+		if err == flag.ErrHelp {
+			return
+		}
+		logx.Error("parse flags", "err", err)
+		os.Exit(2)
+	}
 
 	// Configure logging first
 	logx.Configure(*logLevel, *logFormat)
@@ -473,6 +492,32 @@ func generateSwarmKey(path string) error {
 	hexKey := strings.ToLower(hex.EncodeToString(b))
 	content := []byte("/key/swarm/psk/1.0.0/\n/base16/\n" + hexKey + "\n")
 	return os.WriteFile(path, content, 0o600)
+}
+
+// normalizeBoolFlags converts "-flag true" into "-flag=true" so parsing keeps going.
+func normalizeBoolFlags(args []string, boolFlags map[string]struct{}) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if len(arg) > 0 && arg[0] == '-' {
+			name := strings.TrimLeft(arg, "-")
+			if idx := strings.Index(name, "="); idx >= 0 {
+				name = name[:idx]
+			}
+			if _, ok := boolFlags[name]; ok {
+				if !strings.Contains(arg, "=") && i+1 < len(args) {
+					next := strings.ToLower(args[i+1])
+					if next == "true" || next == "false" {
+						out = append(out, fmt.Sprintf("%s=%s", arg, next))
+						i++
+						continue
+					}
+				}
+			}
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 func loadSwarmKey(path string) ([]byte, error) {

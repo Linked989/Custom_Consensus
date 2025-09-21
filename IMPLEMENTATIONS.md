@@ -42,3 +42,4 @@
 - [x] Reproduce missing `-iot-max-devices` effect in `cellThreshold`
 - [x] Implement fix so `cellThreshold` honors `iotMax`
 - [x] Validate runtime logs reflect configured IoT device limit
+- [x] Normalize boolean flag parsing so `-iot-max-devices` is always read
