@@ -164,6 +164,7 @@ func main() {
 	// IoT registry (HTTP only)
 	devReg := iot.NewRegistry(*chainID)
 	devReg.SetMax(maxDevices)
+	logx.Info("iot capacity", "max_devices", maxDevices)
 	// Cell manager (uses registry)
 	cellThreshold := 3
 	if maxDevices > 0 && maxDevices < cellThreshold {
@@ -426,6 +427,11 @@ func main() {
 
 	// Periodically list IoT devices if requested
 	if *listIot && listIotInterval != nil && *listIotInterval > 0 {
+		logDevices := func() {
+			devs := devReg.List()
+			logx.Info("iot devices", "count", len(devs), "devices", devs)
+		}
+		logDevices()
 		go func() {
 			t := time.NewTicker(*listIotInterval)
 			defer t.Stop()
@@ -434,8 +440,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					devs := devReg.List()
-					logx.Info("iot devices", "count", len(devs), "devices", devs)
+					logDevices()
 				}
 			}
 		}()
