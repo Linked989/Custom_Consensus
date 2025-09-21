@@ -163,13 +163,13 @@ func main() {
 	p2p.RegisterHelloHandler(h)
 	// IoT registry served via libp2p control channel
 	devReg := iot.NewRegistry(*chainID)
-	devReg.SetMax(*iotMax)
-	logx.Info("iot capacity", "max_devices", iotMax)
+	devReg.SetMax(maxDevices)
+	logx.Info("iot capacity", "max_devices", maxDevices)
 	p2p.RegisterIoTHandler(h, devReg)
 	// Cell manager (uses registry)
 	cellThreshold := 2
 	if maxDevices > 0 {
-		cellThreshold = *iotMax
+		cellThreshold = maxDevices
 	}
 	if cellThreshold <= 0 {
 		cellThreshold = 1
