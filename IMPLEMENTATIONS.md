@@ -105,3 +105,4 @@
 - [x] Restore legacy iotdev telemetry+cell formation simulator
 - [x] Align iotdev telemetry payloads with dev generator format
 - [x] Normalize IoT payload logging to emit JSON-friendly data
+- [x] Treat duplicate gossip as duplicates, not replays

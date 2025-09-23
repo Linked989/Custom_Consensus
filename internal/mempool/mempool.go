@@ -58,15 +58,15 @@ func (p *Pool) AddValidatedCOSE(b []byte) (*Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	// replay protection
-	if !coseutil.UpdateLastSeq(devID, kid, seq) {
-		return nil, errors.New("replay")
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.sweepLocked()
 	if _, ok := p.entries[txid]; ok {
 		return nil, errors.New("duplicate")
+	}
+	// replay protection occurs after duplicate check so repeats don't flag as replay
+	if !coseutil.UpdateLastSeq(devID, kid, seq) {
+		return nil, errors.New("replay")
 	}
 	// if bytes cap configured and single tx exceeds it, reject
 	if p.capBytes > 0 && len(b) > p.capBytes {
