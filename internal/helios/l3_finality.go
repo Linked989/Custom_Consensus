@@ -687,7 +687,9 @@ func (s *L3Service) isReadyLocked(blk *blockCounters) bool {
 			if majority < 1 {
 				majority = 1
 			}
-			if len(blk.cells) >= majority {
+			if len(blk.cells) == 0 {
+				effectiveCells = 0
+			} else if len(blk.cells) >= majority {
 				effectiveCells = majority
 			}
 		}
@@ -702,7 +704,9 @@ func (s *L3Service) isReadyLocked(blk *blockCounters) bool {
 			if majority < 1 {
 				majority = 1
 			}
-			if len(blk.regions) >= majority {
+			if len(blk.regions) == 0 {
+				effectiveRegions = 0
+			} else if len(blk.regions) >= majority {
 				effectiveRegions = majority
 			}
 		}
