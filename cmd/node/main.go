@@ -271,7 +271,7 @@ func main() {
 					pub = key
 				}
 			}
-			l3.RegisterCell(helios.CellRecord{ID: c.ID, RegionID: c.NodeID, PubKey: pub})
+			l3.RegisterCell(helios.CellRecord{ID: c.ID, PubKey: pub})
 		}
 	}
 	// Start HTTP API early so devices can register while we wait for orchestration.
@@ -345,12 +345,9 @@ func main() {
 	l2Params := helios.L2Params{QuorumSize: l2Quorum}
 	l2svc = helios.StartL2FromTopic(ctx, h, ps, l2Params, blkTopic)
 	logx.Info("helios l2 params", "validators", totalNodes, "quorum", l2Params.QuorumSize)
-	l3Params := helios.L3Params{MinCells: cellThreshold, MinRegions: 1, TotalStake: float64(totalNodes)}
+	l3Params := helios.L3Params{MinCells: cellThreshold, TotalStake: float64(totalNodes)}
 	if l3Params.MinCells < 1 {
 		l3Params.MinCells = 1
-	}
-	if l3Params.MinRegions < 1 {
-		l3Params.MinRegions = 1
 	}
 	if l3Params.TotalStake <= 0 {
 		l3Params.TotalStake = 1
@@ -363,7 +360,7 @@ func main() {
 		registerCell(c)
 	}
 	if l3svc != nil {
-		logx.Info("helios l3 params", "min_cells", l3Params.MinCells, "min_regions", l3Params.MinRegions, "total_stake", l3Params.TotalStake)
+		logx.Info("helios l3 params", "min_cells", l3Params.MinCells, "total_stake", l3Params.TotalStake)
 	}
 	if members != nil {
 		go func() {

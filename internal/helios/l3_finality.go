@@ -29,7 +29,6 @@ const (
 
 const (
 	defaultL3MinCells       = 7
-	defaultL3MinRegions     = 3
 	defaultL3SamplesPerCell = 16
 	defaultL3HorizonEpochs  = 4
 	defaultL3StakeThreshold = 0.6666667
@@ -40,7 +39,6 @@ const (
 // L3Params holds configurable knobs for the L3 service.
 type L3Params struct {
 	MinCells        int
-	MinRegions      int
 	SamplesPerCell  int
 	HorizonEpochs   uint64
 	StakeThreshold  float64
@@ -52,7 +50,6 @@ type L3Params struct {
 func defaultL3Params() L3Params {
 	return L3Params{
 		MinCells:        defaultL3MinCells,
-		MinRegions:      defaultL3MinRegions,
 		SamplesPerCell:  defaultL3SamplesPerCell,
 		HorizonEpochs:   defaultL3HorizonEpochs,
 		StakeThreshold:  defaultL3StakeThreshold,
@@ -75,12 +72,11 @@ const (
 
 // CellRecord describes a cell and its gateway key.
 type CellRecord struct {
-	ID       string
-	RegionID string
-	PubKey   []byte
-	Bond     uint64
-	Status   CellStatus
-	Updated  time.Time
+	ID      string
+	PubKey  []byte
+	Bond    uint64
+	Status  CellStatus
+	Updated time.Time
 }
 
 // CellRegistry stores authorized cells for DA attestations.
@@ -134,24 +130,16 @@ func (r *CellRegistry) ActiveCells() []CellRecord {
 	return out
 }
 
-func (r *CellRegistry) ActiveCounts() (int, int) {
+func (r *CellRegistry) ActiveCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.records) == 0 {
-		return 0, 0
-	}
-	regions := make(map[string]struct{})
-	cells := 0
+	count := 0
 	for _, rec := range r.records {
-		if rec.Status != CellStatusActive {
-			continue
-		}
-		cells++
-		if rec.RegionID != "" {
-			regions[rec.RegionID] = struct{}{}
+		if rec.Status == CellStatusActive {
+			count++
 		}
 	}
-	return cells, len(regions)
+	return count
 }
 
 // EpochBeacon exposes randomness per epoch.
@@ -206,12 +194,11 @@ type L3Attestation struct {
 	Height        int64    `cbor:"1,keyasint"`
 	Epoch         uint64   `cbor:"2,keyasint"`
 	CellID        string   `cbor:"3,keyasint"`
-	RegionID      string   `cbor:"4,keyasint"`
-	SampleIndices []uint32 `cbor:"5,keyasint"`
-	Proofs        [][]byte `cbor:"6,keyasint"`
-	HeadID        []byte   `cbor:"7,keyasint"`
-	Signature     []byte   `cbor:"8,keyasint"`
-	TotalChunks   uint32   `cbor:"9,keyasint"`
+	SampleIndices []uint32 `cbor:"4,keyasint"`
+	Proofs        [][]byte `cbor:"5,keyasint"`
+	HeadID        []byte   `cbor:"6,keyasint"`
+	Signature     []byte   `cbor:"7,keyasint"`
+	TotalChunks   uint32   `cbor:"8,keyasint"`
 }
 
 // L3Challenge requests additional samples from a cell.
@@ -248,10 +235,9 @@ type FinalityEnvelope struct {
 	Horizon         uint64           `cbor:"2,keyasint"`
 	DescendantQCs   []ValidatorQCRef `cbor:"3,keyasint"`
 	CellBitmap      []string         `cbor:"4,keyasint"`
-	RegionBitmap    []string         `cbor:"5,keyasint"`
-	CellAggSig      []byte           `cbor:"6,keyasint"`
-	ValidatorAggSig []byte           `cbor:"7,keyasint"`
-	FinalizedAt     time.Time        `cbor:"8,keyasint"`
+	CellAggSig      []byte           `cbor:"5,keyasint"`
+	ValidatorAggSig []byte           `cbor:"6,keyasint"`
+	FinalizedAt     time.Time        `cbor:"7,keyasint"`
 }
 
 // L3Status enumerates light-client status.
@@ -276,7 +262,6 @@ func (st L3Status) String() string {
 
 type blockCounters struct {
 	cells        map[string]struct{}
-	regions      map[string]struct{}
 	attestations map[string]L3Attestation
 	auditsPassed int
 	auditsFailed int
@@ -319,9 +304,6 @@ type L3Service struct {
 func StartL3Finality(ctx context.Context, h host.Host, ps *pubsub.PubSub, params L3Params, beacon EpochBeacon, verifier DataVerifier) *L3Service {
 	if params.MinCells <= 0 {
 		params.MinCells = defaultL3Params().MinCells
-	}
-	if params.MinRegions <= 0 {
-		params.MinRegions = defaultL3Params().MinRegions
 	}
 	if params.SamplesPerCell <= 0 {
 		params.SamplesPerCell = defaultL3Params().SamplesPerCell
@@ -450,7 +432,6 @@ func (s *L3Service) ensureBlock(blockHex string) *blockCounters {
 	}
 	blk = &blockCounters{
 		cells:        make(map[string]struct{}),
-		regions:      make(map[string]struct{}),
 		attestations: make(map[string]L3Attestation),
 		firstSeen:    time.Now().UTC(),
 		status:       L3StatusPending,
@@ -517,10 +498,6 @@ func (s *L3Service) onAttestation(data []byte, from peer.ID) {
 	if len(att.SampleIndices) == 0 {
 		att.SampleIndices = SamplePlan(s.beacon, att.BlockID, att.CellID, att.Epoch, s.params.SamplesPerCell, att.TotalChunks)
 	}
-	if rec.RegionID != "" && rec.RegionID != att.RegionID {
-		logx.Warn("helios l3 attestation region mismatch", "cell", att.CellID, "have", att.RegionID, "want", rec.RegionID)
-		return
-	}
 	if len(rec.PubKey) == ed25519.PublicKeySize {
 		if !s.verifyAttestationSignature(att, rec.PubKey) {
 			s.recordFailure(att.CellID)
@@ -559,10 +536,9 @@ func (s *L3Service) onAttestation(data []byte, from peer.ID) {
 	}
 	blk.attestations[att.CellID] = att
 	blk.cells[att.CellID] = struct{}{}
-	blk.regions[att.RegionID] = struct{}{}
 	blk.auditsPassed++
 	blk.status = L3StatusPending
-	logx.Debug("helios l3 attestation accepted", "cell", att.CellID, "region", att.RegionID, "from", from)
+	logx.Debug("helios l3 attestation accepted", "cell", att.CellID, "from", from)
 	s.maybeFinalizeLocked(hex.EncodeToString(att.BlockID), blk)
 }
 
@@ -648,7 +624,7 @@ func (s *L3Service) maybeFinalizeLocked(blockHex string, blk *blockCounters) {
 		env := s.buildEnvelopeLocked(blockHex, blk)
 		blk.envelope = env
 		blk.status = L3StatusFinal
-		logx.Info("helios l3 finalized", "block", shortHex(blockHex), "height", blk.height, "cells", len(blk.cells), "regions", len(blk.regions))
+		logx.Info("helios l3 finalized", "block", shortHex(blockHex), "height", blk.height, "cells", len(blk.cells))
 		s.broadcastEnvelope(env)
 	}
 }
@@ -657,23 +633,13 @@ func (s *L3Service) isReadyLocked(blk *blockCounters) bool {
 	if !blk.l2Committed {
 		return false
 	}
-	activeCells, activeRegions := s.cells.ActiveCounts()
+	activeCells := s.cells.ActiveCount()
 	requiredCells := s.params.MinCells
 	if requiredCells > activeCells {
 		requiredCells = activeCells
 	}
 	if requiredCells < 0 {
 		requiredCells = 0
-	}
-	requiredRegions := s.params.MinRegions
-	if requiredRegions > activeRegions {
-		requiredRegions = activeRegions
-	}
-	if requiredRegions < 0 {
-		requiredRegions = 0
-	}
-	if requiredCells == 0 {
-		requiredRegions = 0
 	}
 	grace := s.params.ChallengeWindow
 	if grace <= 0 {
@@ -697,23 +663,6 @@ func (s *L3Service) isReadyLocked(blk *blockCounters) bool {
 			return false
 		}
 	}
-	effectiveRegions := requiredRegions
-	if effectiveRegions > 0 && len(blk.regions) < effectiveRegions {
-		if waited >= grace {
-			majority := (effectiveRegions + 1) / 2
-			if majority < 1 {
-				majority = 1
-			}
-			if len(blk.regions) == 0 {
-				effectiveRegions = 0
-			} else if len(blk.regions) >= majority {
-				effectiveRegions = majority
-			}
-		}
-		if len(blk.regions) < effectiveRegions {
-			return false
-		}
-	}
 	if s.params.TotalStake <= 0 {
 		return false
 	}
@@ -729,18 +678,12 @@ func (s *L3Service) buildEnvelopeLocked(blockHex string, blk *blockCounters) *Fi
 		cells = append(cells, id)
 	}
 	sort.Strings(cells)
-	regions := make([]string, 0, len(blk.regions))
-	for id := range blk.regions {
-		regions = append(regions, id)
-	}
-	sort.Strings(regions)
 	env := &FinalityEnvelope{
 		BlockID:       decodeHex(blockHex),
 		Height:        blk.height,
 		Horizon:       s.params.HorizonEpochs,
 		DescendantQCs: append([]ValidatorQCRef(nil), blk.qcs...),
 		CellBitmap:    cells,
-		RegionBitmap:  regions,
 		FinalizedAt:   time.Now().UTC(),
 	}
 	return env
@@ -763,7 +706,7 @@ func (s *L3Service) broadcastEnvelope(env *FinalityEnvelope) {
 		logx.Warn("helios l3 envelope marshal failed", "err", err)
 		return
 	}
-	logx.Info("helios l3 envelope broadcast", "block", shortHex(hex.EncodeToString(env.BlockID)), "height", env.Height, "cells", len(env.CellBitmap), "regions", len(env.RegionBitmap))
+	logx.Info("helios l3 envelope broadcast", "block", shortHex(hex.EncodeToString(env.BlockID)), "height", env.Height, "cells", len(env.CellBitmap))
 	if err := s.tEnv.Publish(s.ctx, payload); err != nil {
 		logx.Warn("helios l3 envelope publish failed", "err", err)
 	}
@@ -846,7 +789,7 @@ func (s *L3Service) GetFinalityEnvelope(blockID []byte) (*FinalityEnvelope, erro
 }
 
 // MetricsForBlock returns counts for operators.
-func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, regions int, auditsPassed int, auditsFailed int) {
+func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, auditsPassed int, auditsFailed int) {
 	hexID := hex.EncodeToString(blockID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -854,7 +797,7 @@ func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, regions int, aud
 	if !ok {
 		return
 	}
-	return len(blk.cells), len(blk.regions), blk.auditsPassed, blk.auditsFailed
+	return len(blk.cells), blk.auditsPassed, blk.auditsFailed
 }
 
 // L3BlockProgress summarizes tracked blocks for monitoring.
@@ -864,7 +807,6 @@ type L3BlockProgress struct {
 	Epoch        uint64     `json:"epoch"`
 	Status       string     `json:"status"`
 	Cells        int        `json:"cells"`
-	Regions      int        `json:"regions"`
 	AuditsPassed int        `json:"audits_passed"`
 	AuditsFailed int        `json:"audits_failed"`
 	L2Committed  bool       `json:"l2_committed"`
@@ -888,7 +830,6 @@ func (s *L3Service) Snapshot(limit int) []L3BlockProgress {
 			Epoch:        blk.epoch,
 			Status:       blk.status.String(),
 			Cells:        len(blk.cells),
-			Regions:      len(blk.regions),
 			AuditsPassed: blk.auditsPassed,
 			AuditsFailed: blk.auditsFailed,
 			L2Committed:  blk.l2Committed,

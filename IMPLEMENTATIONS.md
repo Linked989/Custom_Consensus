@@ -46,3 +46,4 @@
 - [x] Design IoT-level orchestrator for simulated device assignments
 - [x] Investigate L3 pending status under multi-node deployments
 - [x] Evaluate consensus resilience to latency and low-power nodes
+- [x] Simplify L3 finality by removing region quorum requirements

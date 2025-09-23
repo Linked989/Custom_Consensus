@@ -437,13 +437,12 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 		status := svc.QueryL3Status(blockID)
 		ready := svc.IsL3Ready(blockID)
-		cells, regions, auditsPassed, auditsFailed := svc.MetricsForBlock(blockID)
+		cells, auditsPassed, auditsFailed := svc.MetricsForBlock(blockID)
 		resp := map[string]any{
 			"block":         blockHex,
 			"status":        status.String(),
 			"ready":         ready,
 			"cells":         cells,
-			"regions":       regions,
 			"audits_passed": auditsPassed,
 			"audits_failed": auditsFailed,
 		}
@@ -496,7 +495,6 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			"height":         env.Height,
 			"horizon":        env.Horizon,
 			"cells":          env.CellBitmap,
-			"regions":        env.RegionBitmap,
 			"finalized_at":   env.FinalizedAt,
 			"descendant_qcs": desc,
 		}
