@@ -807,10 +807,14 @@ func (r *registrar) handle(d *device) regResult {
 	blocked := 0
 	var earliest time.Time
 	now := time.Now()
+	var firstBase string
 	for _, idx := range order {
 		ep := r.endpoints[idx]
 		if ep == nil {
 			continue
+		}
+		if firstBase == "" {
+			firstBase = ep.base
 		}
 		if now.Before(ep.retryAt) {
 			blocked++
@@ -862,6 +866,9 @@ func (r *registrar) handle(d *device) regResult {
 	if attempts > 0 && limitHits == attempts {
 		d.assigned = ""
 		d.assignedNode = ""
+		if firstBase != "" {
+			d.assignedBase = firstBase
+		}
 		d.registered = true
 		d.fallback = true
 		d.nextJoin = time.Now().Add(joinRetry)
