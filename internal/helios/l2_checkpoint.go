@@ -635,7 +635,9 @@ func (s *L2Service) checkCommitFor(blockHex string) {
 	shouldBroadcast = true
 
 	if shouldBroadcast {
-		logx.Info("HELIOS L2 COMMIT", "height", commit.Height, "hash", short(blockHex))
+		if LogL2 {
+			logx.Info("HELIOS L2 COMMIT", "height", commit.Height, "hash", short(blockHex))
+		}
 		by, err := s.em.Marshal(commit)
 		if err == nil {
 			if s.tCommit != nil {
@@ -682,7 +684,9 @@ func (s *L2Service) onCommit(data []byte) {
 	}
 	l3Block = append([]byte(nil), msg.Block...)
 	s.mu.Unlock()
-	logx.Info("HELIOS L2 COMMIT", "height", msg.Height, "hash", short(blockHex), "from", "network")
+	if LogL2 {
+		logx.Info("HELIOS L2 COMMIT", "height", msg.Height, "hash", short(blockHex), "from", "network")
+	}
 	if s.l3 != nil && len(l3Block) > 0 {
 		s.l3.RecordBlockMeta(l3Block, l3Parent, l3Height, 0, l3TxRoot, true)
 	}

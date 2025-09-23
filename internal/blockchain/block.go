@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -631,6 +632,7 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
 					}
 				}
 				// drain up to maxTxs directly from mempool
+				beforeLen := pool.Len()
 				batch := pool.PopBatch(maxTxs)
 				// build block with limits (count, bytes)
 				blk := Block{Version: 1, ChainID: chainID, Height: height, PrevHash: prev, Timestamp: time.Now().UTC()}
@@ -673,7 +675,9 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
 				const cyan = "\x1b[36m"
 				const reset = "\x1b[0m"
 				if LogBlocks {
-					logx.Info(cyan+"propose block"+reset, "height", blk.Height, "txs", len(blk.Txs), "mempool_len", pool.Len())
+					afterLen := pool.Len()
+					logx.Info(cyan+"propose block"+reset, "height", blk.Height, "txs", len(blk.Txs), "mempool_before", beforeLen, "mempool_after", afterLen)
+					logx.Info(fmt.Sprintf("BLOCK %d HAS %d TX", blk.Height, len(blk.Txs)))
 				}
 				data, err := encMode.Marshal(blk)
 				if err != nil {
@@ -734,6 +738,9 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 				if ok := leaderOK(epoch, blk.ProducerPub); !ok {
 					logx.Warn("block rejected: not leader", "height", blk.Height, "epoch", epoch, "producer", blk.ProducerID)
 					continue
+				}
+				if LogBlocks {
+					logx.Info("LEADER HAS VALIDATED BLOCK", "height", blk.Height, "epoch", epoch, "producer", blk.ProducerID)
 				}
 			}
 			// Block limits: count and bytes

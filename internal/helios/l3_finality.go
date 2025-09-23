@@ -467,7 +467,9 @@ func (s *L3Service) RecordBlockMeta(blockID []byte, parent []byte, height int64,
 	blk.daCommitment = append([]byte(nil), commitment...)
 	if l2Committed && !blk.l2Committed {
 		blk.l2Committed = true
-		logx.Info("helios l3 l2 commit", "block", shortHex(hexID), "height", height)
+		if LogL3 {
+			logx.Info("helios l3 l2 commit", "block", shortHex(hexID), "height", height)
+		}
 	}
 }
 
