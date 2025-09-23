@@ -30,6 +30,7 @@ const mdnsServiceTag = "pose-simple-mdns"
 const heartbeatTopic = "pose/heartbeat/1.0.0"
 const txTopicDefault = "pose/tx/1.0.0"
 const networkTopic = "pose/network/status/1.0.0"
+const l3AttesterPrefix = "did:iot:l3_attester_"
 
 func main() {
 	// Flags
@@ -396,7 +397,7 @@ func main() {
 		}()
 	}
 	if l3svc != nil && devReg != nil {
-		l3svc.UpdateDeviceTotal(devReg.Count())
+		l3svc.UpdateDeviceTotal(countL3Attesters(devReg))
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
@@ -406,7 +407,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					total := devReg.Count()
+					total := countL3Attesters(devReg)
 					if total == lastDevices {
 						continue
 					}
@@ -499,6 +500,20 @@ type multiFlag []string
 
 func (m *multiFlag) String() string     { return fmt.Sprint([]string(*m)) }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+func countL3Attesters(reg *iot.Registry) int {
+	if reg == nil {
+		return 0
+	}
+	count := 0
+	for _, dev := range reg.List() {
+		id := strings.ToLower(dev.DeviceID)
+		if strings.HasPrefix(id, l3AttesterPrefix) {
+			count++
+		}
+	}
+	return count
+}
 
 // -------- Swarm key helpers (pnet) --------
 

@@ -347,10 +347,6 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client 
 			}
 		}
 		if client != nil && d.assignedBase != "" {
-			label := "device"
-			if d.attester {
-				label = "attester"
-			}
 			loops := 1
 			if d.attester {
 				loops = 3
@@ -358,13 +354,17 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client 
 			for i := 0; i < loops; i++ {
 				next, votes, required, total, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested)
 				if err != nil {
-					log.Printf("attest failed (%s %s): %v", label, short(d.id), err)
+					if !d.attester {
+						log.Printf("attest failed (device %s): %v", short(d.id), err)
+					}
 					break
 				}
 				if next == "" || next == d.lastAttested {
 					break
 				}
-				log.Printf("attested %s=%s block=%s votes=%d/%d total_devices=%d", label, short(d.id), short(next), votes, required, total)
+				if !d.attester {
+					log.Printf("attested device=%s block=%s votes=%d/%d total_devices=%d", short(d.id), short(next), votes, required, total)
+				}
 				d.lastAttested = next
 			}
 		}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,8 @@ const (
 	topicDAResponse    = "helios/da/response/1.0.0"
 	topicL3Envelope    = "helios/finality/envelope/1.0.0"
 )
+
+const l3AttesterPrefix = "did:iot:l3_attester_"
 
 const (
 	defaultL3MinCells       = 7
@@ -566,6 +569,9 @@ func (s *L3Service) RecordDeviceAttestation(blockID []byte, deviceID string) (vo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	blk := s.ensureBlock(hexID)
+	if !strings.HasPrefix(strings.ToLower(deviceID), l3AttesterPrefix) {
+		return len(blk.deviceVotes), requiredDevices(s.devicesTotal), s.devicesTotal, false
+	}
 	if blk.status == L3StatusFinal {
 		return len(blk.deviceVotes), requiredDevices(s.devicesTotal), s.devicesTotal, false
 	}

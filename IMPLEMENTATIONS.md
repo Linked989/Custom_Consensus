@@ -56,3 +56,9 @@
 
 - [x] Optimize IoT attester latency
 - [x] Tighten L3 attestation scheduling loop
+
+- [x] Silence L3 attester console output
+- [x] Streamline attester loop for minimal delays
+
+- [x] Track dedicated L3 attester count
+- [x] Apply attester-specific quorum thresholds
