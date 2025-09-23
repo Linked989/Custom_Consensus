@@ -67,3 +67,5 @@
 - [x] Keep attester totals refreshed dynamically
 
 - [x] Auto-discover L3 attesters without flags
+
+- [x] Enrich L3 attester progress reporting
