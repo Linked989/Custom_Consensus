@@ -14,6 +14,7 @@ import (
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
 
+	"pose/internal/blockchain"
 	"pose/internal/coseutil"
 	"pose/internal/logx"
 	"pose/internal/mempool"
@@ -144,7 +145,7 @@ func StartTxGossip(ctx context.Context, ps *pubsub.PubSub, topicName string, bri
 }
 
 // StartTxGossipToPool is like StartTxGossip but inserts validated txs into the provided mempool.
-func StartTxGossipToPool(ctx context.Context, ps *pubsub.PubSub, topicName string, bridgeURL string, pool *mempool.Pool, logTx bool) (*pubsub.Topic, error) {
+func StartTxGossipToPool(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, bridgeURL string, pool *mempool.Pool, logTx bool) (*pubsub.Topic, error) {
 	topic, err := ps.Join(topicName)
 	if err != nil {
 		return nil, err
@@ -168,6 +169,19 @@ func StartTxGossipToPool(ctx context.Context, ps *pubsub.PubSub, topicName strin
 		e, err := pool.AddValidatedCOSE(data)
 		if err != nil {
 			unknown := strings.Contains(err.Error(), "unknown kid")
+			if unknown {
+				// try to fetch the missing key via libp2p block sync
+				if kid, kerr := coseutil.ExtractKid(data); kerr == nil {
+					fetchCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+					_ = blockchain.FetchAndRegisterKey(fetchCtx, h, kid)
+					cancel()
+					// re-attempt admission after fetch
+					if _, err2 := pool.AddValidatedCOSE(data); err2 == nil {
+						unknown = false
+						return true, false
+					}
+				}
+			}
 			if unknown && !viaRetry {
 				copyData := append([]byte(nil), data...)
 				select {

@@ -243,7 +243,7 @@ func main() {
 		if err != nil {
 			return nil, nil, err
 		}
-		t, err := gossip.StartTxGossipToPool(ctx, ps, *txTopicName, *bridgeURL, pool, *logTx)
+		t, err := gossip.StartTxGossipToPool(ctx, h, ps, *txTopicName, *bridgeURL, pool, *logTx)
 		if err != nil {
 			return nil, nil, err
 		}

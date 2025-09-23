@@ -777,7 +777,7 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 				if _, _, _, _, err := coseutil.ValidateCOSETx(tx); err != nil {
 					if strings.Contains(err.Error(), "unknown kid") {
 						if kid, kerr := coseutil.ExtractKid(tx); kerr == nil {
-							if fetchAndRegisterKey(ctx, h, kid) {
+							if FetchAndRegisterKey(ctx, h, kid) {
 								if _, _, _, _, err2 := coseutil.ValidateCOSETx(tx); err2 == nil {
 									continue
 								}
@@ -1056,8 +1056,8 @@ func fetchAndInjectParent(ctx context.Context, h host.Host, chainID string, pare
 	}
 }
 
-// fetchAndRegisterKey requests a key from peers and registers it locally.
-func fetchAndRegisterKey(ctx context.Context, h host.Host, kid []byte) bool {
+// FetchAndRegisterKey requests a device public key from peers and registers it locally.
+func FetchAndRegisterKey(ctx context.Context, h host.Host, kid []byte) bool {
 	hexKid := hex.EncodeToString(kid)
 	for _, pid := range h.Network().Peers() {
 		s, err := h.NewStream(ctx, pid, blockSyncProto)

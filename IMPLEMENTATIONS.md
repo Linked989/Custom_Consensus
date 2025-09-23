@@ -91,5 +91,7 @@
 - [x] Implement dedicated attester runner
 - [x] Review iotdev behavior for telemetry-only operation
 - [x] Update simulator to skip attestation logic for telemetry devices
+- [x] Auto-fetch device keys on unknown kid during tx gossip
+- [x] Wire node host into gossip tx admission for key fetch
 - [x] Investigate IoT handler compilation errors in `internal/p2p/iot.go`
 - [x] Fix IoT handler to call in-package AnnounceDeviceKey with valid context
