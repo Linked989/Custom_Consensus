@@ -539,7 +539,7 @@ func (n *nodeEndpoint) label() string {
 }
 
 func attestPending(ctx context.Context, client *http.Client, base string, deviceID string, last string) (string, int, int, int, error) {
-	target, height, votes, required, total, err := fetchPendingBlock(ctx, client, base)
+	target, _, votes, required, total, err := fetchPendingBlock(ctx, client, base)
 	if err != nil {
 		if errors.Is(err, errNoPending) {
 			return last, votes, required, total, nil
