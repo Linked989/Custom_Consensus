@@ -388,6 +388,7 @@ func StartL3Finality(ctx context.Context, h host.Host, ps *pubsub.PubSub, params
 			}
 		}
 	}
+	go svc.runFinalityRechecks()
 	return svc
 }
 
@@ -761,6 +762,30 @@ func (s *L3Service) broadcastEnvelope(env *FinalityEnvelope) {
 	logx.Info("helios l3 envelope broadcast", "block", shortHex(hex.EncodeToString(env.BlockID)), "height", env.Height, "cells", len(env.CellBitmap), "regions", len(env.RegionBitmap))
 	if err := s.tEnv.Publish(s.ctx, payload); err != nil {
 		logx.Warn("helios l3 envelope publish failed", "err", err)
+	}
+}
+
+func (s *L3Service) runFinalityRechecks() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.recheckPending()
+		}
+	}
+}
+
+func (s *L3Service) recheckPending() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, blk := range s.blocks {
+		if blk == nil || blk.status == L3StatusFinal {
+			continue
+		}
+		s.maybeFinalizeLocked(hash, blk)
 	}
 }
 
