@@ -53,3 +53,6 @@
 
 - [x] Design IoT L3 attester goroutines
 - [x] Implement IoT L3 attester simulator updates
+
+- [x] Optimize IoT attester latency
+- [x] Tighten L3 attestation scheduling loop

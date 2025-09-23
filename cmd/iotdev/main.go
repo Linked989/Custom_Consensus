@@ -133,6 +133,7 @@ func main() {
 	devices := flag.Int("devices", 5, "number of simulated devices")
 	l3Attesters := flag.Int("l3-attesters", 0, "number of dedicated L3 attester devices")
 	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
+	attesterInterval := flag.Duration("l3-attester-interval", 150*time.Millisecond, "send interval per L3 attester")
 	jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
 	once := flag.Bool("once", false, "send just one reading per device then exit")
 	list := flag.Bool("list", false, "list devices from first HTTP node and exit")
@@ -277,14 +278,14 @@ func main() {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			runDevice(ctx, txTopic, reg, client, *chain, interval, jitter, once, d)
+			runDevice(ctx, txTopic, reg, client, *chain, interval, jitter, attesterInterval, once, d)
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client *http.Client, chain string, interval, jitter *time.Duration, once *bool, d *device) {
+func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client *http.Client, chain string, interval, jitter, attesterInterval *time.Duration, once *bool, d *device) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -350,9 +351,19 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client 
 			if d.attester {
 				label = "attester"
 			}
-			if next, votes, required, total, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested); err != nil {
-				log.Printf("attest failed (%s %s): %v", label, short(d.id), err)
-			} else if next != "" && next != d.lastAttested {
+			loops := 1
+			if d.attester {
+				loops = 3
+			}
+			for i := 0; i < loops; i++ {
+				next, votes, required, total, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested)
+				if err != nil {
+					log.Printf("attest failed (%s %s): %v", label, short(d.id), err)
+					break
+				}
+				if next == "" || next == d.lastAttested {
+					break
+				}
 				log.Printf("attested %s=%s block=%s votes=%d/%d total_devices=%d", label, short(d.id), short(next), votes, required, total)
 				d.lastAttested = next
 			}
@@ -363,6 +374,9 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client 
 		delay := *interval
 		if d.attester {
 			delay = time.Second
+			if attesterInterval != nil && *attesterInterval > 0 {
+				delay = *attesterInterval
+			}
 		} else if jitter != nil && *jitter > 0 {
 			delay += time.Duration(rand.Int63n(int64(*jitter)))
 		}
