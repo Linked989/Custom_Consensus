@@ -28,6 +28,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"pose/internal/coseutil"
 	"pose/internal/gossip"
 	"pose/internal/iot"
 	"pose/internal/p2p"
@@ -213,7 +214,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("keygen: %v", err)
 		}
-		kid := kidFromPub(pub)
+		kid := coseutil.KidFromPub(pub)
 		devs = append(devs, device{
 			id:         fmt.Sprintf("did:iot:SIM-%x", kid),
 			pub:        pub,
@@ -229,7 +230,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("keygen: %v", err)
 		}
-		kid := kidFromPub(pub)
+		kid := coseutil.KidFromPub(pub)
 		// Dedicated attesters only perform L3 validation duties.
 		devs = append(devs, device{
 			id:         fmt.Sprintf("%s%03d-%x", iot.L3AttesterPrefix, i, kid),
@@ -506,14 +507,14 @@ func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID strin
 		0: int64(1),
 		1: chain,
 		2: "data",
-		3: map[int]interface{}{0: deviceID, 1: defaultFirmware, 2: "ed25519:SIM"},
+		3: map[int]interface{}{0: deviceID, 1: defaultFirmware, 2: "ed25519:DEV"},
 		4: int64(seq),
 		5: time.Now().UTC(),
 		6: map[int]interface{}{0: int64(25), 1: "uCR"},
 		7: []interface{}{randBytes(7), randBytes(7)},
 		8: map[int]interface{}{
 			0: "urn:example:sensor:v1",
-			1: map[string]interface{}{"temp_c": 18 + rand.Float64()*8, "humidity": 0.35 + rand.Float64()*0.25},
+			1: map[string]interface{}{"temp_c": 21.5, "humidity": 0.45},
 			2: map[string]interface{}{"gps": []interface{}{52.520008, 13.404954, 8.0}, "site": "plant-berlin-a"},
 			3: randBytes(6),
 		},
@@ -542,8 +543,6 @@ func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID strin
 	}
 	return out, hex.EncodeToString(txid[:]), nil
 }
-
-func kidFromPub(pub ed25519.PublicKey) []byte { sum := sha256.Sum256(pub); return sum[:8] }
 
 func randBytes(n int) []byte { b := make([]byte, n); io.ReadFull(crand.Reader, b); return b }
 
