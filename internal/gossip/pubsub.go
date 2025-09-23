@@ -172,7 +172,8 @@ func StartTxGossipToPool(ctx context.Context, h host.Host, ps *pubsub.PubSub, to
 	process := func(data []byte, sender string, viaRetry bool) (bool, bool) {
 		e, err := pool.AddValidatedCOSE(data)
 		if err != nil {
-			unknown := strings.Contains(err.Error(), "unknown kid")
+			reason := err.Error()
+			unknown := strings.Contains(reason, "unknown kid")
 			if unknown {
 				// try to fetch the missing key via libp2p block sync
 				if kid, kerr := coseutil.ExtractKid(data); kerr == nil {
@@ -190,7 +191,11 @@ func StartTxGossipToPool(ctx context.Context, h host.Host, ps *pubsub.PubSub, to
 				}
 			}
 			if logTx {
-				logx.Warn("tx rejected", "reason", err.Error(), "from", sender, "retrying", unknown && !viaRetry)
+				if reason == "replay" || reason == "duplicate" {
+					logx.Debug("tx skipped", "reason", reason, "from", sender)
+				} else {
+					logx.Warn("tx rejected", "reason", reason, "from", sender, "retrying", unknown && !viaRetry)
+				}
 			}
 			if unknown && !viaRetry {
 				copyData := append([]byte(nil), data...)
