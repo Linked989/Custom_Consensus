@@ -89,5 +89,7 @@
 - [x] Split IoT attester simulator into separate binary
 - [x] Update iotdev to emit telemetry only
 - [x] Implement dedicated attester runner
+- [x] Review iotdev behavior for telemetry-only operation
+- [x] Update simulator to skip attestation logic for telemetry devices
 - [x] Investigate IoT handler compilation errors in `internal/p2p/iot.go`
 - [x] Fix IoT handler to call in-package AnnounceDeviceKey with valid context
