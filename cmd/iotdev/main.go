@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -321,11 +322,11 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client 
 			log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
 		}
 		if client != nil && d.assignedBase != "" {
-			if tip, votes, required, total, err := attestLatest(ctx, client, d.assignedBase, d.id, d.lastAttested); err != nil {
+			if next, votes, required, total, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested); err != nil {
 				log.Printf("attest failed (%s): %v", short(d.id), err)
-			} else if tip != d.lastAttested {
-				log.Printf("attested device=%s block=%s votes=%d/%d total_devices=%d", short(d.id), short(tip), votes, required, total)
-				d.lastAttested = tip
+			} else if next != "" && next != d.lastAttested {
+				log.Printf("attested device=%s block=%s votes=%d/%d total_devices=%d", short(d.id), short(next), votes, required, total)
+				d.lastAttested = next
 			}
 		}
 		if *once {
@@ -537,44 +538,56 @@ func (n *nodeEndpoint) label() string {
 	return n.host
 }
 
-func attestLatest(ctx context.Context, client *http.Client, base string, deviceID string, last string) (string, int, int, int, error) {
-	tip, err := fetchTipHash(ctx, client, base)
+func attestPending(ctx context.Context, client *http.Client, base string, deviceID string, last string) (string, int, int, int, error) {
+	target, height, votes, required, total, err := fetchPendingBlock(ctx, client, base)
 	if err != nil {
-		return last, 0, 0, 0, err
+		if errors.Is(err, errNoPending) {
+			return last, votes, required, total, nil
+		}
+		return last, votes, required, total, err
 	}
-	if tip == "" || tip == last {
-		return last, 0, 0, 0, nil
+	if target == "" || target == last {
+		return last, votes, required, total, nil
 	}
-	votes, required, total, err := postDeviceAttestation(ctx, client, base, deviceID, tip)
+	votes, required, total, err = postDeviceAttestation(ctx, client, base, deviceID, target)
 	if err != nil {
-		return last, 0, 0, 0, err
+		return last, votes, required, total, err
 	}
-	return tip, votes, required, total, nil
+	return target, votes, required, total, nil
 }
 
-func fetchTipHash(ctx context.Context, client *http.Client, base string) (string, error) {
+var errNoPending = errors.New("no pending block")
+
+func fetchPendingBlock(ctx context.Context, client *http.Client, base string) (string, int64, int, int, int, error) {
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, requestURL(base, "/status"), nil)
+	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, requestURL(base, "/helios/l3/pending"), nil)
 	if err != nil {
-		return "", err
+		return "", 0, 0, 0, 0, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", 0, 0, 0, 0, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusNotFound {
+		return "", 0, 0, 0, 0, errNoPending
+	}
+	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		return "", fmt.Errorf("status %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return "", 0, 0, 0, 0, fmt.Errorf("pending status %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	var out struct {
-		TipHash string `json:"tip_hash"`
+		Block    string `json:"block"`
+		Height   int64  `json:"height"`
+		Votes    int    `json:"votes"`
+		Required int    `json:"required"`
+		Total    int    `json:"total"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
+		return "", 0, 0, 0, 0, err
 	}
-	return strings.ToLower(strings.TrimSpace(out.TipHash)), nil
+	return strings.ToLower(strings.TrimSpace(out.Block)), out.Height, out.Votes, out.Required, out.Total, nil
 }
 
 func postDeviceAttestation(ctx context.Context, client *http.Client, base, deviceID, block string) (int, int, int, error) {

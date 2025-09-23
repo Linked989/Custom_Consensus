@@ -847,6 +847,37 @@ func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, deviceVotes int,
 	return len(blk.cells), len(blk.deviceVotes), requiredDevices(s.devicesTotal), s.devicesTotal, blk.auditsPassed, blk.auditsFailed
 }
 
+// NextPending returns the highest-height block still awaiting device quorum.
+func (s *L3Service) NextPending() (block string, height int64, votes int, required int, total int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		bestID     string
+		bestHeight int64 = -1
+		bestSeen   time.Time
+	)
+	required = requiredDevices(s.devicesTotal)
+	total = s.devicesTotal
+	for id, blk := range s.blocks {
+		if blk == nil || blk.status == L3StatusFinal || !blk.l2Committed {
+			continue
+		}
+		if required > 0 && len(blk.deviceVotes) >= required {
+			continue
+		}
+		if blk.height > bestHeight || (blk.height == bestHeight && (bestSeen.IsZero() || blk.firstSeen.Before(bestSeen))) {
+			bestID = id
+			bestHeight = blk.height
+			bestSeen = blk.firstSeen
+		}
+	}
+	if bestID == "" {
+		return "", 0, 0, required, total, false
+	}
+	blk := s.blocks[bestID]
+	return bestID, blk.height, len(blk.deviceVotes), required, total, true
+}
+
 // L3BlockProgress summarizes tracked blocks for monitoring.
 type L3BlockProgress struct {
 	Block        string     `json:"block"`

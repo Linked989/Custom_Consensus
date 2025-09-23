@@ -510,6 +510,32 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
+	// GET /helios/l3/pending
+	mux.HandleFunc("/helios/l3/pending", func(w http.ResponseWriter, r *http.Request) {
+		if getL3 == nil {
+			http.Error(w, "helios l3 not available", http.StatusServiceUnavailable)
+			return
+		}
+		svc := getL3()
+		if svc == nil {
+			http.Error(w, "helios l3 not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		block, height, votes, required, total, ok := svc.NextPending()
+		if !ok {
+			http.Error(w, "no pending block", http.StatusNotFound)
+			return
+		}
+		resp := map[string]any{
+			"block":    block,
+			"height":   height,
+			"votes":    votes,
+			"required": required,
+			"total":    total,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
 	// GET /helios/l3/overview?limit=10
 	mux.HandleFunc("/helios/l3/overview", func(w http.ResponseWriter, r *http.Request) {
 		if getL3 == nil {
