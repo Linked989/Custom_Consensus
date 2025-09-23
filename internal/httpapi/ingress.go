@@ -656,6 +656,11 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
 		count := reg.Count()
 		accepting := limit == 0 || count < limit
+		if iot.IsL3Attester(req.DeviceID) && getL3 != nil {
+			if svc := getL3(); svc != nil {
+				svc.UpdateDeviceTotal(iot.CountAttesters(reg))
+			}
+		}
 		resp := map[string]any{
 			"ok":          true,
 			"node_id":     h.ID().String(),
