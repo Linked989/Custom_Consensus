@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,14 +11,12 @@ import (
 	"sync"
 	"time"
 
-	cbor "github.com/fxamacker/cbor/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
 
 	"pose/internal/blockchain"
 	"pose/internal/coseutil"
-	"pose/internal/entropy"
 	"pose/internal/logx"
 	"pose/internal/mempool"
 )
@@ -216,19 +213,19 @@ func StartTxGossipToPool(ctx context.Context, h host.Host, ps *pubsub.PubSub, to
 		if logTx {
 			logx.Info("tx accepted", "txid", e.TxID, "dev", e.DevID, "seq", e.Seq, "from", sender)
 		}
-		if devID, dataPart, ok := entropy.ExtractDevIDAndData(data); ok {
-			var decoded interface{}
-			if err := cbor.Unmarshal(dataPart, &decoded); err == nil {
-				jsReady := normalizeForJSON(decoded)
-				if js, err2 := json.Marshal(jsReady); err2 == nil {
-					logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload", string(js))
-				} else {
-					logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload_err", err2.Error())
-				}
-			} else {
-				logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload_hex", hex.EncodeToString(dataPart))
-			}
-		}
+		// if devID, dataPart, ok := entropy.ExtractDevIDAndData(data); ok {
+		// 	var decoded interface{}
+		// 	if err := cbor.Unmarshal(dataPart, &decoded); err == nil {
+		// 		jsReady := normalizeForJSON(decoded)
+		// 		if js, err2 := json.Marshal(jsReady); err2 == nil {
+		// 			logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload", string(js))
+		// 		} else {
+		// 			logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload_err", err2.Error())
+		// 		}
+		// 	} else {
+		// 		logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload_hex", hex.EncodeToString(dataPart))
+		// 	}
+		// }
 		if bridgeURL != "" {
 			go forwardCOSE(bridgeURL, data)
 		}
