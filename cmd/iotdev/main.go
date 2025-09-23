@@ -54,6 +54,7 @@ type device struct {
 	priv         ed25519.PrivateKey
 	kid          []byte
 	seq          uint64
+	attester     bool
 	assigned     peer.ID
 	assignedNode string
 	assignedBase string
@@ -130,6 +131,7 @@ func main() {
 	flag.Var(&nodes, "node", "node HTTP base URL for registration (repeatable)")
 	chain := flag.String("chain", "iotnet-main", "chain/network id")
 	devices := flag.Int("devices", 5, "number of simulated devices")
+	l3Attesters := flag.Int("l3-attesters", 0, "number of dedicated L3 attester devices")
 	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
 	jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
 	once := flag.Bool("once", false, "send just one reading per device then exit")
@@ -202,24 +204,44 @@ func main() {
 		return
 	}
 
-	devs := make([]device, *devices)
+	totalDevices := *devices + *l3Attesters
+	devs := make([]device, 0, totalDevices)
 	for i := 0; i < *devices; i++ {
 		pub, priv, err := ed25519.GenerateKey(crand.Reader)
 		if err != nil {
 			log.Fatalf("keygen: %v", err)
 		}
 		kid := kidFromPub(pub)
-		devs[i] = device{
+		devs = append(devs, device{
 			id:         fmt.Sprintf("did:iot:SIM-%x", kid),
 			pub:        pub,
 			priv:       priv,
 			kid:        kid,
 			seq:        0,
 			nextJoin:   time.Now(),
-			baseOffset: i,
-		}
+			baseOffset: len(devs),
+		})
 	}
-	log.Printf("initialized %d devices", *devices)
+	for i := 0; i < *l3Attesters; i++ {
+		pub, priv, err := ed25519.GenerateKey(crand.Reader)
+		if err != nil {
+			log.Fatalf("keygen: %v", err)
+		}
+		kid := kidFromPub(pub)
+		prefix := fmt.Sprintf("l3_attester_%03d", i)
+		// Dedicated attesters only perform L3 validation duties.
+		devs = append(devs, device{
+			id:         fmt.Sprintf("did:iot:%s-%x", prefix, kid),
+			pub:        pub,
+			priv:       priv,
+			kid:        kid,
+			seq:        0,
+			nextJoin:   time.Now(),
+			baseOffset: len(devs),
+			attester:   true,
+		})
+	}
+	log.Printf("initialized %d devices (%d telemetry, %d L3 attesters)", len(devs), *devices, *l3Attesters)
 	devPtrs := make([]*device, len(devs))
 	for i := range devs {
 		devs[i].baseOffset = i
@@ -299,41 +321,49 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client 
 			continue
 		}
 
-		d.seq++
-		cose, txid, err := buildCOSE(d.priv, d.kid, chain, d.id, d.seq)
-		if err != nil {
-			log.Printf("build error (%s): %v", short(d.id), err)
-			continue
-		}
-		sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err = topic.Publish(sendCtx, cose)
-		cancel()
-		if err != nil {
-			log.Printf("publish failed (%s): %v", short(d.id), err)
-			d.registered = false
-			d.nextJoin = time.Now().Add(discoveryRetry)
-			continue
-		}
-		if d.assignedNode != "" {
-			log.Printf("sent device=%s node=%s txid=%s", short(d.id), d.assignedNode, txid[:12])
-		} else if d.fallback {
-			log.Printf("sent device=%s node=fallback txid=%s", short(d.id), txid[:12])
-		} else {
-			log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
+		if !d.attester {
+			d.seq++
+			cose, txid, err := buildCOSE(d.priv, d.kid, chain, d.id, d.seq)
+			if err != nil {
+				log.Printf("build error (%s): %v", short(d.id), err)
+				continue
+			}
+			sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err = topic.Publish(sendCtx, cose)
+			cancel()
+			if err != nil {
+				log.Printf("publish failed (%s): %v", short(d.id), err)
+				d.registered = false
+				d.nextJoin = time.Now().Add(discoveryRetry)
+				continue
+			}
+			if d.assignedNode != "" {
+				log.Printf("sent device=%s node=%s txid=%s", short(d.id), d.assignedNode, txid[:12])
+			} else if d.fallback {
+				log.Printf("sent device=%s node=fallback txid=%s", short(d.id), txid[:12])
+			} else {
+				log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
+			}
 		}
 		if client != nil && d.assignedBase != "" {
+			label := "device"
+			if d.attester {
+				label = "attester"
+			}
 			if next, votes, required, total, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested); err != nil {
-				log.Printf("attest failed (%s): %v", short(d.id), err)
+				log.Printf("attest failed (%s %s): %v", label, short(d.id), err)
 			} else if next != "" && next != d.lastAttested {
-				log.Printf("attested device=%s block=%s votes=%d/%d total_devices=%d", short(d.id), short(next), votes, required, total)
+				log.Printf("attested %s=%s block=%s votes=%d/%d total_devices=%d", label, short(d.id), short(next), votes, required, total)
 				d.lastAttested = next
 			}
 		}
-		if *once {
+		if *once && !d.attester {
 			return
 		}
 		delay := *interval
-		if jitter != nil && *jitter > 0 {
+		if d.attester {
+			delay = time.Second
+		} else if jitter != nil && *jitter > 0 {
 			delay += time.Duration(rand.Int63n(int64(*jitter)))
 		}
 		select {

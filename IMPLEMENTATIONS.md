@@ -50,3 +50,6 @@
 - [x] Design lightweight IoT device L3 attestation flow
 - [x] Implement IoT-driven finality quorum and device attestation APIs
 - [x] Update IoT simulator to submit L3 attestations and report participation
+
+- [x] Design IoT L3 attester goroutines
+- [x] Implement IoT L3 attester simulator updates
