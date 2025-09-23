@@ -75,3 +75,7 @@
 - [x] Ensure IoT attester registration does not consume device slots
 
 - [x] Drain mempool directly during block proposals
+
+- [ ] Investigate empty blocks despite mempool drain
+
+- [x] Add HTTP endpoint exposing mempool stats

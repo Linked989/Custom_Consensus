@@ -98,6 +98,40 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(out)
 	})
+	// GET /mempool?snapshot=1&limit=100
+	mux.HandleFunc("/mempool", func(w http.ResponseWriter, r *http.Request) {
+		if pool == nil {
+			http.Error(w, "mempool disabled", http.StatusServiceUnavailable)
+			return
+		}
+		limit := 50
+		if qs := r.URL.Query().Get("limit"); qs != "" {
+			if v, err := strconv.Atoi(qs); err == nil && v > 0 {
+				limit = v
+			}
+		}
+		total := pool.Len()
+		resp := map[string]any{"ok": true, "size": total}
+		if r.URL.Query().Get("snapshot") == "1" {
+			entries := pool.Snapshot()
+			if limit > 0 && len(entries) > limit {
+				entries = entries[:limit]
+			}
+			dtos := make([]map[string]any, 0, len(entries))
+			for _, e := range entries {
+				dtos = append(dtos, map[string]any{
+					"txid":   e.TxID,
+					"device": e.DevID,
+					"seq":    e.Seq,
+					"age_ms": time.Since(e.Added).Milliseconds(),
+					"bytes":  len(e.Bytes),
+				})
+			}
+			resp["entries"] = dtos
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
 	// GET /blocks?n=20 — list recent block hashes
 	mux.HandleFunc("/blocks", func(w http.ResponseWriter, r *http.Request) {
 		n := 20
@@ -233,7 +267,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 	// GET /cell/entropy: recompute entropy now and return summary + per-device breakdown
 	mux.HandleFunc("/cell/entropy", func(w http.ResponseWriter, r *http.Request) {
 		st := cellMgr.Status()
-		resp := map[string]any{
+		resp = map[string]any{
 			"cell_active": st.Active,
 			"cell_id":     st.ID,
 			"devices":     len(st.Devices),
@@ -283,7 +317,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			http.Error(w, "directory not available", http.StatusServiceUnavailable)
 			return
 		}
-		resp := map[string]any{
+		resp = map[string]any{
 			"nodes":        dir.List(),
 			"generated_at": time.Now().UTC(),
 		}
@@ -299,7 +333,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 				limit = v
 			}
 		}
-		resp := map[string]any{"limit": limit}
+		resp = map[string]any{"limit": limit}
 		var l1Records []helios.L1Record
 		if getHELIOS == nil {
 			resp["l1"] = map[string]any{"available": false, "reason": "helios l1 not available"}
@@ -438,7 +472,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		status := svc.QueryL3Status(blockID)
 		ready := svc.IsL3Ready(blockID)
 		cells, deviceVotes, deviceNeeded, deviceTotal, auditsPassed, auditsFailed := svc.MetricsForBlock(blockID)
-		resp := map[string]any{
+		resp = map[string]any{
 			"block":           blockHex,
 			"status":          status.String(),
 			"ready":           ready,
@@ -493,7 +527,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 				"created_at": qc.CreatedAt,
 			})
 		}
-		resp := map[string]any{
+		resp = map[string]any{
 			"block":          blockHex,
 			"height":         env.Height,
 			"horizon":        env.Horizon,
@@ -526,7 +560,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			http.Error(w, "no pending block", http.StatusNotFound)
 			return
 		}
-		resp := map[string]any{
+		resp = map[string]any{
 			"block":    block,
 			"height":   height,
 			"votes":    votes,
@@ -571,7 +605,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		max := reg.Max()
 		nonAtt := reg.NonAttesterCount()
 		accepting := max == 0 || nonAtt < max
-		resp := map[string]any{
+		resp = map[string]any{
 			"ok":            true,
 			"node_id":       h.ID().String(),
 			"connected":     nonAtt,
@@ -638,7 +672,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		if err := reg.UpsertWithLimit(device, limit); err != nil {
 			if errors.Is(err, iot.ErrRegistryFull) {
 				nonAtt := reg.NonAttesterCount()
-				resp := map[string]any{
+				resp = map[string]any{
 					"ok":            false,
 					"error":         "iot_limit_reached",
 					"message":       "node at capacity",
@@ -661,7 +695,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		total := reg.Count()
 		nonAtt := reg.NonAttesterCount()
 		accepting := limit == 0 || nonAtt < limit
-		resp := map[string]any{
+		resp = map[string]any{
 			"ok":            true,
 			"node_id":       h.ID().String(),
 			"connected":     nonAtt,
@@ -740,7 +774,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			return
 		}
 		votes, required, total, recorded := svc.RecordDeviceAttestation(blockID, req.DeviceID)
-		resp := map[string]any{
+		resp = map[string]any{
 			"ok":       recorded,
 			"votes":    votes,
 			"required": required,
@@ -761,7 +795,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 		list := reg.List()
 		sort.Slice(list, func(i, j int) bool { return list[i].DeviceID < list[j].DeviceID })
-		resp := map[string]any{
+		resp = map[string]any{
 			"ok":          true,
 			"node_id":     h.ID().String(),
 			"devices":     list,
