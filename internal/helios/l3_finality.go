@@ -134,6 +134,26 @@ func (r *CellRegistry) ActiveCells() []CellRecord {
 	return out
 }
 
+func (r *CellRegistry) ActiveCounts() (int, int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.records) == 0 {
+		return 0, 0
+	}
+	regions := make(map[string]struct{})
+	cells := 0
+	for _, rec := range r.records {
+		if rec.Status != CellStatusActive {
+			continue
+		}
+		cells++
+		if rec.RegionID != "" {
+			regions[rec.RegionID] = struct{}{}
+		}
+	}
+	return cells, len(regions)
+}
+
 // EpochBeacon exposes randomness per epoch.
 type EpochBeacon interface {
 	Randomness(epoch uint64) []byte
@@ -636,11 +656,58 @@ func (s *L3Service) isReadyLocked(blk *blockCounters) bool {
 	if !blk.l2Committed {
 		return false
 	}
-	if len(blk.cells) < s.params.MinCells {
-		return false
+	activeCells, activeRegions := s.cells.ActiveCounts()
+	requiredCells := s.params.MinCells
+	if requiredCells > activeCells {
+		requiredCells = activeCells
 	}
-	if len(blk.regions) < s.params.MinRegions {
-		return false
+	if requiredCells < 0 {
+		requiredCells = 0
+	}
+	requiredRegions := s.params.MinRegions
+	if requiredRegions > activeRegions {
+		requiredRegions = activeRegions
+	}
+	if requiredRegions < 0 {
+		requiredRegions = 0
+	}
+	if requiredCells == 0 {
+		requiredRegions = 0
+	}
+	grace := s.params.ChallengeWindow
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	waited := time.Since(blk.firstSeen)
+	effectiveCells := requiredCells
+	if effectiveCells > 0 && len(blk.cells) < effectiveCells {
+		if waited >= grace {
+			majority := (effectiveCells + 1) / 2
+			if majority < 1 {
+				majority = 1
+			}
+			if len(blk.cells) >= majority {
+				effectiveCells = majority
+			}
+		}
+		if len(blk.cells) < effectiveCells {
+			return false
+		}
+	}
+	effectiveRegions := requiredRegions
+	if effectiveRegions > 0 && len(blk.regions) < effectiveRegions {
+		if waited >= grace {
+			majority := (effectiveRegions + 1) / 2
+			if majority < 1 {
+				majority = 1
+			}
+			if len(blk.regions) >= majority {
+				effectiveRegions = majority
+			}
+		}
+		if len(blk.regions) < effectiveRegions {
+			return false
+		}
 	}
 	if s.params.TotalStake <= 0 {
 		return false

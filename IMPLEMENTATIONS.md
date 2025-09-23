@@ -44,3 +44,5 @@
 - [x] Validate runtime logs reflect configured IoT device limit
 - [x] Normalize boolean flag parsing so `-iot-max-devices` is always read
 - [x] Design IoT-level orchestrator for simulated device assignments
+- [x] Investigate L3 pending status under multi-node deployments
+- [x] Evaluate consensus resilience to latency and low-power nodes
