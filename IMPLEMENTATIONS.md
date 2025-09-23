@@ -97,5 +97,6 @@
 - [x] Gate AION/HELIOS/blockchain/HTTP logs behind flags
 - [x] Suppress L2/L3 commit logs unless flags enabled
 - [x] Add leader/block summary logs for troubleshooting empty blocks
+- [x] Log tx admission failures and retries behind -log-tx
 - [x] Investigate IoT handler compilation errors in `internal/p2p/iot.go`
 - [x] Fix IoT handler to call in-package AnnounceDeviceKey with valid context

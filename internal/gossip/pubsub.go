@@ -178,9 +178,15 @@ func StartTxGossipToPool(ctx context.Context, h host.Host, ps *pubsub.PubSub, to
 					// re-attempt admission after fetch
 					if _, err2 := pool.AddValidatedCOSE(data); err2 == nil {
 						unknown = false
+						if logTx {
+							logx.Info("tx accepted after key fetch", "from", sender)
+						}
 						return true, false
 					}
 				}
+			}
+			if logTx {
+				logx.Warn("tx rejected", "reason", err.Error(), "from", sender, "retrying", unknown && !viaRetry)
 			}
 			if unknown && !viaRetry {
 				copyData := append([]byte(nil), data...)
