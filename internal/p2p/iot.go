@@ -44,6 +44,7 @@ type IoTResponse struct {
 	MaxDevices int          `json:"max_devices,omitempty"`
 	Accepting  bool         `json:"accepting,omitempty"`
 	Timestamp  time.Time    `json:"timestamp,omitempty"`
+	Total      int          `json:"total_devices,omitempty"`
 	Devices    []iot.Device `json:"devices,omitempty"`
 }
 
@@ -112,7 +113,8 @@ func handleIoTRegister(s network.Stream, h host.Host, reg *iot.Registry, req IoT
 	if err := reg.UpsertWithLimit(device, limit); err != nil {
 		if errors.Is(err, iot.ErrRegistryFull) {
 			nonAtt := reg.NonAttesterCount()
-			writeIoTResponse(s, IoTResponse{OK: false, Error: "iot_limit_reached", Message: "node at capacity", NodeID: h.ID().String(), Connected: nonAtt, MaxDevices: limit, Accepting: false, Timestamp: time.Now().UTC()})
+			total := reg.Count()
+			writeIoTResponse(s, IoTResponse{OK: false, Error: "iot_limit_reached", Message: "node at capacity", NodeID: h.ID().String(), Connected: nonAtt, Total: total, MaxDevices: limit, Accepting: false, Timestamp: time.Now().UTC()})
 			return
 		}
 		writeIoTResponse(s, IoTResponse{OK: false, Error: "registry_error", Message: err.Error()})
@@ -120,7 +122,7 @@ func handleIoTRegister(s network.Stream, h host.Host, reg *iot.Registry, req IoT
 	}
 	coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
 	nonAtt := reg.NonAttesterCount()
-	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: reg.Count(), MaxDevices: limit, Accepting: limit == 0 || nonAtt < limit, Timestamp: time.Now().UTC()})
+	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: nonAtt, Total: reg.Count(), MaxDevices: limit, Accepting: limit == 0 || nonAtt < limit, Timestamp: time.Now().UTC()})
 }
 
 func handleIoTCapacity(s network.Stream, h host.Host, reg *iot.Registry) {
@@ -128,7 +130,7 @@ func handleIoTCapacity(s network.Stream, h host.Host, reg *iot.Registry) {
 	max := reg.Max()
 	nonAtt := reg.NonAttesterCount()
 	accepting := max == 0 || nonAtt < max
-	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: count, MaxDevices: max, Accepting: accepting, Timestamp: time.Now().UTC()})
+	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: nonAtt, Total: count, MaxDevices: max, Accepting: accepting, Timestamp: time.Now().UTC()})
 }
 
 func handleIoTList(s network.Stream, h host.Host, reg *iot.Registry) {

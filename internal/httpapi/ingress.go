@@ -567,18 +567,20 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			http.Error(w, "GET only", http.StatusMethodNotAllowed)
 			return
 		}
-		count := reg.Count()
-		max := reg.Max()
-		accepting := max == 0 || count < max
-		resp := map[string]any{
-			"ok":          true,
-			"node_id":     h.ID().String(),
-			"connected":   count,
-			"max_devices": max,
-			"accepting":   accepting,
-			"p2p_addrs":   p2p.LocalAddrs(h),
-			"timestamp":   time.Now().UTC(),
-		}
+	count := reg.Count()
+	max := reg.Max()
+	nonAtt := reg.NonAttesterCount()
+	accepting := max == 0 || nonAtt < max
+	resp := map[string]any{
+		"ok":          true,
+		"node_id":     h.ID().String(),
+		"connected":   nonAtt,
+		"max_devices": max,
+		"accepting":   accepting,
+		"total_devices": count,
+		"p2p_addrs":   p2p.LocalAddrs(h),
+		"timestamp":   time.Now().UTC(),
+	}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
@@ -635,15 +637,17 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 		if err := reg.UpsertWithLimit(device, limit); err != nil {
 			if errors.Is(err, iot.ErrRegistryFull) {
+				nonAtt := reg.NonAttesterCount()
 				resp := map[string]any{
-					"ok":          false,
-					"error":       "iot_limit_reached",
-					"message":     "node at capacity",
-					"node_id":     h.ID().String(),
-					"connected":   reg.NonAttesterCount(),
-					"max_devices": limit,
-					"accepting":   false,
-					"timestamp":   time.Now().UTC(),
+					"ok":            false,
+					"error":         "iot_limit_reached",
+					"message":       "node at capacity",
+					"node_id":       h.ID().String(),
+					"connected":     nonAtt,
+					"total_devices": reg.Count(),
+					"max_devices":   limit,
+					"accepting":     false,
+					"timestamp":     time.Now().UTC(),
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -657,15 +661,17 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		count := reg.Count()
 		nonAtt := reg.NonAttesterCount()
 		accepting := limit == 0 || nonAtt < limit
-		resp := map[string]any{
-			"ok":          true,
-			"node_id":     h.ID().String(),
-			"connected":   count,
-			"max_devices": limit,
-			"accepting":   accepting,
-			"p2p_addrs":   p2p.LocalAddrs(h),
-			"timestamp":   time.Now().UTC(),
-		}
+	nonAtt := reg.NonAttesterCount()
+	resp := map[string]any{
+		"ok":          true,
+		"node_id":     h.ID().String(),
+		"connected":   nonAtt,
+		"max_devices": limit,
+		"accepting":   accepting,
+		"total_devices": count,
+		"p2p_addrs":   p2p.LocalAddrs(h),
+		"timestamp":   time.Now().UTC(),
+	}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
