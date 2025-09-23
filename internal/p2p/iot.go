@@ -121,7 +121,8 @@ func handleIoTRegister(s network.Stream, h host.Host, reg *iot.Registry, req IoT
 		return
 	}
 	coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
-	p2p.AnnounceDeviceKey(s.Context(), h, kidBytes[:8], ed25519.PublicKey(pubBytes))
+	// broadcast the new device key using a fresh context since streams lack one
+	AnnounceDeviceKey(context.Background(), h, kidBytes[:8], ed25519.PublicKey(pubBytes))
 	nonAtt := reg.NonAttesterCount()
 	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: nonAtt, Total: reg.Count(), MaxDevices: limit, Accepting: limit == 0 || nonAtt < limit, Timestamp: time.Now().UTC()})
 }
