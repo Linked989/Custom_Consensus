@@ -79,3 +79,5 @@
 - [ ] Investigate empty blocks despite mempool drain
 
 - [x] Add HTTP endpoint exposing mempool stats
+
+- [ ] Confirm IoT telemetry reaches mempool

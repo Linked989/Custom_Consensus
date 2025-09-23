@@ -100,10 +100,10 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 	})
 	// GET /mempool?snapshot=1&limit=100
 	mux.HandleFunc("/mempool", func(w http.ResponseWriter, r *http.Request) {
-		if pool == nil {
-			http.Error(w, "mempool disabled", http.StatusServiceUnavailable)
-			return
-		}
+	if pool == nil {
+		http.Error(w, "mempool disabled", http.StatusServiceUnavailable)
+		return
+	}
 		limit := 50
 		if qs := r.URL.Query().Get("limit"); qs != "" {
 			if v, err := strconv.Atoi(qs); err == nil && v > 0 {
