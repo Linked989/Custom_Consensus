@@ -186,7 +186,7 @@ func StartTxGossipToPool(ctx context.Context, h host.Host, ps *pubsub.PubSub, to
 				}
 			}
 			if logTx {
-				logx.Info("tx rejected", "reason", err.Error(), "from", sender, "retrying", unknown && !viaRetry)
+				logx.Warn("tx rejected", "reason", err.Error(), "from", sender, "retrying", unknown && !viaRetry)
 			}
 			if unknown && !viaRetry {
 				copyData := append([]byte(nil), data...)
