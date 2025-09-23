@@ -101,3 +101,4 @@
 - [x] Investigate IoT handler compilation errors in `internal/p2p/iot.go`
 - [x] Fix IoT handler to call in-package AnnounceDeviceKey with valid context
 - [x] Restore legacy iotdev telemetry+cell formation simulator
+- [x] Align iotdev telemetry payloads with dev generator format
