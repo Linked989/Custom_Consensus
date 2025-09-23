@@ -57,6 +57,13 @@ func main() {
 	// Logging toggles
 	logHeartbeats := flag.Bool("log-heartbeats", false, "log every heartbeat message")
 	logTx := flag.Bool("log-tx", false, "log every accepted tx from gossip")
+	logHTTPtx := flag.Bool("log-http-tx", false, "log every HTTP /tx accepted")
+	logIoT := flag.Bool("log-iot", false, "log IoT register/events")
+	logBlocks := flag.Bool("log-blocks", false, "log block propose/accept")
+	logAION := flag.Bool("log-aion", false, "log AION leader election/schedule")
+	logL1 := flag.Bool("log-l1", false, "log HELIOS L1 events")
+	logL2 := flag.Bool("log-l2", false, "log HELIOS L2 events")
+	logL3 := flag.Bool("log-l3", false, "log HELIOS L3 events")
 	logDev := flag.Bool("log-dev", false, "log dev tx publishes")
 	logBlockQueue := flag.Bool("log-block-queue", false, "log when blocks are queued waiting for parent")
 	logPrune := flag.Bool("log-mempool-prune", true, "log mempool pruning due to accepted blocks")
@@ -96,6 +103,13 @@ func main() {
 		"log-block-queue":   {},
 		"log-mempool-prune": {},
 		"log-mempool":       {},
+		"log-http-tx":       {},
+		"log-iot":           {},
+		"log-blocks":        {},
+		"log-aion":          {},
+		"log-l1":            {},
+		"log-l2":            {},
+		"log-l3":            {},
 		"dev-gen-tx":        {},
 		"dev-reuse-key":     {},
 		"verbose":           {},
@@ -237,6 +251,15 @@ func main() {
 	}()
 	// Local mempool
 	pool := mempool.New(*memCapacity, *memTTL, *memBytesCap)
+
+	// Apply logging flags to subsystems
+	aion.SetLogAION(*logAION)
+	helios.SetLogL1(*logL1)
+	helios.SetLogL2(*logL2)
+	helios.SetLogL3(*logL3)
+	blockchain.SetLogBlocks(*logBlocks)
+	httpapi.SetLogHTTPTx(*logHTTPtx)
+	httpapi.SetLogIoT(*logIoT)
 
 	members, txTopic, err := func() (*gossip.MemberSet, *pubsub.Topic, error) {
 		m, _, err := gossip.StartHeartbeat(ctx, h, ps, *hbTopic, *hbInterval, *memberTTL, *logHeartbeats)

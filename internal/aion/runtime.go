@@ -11,4 +11,3 @@ func SetLeaderActive(v bool) { runtimeLeader.Store(v) }
 
 // IsLeaderActive reports if local node is currently allowed to produce blocks.
 func IsLeaderActive() bool { return runtimeLeader.Load() }
-

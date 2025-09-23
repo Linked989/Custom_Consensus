@@ -70,7 +70,9 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		if pool != nil {
 			_, _ = pool.AddValidatedCOSE(body)
 		}
-		logx.Info("http accepted", "txid", txid, "dev", devID, "seq", seq)
+		if LogHTTPTx {
+			logx.Info("http accepted", "txid", txid, "dev", devID, "seq", seq)
+		}
 		w.WriteHeader(http.StatusAccepted)
 	})
 	// GET /status
@@ -693,6 +695,9 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 		coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
 		p2p.AnnounceDeviceKey(r.Context(), h, kidBytes[:8], ed25519.PublicKey(pubBytes))
+		if LogIoT {
+			logx.Info("iot register", "device", req.DeviceID, "node", h.ID().String(), "connected", reg.NonAttesterCount(), "max", limit)
+		}
 		total := reg.Count()
 		nonAtt := reg.NonAttesterCount()
 		accepting := limit == 0 || nonAtt < limit

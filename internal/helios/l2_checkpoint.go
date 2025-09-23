@@ -486,7 +486,9 @@ func (s *L2Service) buildAndBroadcastQC(blockHex string) {
 			_ = s.publish(topicL2QC, by)
 		}
 	}
-	logx.Info("HELIOS L2 QC", "height", meta.height, "hash", short(blockHex), "votes", len(list))
+	if LogL2 {
+		logx.Info("HELIOS L2 QC", "height", meta.height, "hash", short(blockHex), "votes", len(list))
+	}
 }
 
 func (s *L2Service) onQC(data []byte) {
@@ -507,7 +509,9 @@ func (s *L2Service) onQC(data []byte) {
 	if !s.storeQC(blockHex, msg, parentHex) {
 		return
 	}
-	logx.Info("HELIOS L2 QC", "height", msg.Height, "hash", short(blockHex), "votes", len(msg.Votes), "from", msg.CreatedBy)
+	if LogL2 {
+		logx.Info("HELIOS L2 QC", "height", msg.Height, "hash", short(blockHex), "votes", len(msg.Votes), "from", msg.CreatedBy)
+	}
 }
 
 func (s *L2Service) storeQC(blockHex string, qc qcMsg, parentHex string) bool {

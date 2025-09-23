@@ -93,5 +93,7 @@
 - [x] Update simulator to skip attestation logic for telemetry devices
 - [x] Auto-fetch device keys on unknown kid during tx gossip
 - [x] Wire node host into gossip tx admission for key fetch
+- [x] Add logging flags (-log-aion, -log-l1, -log-l2, -log-l3, -log-blocks, -log-http-tx, -log-iot)
+- [x] Gate AION/HELIOS/blockchain/HTTP logs behind flags
 - [x] Investigate IoT handler compilation errors in `internal/p2p/iot.go`
 - [x] Fix IoT handler to call in-package AnnounceDeviceKey with valid context

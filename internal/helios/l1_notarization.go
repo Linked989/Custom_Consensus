@@ -102,7 +102,9 @@ func StartL1(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *aion.Servic
 	// Subscribe to block topic directly to react quickly
 	if tB, err := ps.Join(blockTopicName); err == nil {
 		subB, _ := tB.Subscribe()
-		logx.Info("HELIOS L1 started", "block_topic", blockTopicName, "min_attesters", p.MinAttesters)
+		if LogL1 {
+			logx.Info("HELIOS L1 started", "block_topic", blockTopicName, "min_attesters", p.MinAttesters)
+		}
 		go func() {
 			for {
 				msg, err := subB.Next(ctx)
@@ -147,7 +149,9 @@ func StartL1FromTopic(ctx context.Context, h host.Host, ps *pubsub.PubSub, a *ai
 	// Subscribe to existing block topic
 	if blockTopic != nil {
 		if subB, err := blockTopic.Subscribe(); err == nil {
-			logx.Info("HELIOS L1 started", "block_topic", "(existing)", "min_attesters", p.MinAttesters)
+			if LogL1 {
+				logx.Info("HELIOS L1 started", "block_topic", "(existing)", "min_attesters", p.MinAttesters)
+			}
 			go func() {
 				for {
 					msg, err := subB.Next(ctx)
@@ -201,7 +205,9 @@ func (s *L1Service) OnBlockProposed(ctx context.Context, epoch uint64, height in
 		perr = s.publish(topicL1Attest, by)
 	}
 	if perr == nil {
-		logx.Info("HELIOS L1 attested", "height", height, "epoch", epoch, "hash", short(hex.EncodeToString(hash)))
+		if LogL1 {
+			logx.Info("HELIOS L1 attested", "height", height, "epoch", epoch, "hash", short(hex.EncodeToString(hash)))
+		}
 		// Ensure local aggregation sees our attestation even if pubsub doesn't loop back
 		if s.tNotarize != nil {
 			s.onAttest(s.tNotarize, by)
@@ -263,7 +269,9 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
 	need := s.params.MinAttesters
 	s.mu.Unlock()
 	s.updateAttesters(key, a.Epoch, a.Height, cnt)
-	logx.Info("HELIOS L1 attest received", "epoch", a.Epoch, "height", a.Height, "hash", short(key), "attesters", cnt)
+	if LogL1 {
+		logx.Info("HELIOS L1 attest received", "epoch", a.Epoch, "height", a.Height, "hash", short(key), "attesters", cnt)
+	}
 	if cnt >= need {
 		// Notarize once
 		dt := time.Since(first)
@@ -275,7 +283,9 @@ func (s *L1Service) onAttest(tN *pubsub.Topic, data []byte) {
 		out := l1Notarized{Epoch: a.Epoch, Height: a.Height, Hash: append([]byte(nil), a.Hash...), Count: cnt, Attesters: [][]byte{a.Attester}}
 		by, _ := s.em.Marshal(out)
 		_ = tN.Publish(context.Background(), by)
-		logx.Info("HELIOS L1 NOTARIZED", "epoch", a.Epoch, "height", a.Height, "hash", short(key), "attesters", cnt, "latency_ms", dt.Milliseconds())
+		if LogL1 {
+			logx.Info("HELIOS L1 NOTARIZED", "epoch", a.Epoch, "height", a.Height, "hash", short(key), "attesters", cnt, "latency_ms", dt.Milliseconds())
+		}
 	}
 }
 

@@ -713,10 +713,12 @@ func (s *Service) updateLeader(e uint64) {
 	const cyan = "\x1b[36m"
 	const yellow = "\x1b[33m"
 	const reset = "\x1b[0m"
-	logx.Info(cyan+"AION SCHEDULE"+reset, "epoch", e, "candidates", len(list), "tip_height", tipH)
-	if len(list) > 0 {
-		br16 := binary.BigEndian.Uint16(list[0].rank[0:2])
-		logx.Info(yellow+"leader scheduled"+reset, "epoch", e, "leader_pub", list[0].pubhex, "best_rank16", br16)
+	if LogAION {
+		logx.Info(cyan+"AION SCHEDULE"+reset, "epoch", e, "candidates", len(list), "tip_height", tipH)
+		if len(list) > 0 {
+			br16 := binary.BigEndian.Uint16(list[0].rank[0:2])
+			logx.Info(yellow+"leader scheduled"+reset, "epoch", e, "leader_pub", list[0].pubhex, "best_rank16", br16)
+		}
 	}
 }
 

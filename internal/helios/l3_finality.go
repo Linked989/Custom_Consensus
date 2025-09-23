@@ -610,7 +610,9 @@ func (s *L3Service) RecordDeviceAttestation(blockID []byte, deviceID string) (vo
 	required = requiredDevices(updatedTotal)
 	total = updatedTotal
 	recorded = true
-	logx.Info("helios l3 device attest", "block", shortHex(hexID), "device", shortDevice(deviceID), "votes", votes, "required", required, "total", total)
+	if LogL3 {
+		logx.Info("helios l3 device attest", "block", shortHex(hexID), "device", shortDevice(deviceID), "votes", votes, "required", required, "total", total)
+	}
 	s.maybeFinalizeLocked(hexID, blk)
 	return votes, required, total, true
 }
@@ -670,7 +672,9 @@ func (s *L3Service) onEnvelope(data []byte, from peer.ID) {
 	blk := s.ensureBlock(hexID)
 	blk.envelope = &env
 	blk.status = L3StatusFinal
-	logx.Info("helios l3 finality observed", "block", shortHex(hexID), "height", env.Height, "from", from)
+	if LogL3 {
+		logx.Info("helios l3 finality observed", "block", shortHex(hexID), "height", env.Height, "from", from)
+	}
 }
 
 // RecordDescendantQC updates weight tracking for a block's descendants.
@@ -688,7 +692,9 @@ func (s *L3Service) RecordDescendantQC(blockID []byte, ref ValidatorQCRef) {
 	if s.params.TotalStake > 0 {
 		ratio = blk.qcWeight / s.params.TotalStake
 	}
-	logx.Info("helios l3 qc weight", "block", shortHex(hexID), "weight", blk.qcWeight, "ratio", ratio, "target", s.params.StakeThreshold)
+	if LogL3 {
+		logx.Info("helios l3 qc weight", "block", shortHex(hexID), "weight", blk.qcWeight, "ratio", ratio, "target", s.params.StakeThreshold)
+	}
 	s.maybeFinalizeLocked(hexID, blk)
 }
 
@@ -698,7 +704,9 @@ func (s *L3Service) maybeFinalizeLocked(blockHex string, blk *blockCounters) {
 		blk.envelope = env
 		blk.status = L3StatusFinal
 		total := s.attesterTotalLocked()
-		logx.Info("helios l3 finalized", "block", shortHex(blockHex), "height", blk.height, "cells", len(blk.cells), "device_votes", len(blk.deviceVotes), "device_total", total)
+		if LogL3 {
+			logx.Info("helios l3 finalized", "block", shortHex(blockHex), "height", blk.height, "cells", len(blk.cells), "device_votes", len(blk.deviceVotes), "device_total", total)
+		}
 		s.broadcastEnvelope(env)
 	}
 }
@@ -784,7 +792,9 @@ func (s *L3Service) broadcastEnvelope(env *FinalityEnvelope) {
 		logx.Warn("helios l3 envelope marshal failed", "err", err)
 		return
 	}
-	logx.Info("helios l3 envelope broadcast", "block", shortHex(hex.EncodeToString(env.BlockID)), "height", env.Height, "cells", len(env.CellBitmap))
+	if LogL3 {
+		logx.Info("helios l3 envelope broadcast", "block", shortHex(hex.EncodeToString(env.BlockID)), "height", env.Height, "cells", len(env.CellBitmap))
+	}
 	if err := s.tEnv.Publish(s.ctx, payload); err != nil {
 		logx.Warn("helios l3 envelope publish failed", "err", err)
 	}
