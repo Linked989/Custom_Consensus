@@ -699,9 +699,34 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			http.Error(w, "device_id and block required", http.StatusBadRequest)
 			return
 		}
-		if _, ok := reg.Get(req.DeviceID); !ok {
-			http.Error(w, "device not registered", http.StatusNotFound)
-			return
+		if dev, ok := reg.Get(req.DeviceID); !ok {
+			if iot.IsL3Attester(req.DeviceID) {
+				now := time.Now()
+				dev := iot.Device{
+					DeviceID:  req.DeviceID,
+					Firmware:  "attester",
+					Model:     "l3-attester",
+					Caps:      []string{"attest"},
+					FirstSeen: now,
+					LastSeen:  now,
+				}
+				if err := reg.UpsertWithLimit(dev, 0); err != nil {
+					logx.Warn("auto-register attester failed", "device", req.DeviceID, "err", err)
+					http.Error(w, "device registration failed", http.StatusInternalServerError)
+					return
+				}
+				if svc != nil {
+					svc.UpdateDeviceTotal(iot.CountAttesters(reg))
+				}
+			} else {
+				http.Error(w, "device not registered", http.StatusNotFound)
+				return
+			}
+		} else if iot.IsL3Attester(req.DeviceID) {
+			dev.LastSeen = time.Now()
+			if err := reg.UpsertWithLimit(dev, 0); err != nil {
+				logx.Warn("attester heartbeat update failed", "device", req.DeviceID, "err", err)
+			}
 		}
 		blockID, err := hex.DecodeString(strings.ToLower(req.Block))
 		if err != nil {

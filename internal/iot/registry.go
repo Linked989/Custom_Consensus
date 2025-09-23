@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +13,32 @@ import (
 // IotProto is retained for compatibility with tooling that still references the
 // legacy libp2p registration flow. Servers no longer listen on this protocol.
 const IotProto = "/pose/iot/1.0.0"
+
+// L3AttesterPrefix identifies dedicated L3 attester device IDs.
+const L3AttesterPrefix = "did:iot:l3_attester_"
+
+// IsL3Attester reports whether the provided device ID belongs to an L3 attester.
+func IsL3Attester(id string) bool {
+	trim := strings.TrimSpace(id)
+	if trim == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(trim), L3AttesterPrefix)
+}
+
+// CountAttesters returns the number of L3 attesters in the registry.
+func CountAttesters(reg *Registry) int {
+	if reg == nil {
+		return 0
+	}
+	count := 0
+	for _, dev := range reg.List() {
+		if IsL3Attester(dev.DeviceID) {
+			count++
+		}
+	}
+	return count
+}
 
 // Hello mirrors the historical libp2p registration payload so existing clients
 // can reuse the struct when calling HTTP registration.

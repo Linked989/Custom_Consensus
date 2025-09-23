@@ -62,3 +62,8 @@
 
 - [x] Track dedicated L3 attester count
 - [x] Apply attester-specific quorum thresholds
+
+- [x] Discover L3 attesters across nodes
+- [x] Keep attester totals refreshed dynamically
+
+- [x] Auto-discover L3 attesters without flags

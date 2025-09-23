@@ -30,7 +30,10 @@ const mdnsServiceTag = "pose-simple-mdns"
 const heartbeatTopic = "pose/heartbeat/1.0.0"
 const txTopicDefault = "pose/tx/1.0.0"
 const networkTopic = "pose/network/status/1.0.0"
-const l3AttesterPrefix = "did:iot:l3_attester_"
+const (
+	attesterQueryInterval = 12 * time.Second
+	attesterRetention     = 2 * time.Minute
+)
 
 func main() {
 	// Flags
@@ -397,17 +400,19 @@ func main() {
 		}()
 	}
 	if l3svc != nil && devReg != nil {
-		l3svc.UpdateDeviceTotal(countL3Attesters(devReg))
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
+		total := syncAttesterRegistry(devReg, discoverAttesters(devReg))
+		l3svc.UpdateDeviceTotal(total)
+		go func(initial int) {
+			ticker := time.NewTicker(attesterQueryInterval)
 			defer ticker.Stop()
-			lastDevices := -1
+			lastDevices := initial
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					total := countL3Attesters(devReg)
+					ids := discoverAttesters(devReg)
+					total := syncAttesterRegistry(devReg, ids)
 					if total == lastDevices {
 						continue
 					}
@@ -415,7 +420,7 @@ func main() {
 					l3svc.UpdateDeviceTotal(total)
 				}
 			}
-		}()
+		}(total)
 	}
 	// Always start builder; AllowProduceSlot gates production to elected leader.
 	{
@@ -501,18 +506,65 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return fmt.Sprint([]string(*m)) }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
-func countL3Attesters(reg *iot.Registry) int {
+func discoverAttesters(reg *iot.Registry) []string {
+	if reg == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var ids []string
+	for _, dev := range reg.List() {
+		id := strings.TrimSpace(dev.DeviceID)
+		if id == "" {
+			continue
+		}
+		if !iot.IsL3Attester(id) {
+			continue
+		}
+		if !dev.LastSeen.IsZero() && time.Since(dev.LastSeen) > attesterRetention {
+			continue
+		}
+		low := strings.ToLower(id)
+		if _, ok := seen[low]; ok {
+			continue
+		}
+		seen[low] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func syncAttesterRegistry(reg *iot.Registry, ids []string) int {
 	if reg == nil {
 		return 0
 	}
-	count := 0
-	for _, dev := range reg.List() {
-		id := strings.ToLower(dev.DeviceID)
-		if strings.HasPrefix(id, l3AttesterPrefix) {
-			count++
+	desired := make(map[string]string, len(ids))
+	for _, id := range ids {
+		low := strings.ToLower(id)
+		desired[low] = id
+		if _, ok := reg.Get(id); ok {
+			continue
+		}
+		dev := iot.Device{
+			DeviceID:  id,
+			Firmware:  "attester",
+			Model:     "l3-attester",
+			Caps:      []string{"attest"},
+			FirstSeen: time.Now(),
+			LastSeen:  time.Now(),
+		}
+		if err := reg.UpsertWithLimit(dev, 0); err != nil {
+			logx.Warn("attester registry update failed", "id", id, "err", err)
 		}
 	}
-	return count
+	for _, dev := range reg.List() {
+		low := strings.ToLower(dev.DeviceID)
+		if iot.IsL3Attester(dev.DeviceID) {
+			if _, ok := desired[low]; !ok {
+				reg.Remove(dev.DeviceID)
+			}
+		}
+	}
+	return len(desired)
 }
 
 // -------- Swarm key helpers (pnet) --------

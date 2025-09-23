@@ -29,6 +29,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"pose/internal/gossip"
+	"pose/internal/iot"
 	"pose/internal/p2p"
 )
 
@@ -229,10 +230,9 @@ func main() {
 			log.Fatalf("keygen: %v", err)
 		}
 		kid := kidFromPub(pub)
-		prefix := fmt.Sprintf("l3_attester_%03d", i)
 		// Dedicated attesters only perform L3 validation duties.
 		devs = append(devs, device{
-			id:         fmt.Sprintf("did:iot:%s-%x", prefix, kid),
+			id:         fmt.Sprintf("%s%03d-%x", iot.L3AttesterPrefix, i, kid),
 			pub:        pub,
 			priv:       priv,
 			kid:        kid,
