@@ -133,6 +133,10 @@ func main() {
 	list := flag.Bool("list", false, "list devices from first HTTP node and exit")
 	topicName := flag.String("topic", txTopicDefault, "pubsub topic for COSE telemetry")
 	pnetPath := flag.String("pnet", "", "path to swarm.key for private network")
+	orchInterval := flag.Duration("orchestrator-interval", 2*time.Second, "interval between orchestrator coordination passes")
+	orchMinNodes := flag.Int("orchestrator-min-nodes", 2, "minimum nodes before devices attempt registration")
+	orchMinAccepting := flag.Int("orchestrator-min-accepting", 1, "minimum accepting nodes to distribute devices")
+	orchRefresh := flag.Duration("orchestrator-refresh", 15*time.Second, "how often to refresh node capacity snapshots")
 	flag.Parse()
 
 	if len(nodes) == 0 {
@@ -213,9 +217,35 @@ func main() {
 		}
 	}
 	log.Printf("initialized %d devices", *devices)
+	devPtrs := make([]*device, len(devs))
+	for i := range devs {
+		devs[i].baseOffset = i
+		devPtrs[i] = &devs[i]
+	}
 
 	reg := newRegistrar(h, book, client, *chain, endpoints)
 	reg.start(ctx)
+	orchPlan, err := runOrchestrator(orchestratorConfig{
+		ctx:         ctx,
+		client:      client,
+		host:        h,
+		book:        book,
+		nodes:       endpoints,
+		minNodes:    *orchMinNodes,
+		minAccept:   *orchMinAccepting,
+		interval:    *orchInterval,
+		refresh:     *orchRefresh,
+		reg:         reg,
+		deviceCount: len(devPtrs),
+	})
+	if err != nil {
+		log.Printf("orchestrator warning: %v", err)
+	}
+	if len(orchPlan) > 0 {
+		for i, d := range devPtrs {
+			d.baseOffset = orchPlan[i%len(orchPlan)]
+		}
+	}
 
 	var wg sync.WaitGroup
 	for i := range devs {
@@ -508,6 +538,20 @@ type regResult struct {
 	retry    time.Duration
 }
 
+type orchestratorConfig struct {
+	ctx         context.Context
+	client      *http.Client
+	host        host.Host
+	book        *addrBook
+	nodes       []*nodeEndpoint
+	minNodes    int
+	minAccept   int
+	interval    time.Duration
+	refresh     time.Duration
+	reg         *registrar
+	deviceCount int
+}
+
 type registrar struct {
 	host      host.Host
 	book      *addrBook
@@ -515,6 +559,8 @@ type registrar struct {
 	chain     string
 	endpoints []*nodeEndpoint
 	reqCh     chan regRequest
+	prefMu    sync.RWMutex
+	pref      []int
 }
 
 func newRegistrar(h host.Host, book *addrBook, client *http.Client, chain string, endpoints []*nodeEndpoint) *registrar {
@@ -557,6 +603,50 @@ func (r *registrar) Register(ctx context.Context, d *device) (regResult, bool) {
 	}
 }
 
+func (r *registrar) setPreferred(order []int) {
+	r.prefMu.Lock()
+	r.pref = append([]int(nil), order...)
+	r.prefMu.Unlock()
+}
+
+func (r *registrar) orderFor(base int) []int {
+	max := len(r.endpoints)
+	if max == 0 {
+		return nil
+	}
+	r.prefMu.RLock()
+	pref := append([]int(nil), r.pref...)
+	r.prefMu.RUnlock()
+	if len(pref) == 0 {
+		return rotateIndices(max, base)
+	}
+	seen := make(map[int]struct{}, len(pref))
+	ordered := make([]int, 0, max)
+	start := 0
+	if len(pref) > 0 && max > 0 {
+		start = base % len(pref)
+	}
+	for i := 0; i < len(pref); i++ {
+		idx := pref[(start+i)%len(pref)]
+		if idx < 0 || idx >= max {
+			continue
+		}
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		ordered = append(ordered, idx)
+	}
+	for _, idx := range rotateIndices(max, base) {
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		ordered = append(ordered, idx)
+	}
+	return ordered
+}
+
 func (r *registrar) handle(d *device) regResult {
 	req := httpRegisterRequest{
 		DeviceID: d.id,
@@ -570,7 +660,7 @@ func (r *registrar) handle(d *device) regResult {
 	}
 
 	delay := discoveryRetry
-	order := rotateIndices(len(r.endpoints), d.baseOffset)
+	order := r.orderFor(d.baseOffset)
 	limitHits := 0
 	attempts := 0
 	blocked := 0
@@ -652,6 +742,185 @@ func (r *registrar) handle(d *device) regResult {
 	}
 
 	return regResult{ok: false, fallback: false, retry: delay}
+}
+
+type nodeCapacity struct {
+	idx       int
+	label     string
+	nodeID    string
+	connected int
+	max       int
+	accepting bool
+	addrs     []string
+	err       error
+}
+
+func runOrchestrator(cfg orchestratorConfig) ([]int, error) {
+	ctx := cfg.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cfg.interval <= 0 {
+		cfg.interval = 2 * time.Second
+	}
+	if cfg.refresh <= 0 {
+		cfg.refresh = cfg.interval
+	}
+	if cfg.minNodes <= 0 {
+		cfg.minNodes = 1
+	}
+	if cfg.minAccept <= 0 {
+		cfg.minAccept = 1
+	}
+	ticker := time.NewTicker(cfg.interval)
+	defer ticker.Stop()
+	var (
+		lastFetch  time.Time
+		states     []nodeCapacity
+		lastNodes  int
+		lastAccept int
+	)
+	for {
+		if states == nil || time.Since(lastFetch) >= cfg.refresh {
+			now := time.Now()
+			states = fetchCapacities(ctx, cfg.client, cfg.nodes)
+			lastFetch = now
+			if cfg.book != nil && cfg.host != nil {
+				for _, st := range states {
+					if st.err != nil || len(st.addrs) == 0 {
+						continue
+					}
+					if newAddrs := cfg.book.add(st.addrs); len(newAddrs) > 0 {
+						p2p.ConnectToAddrs(cfg.host, newAddrs)
+					}
+				}
+			}
+		}
+		success := make([]nodeCapacity, 0, len(states))
+		for _, st := range states {
+			if st.err == nil {
+				success = append(success, st)
+			}
+		}
+		totalNodes := len(success)
+		accepting := make([]nodeCapacity, 0, len(success))
+		for _, st := range success {
+			if st.accepting {
+				accepting = append(accepting, st)
+			}
+		}
+		if totalNodes != lastNodes || len(accepting) != lastAccept {
+			log.Printf("orchestrator check: nodes=%d accepting=%d devices=%d", totalNodes, len(accepting), cfg.deviceCount)
+			lastNodes = totalNodes
+			lastAccept = len(accepting)
+		}
+		if totalNodes >= cfg.minNodes && len(accepting) >= cfg.minAccept && len(accepting) > 0 {
+			order := rankNodes(accepting)
+			if cfg.reg != nil {
+				cfg.reg.setPreferred(order)
+			}
+			log.Printf("orchestrator ready: using %d nodes", len(order))
+			return order, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func rankNodes(nodes []nodeCapacity) []int {
+	if len(nodes) == 0 {
+		return nil
+	}
+	copyNodes := append([]nodeCapacity(nil), nodes...)
+	sort.Slice(copyNodes, func(i, j int) bool {
+		iSlots := slotsLeft(copyNodes[i].max, copyNodes[i].connected)
+		jSlots := slotsLeft(copyNodes[j].max, copyNodes[j].connected)
+		if iSlots == jSlots {
+			return copyNodes[i].label < copyNodes[j].label
+		}
+		return iSlots > jSlots
+	})
+	order := make([]int, 0, len(copyNodes))
+	for _, st := range copyNodes {
+		order = append(order, st.idx)
+	}
+	return order
+}
+
+func slotsLeft(max, connected int) int {
+	if max <= 0 {
+		return 1 << 20
+	}
+	if connected >= max {
+		return 0
+	}
+	return max - connected
+}
+
+func fetchCapacities(ctx context.Context, client *http.Client, nodes []*nodeEndpoint) []nodeCapacity {
+	out := make([]nodeCapacity, len(nodes))
+	for i, ep := range nodes {
+		out[i] = pullCapacity(ctx, client, ep, i)
+	}
+	return out
+}
+
+func pullCapacity(ctx context.Context, client *http.Client, ep *nodeEndpoint, idx int) nodeCapacity {
+	info := nodeCapacity{idx: idx}
+	if ep == nil {
+		info.err = fmt.Errorf("missing endpoint")
+		return info
+	}
+	info.label = ep.label()
+	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, requestURL(ep.base, "/iot/capacity"), nil)
+	if err != nil {
+		info.err = err
+		return info
+	}
+	cli := client
+	if cli == nil {
+		cli = http.DefaultClient
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		info.err = err
+		return info
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		info.err = fmt.Errorf("capacity status %s", resp.Status)
+		return info
+	}
+	var payload struct {
+		OK        bool     `json:"ok"`
+		NodeID    string   `json:"node_id"`
+		Connected int      `json:"connected"`
+		Max       int      `json:"max_devices"`
+		Accepting bool     `json:"accepting"`
+		Addrs     []string `json:"p2p_addrs"`
+		Error     string   `json:"error"`
+		Message   string   `json:"message"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		info.err = err
+		return info
+	}
+	if !payload.OK {
+		msg := firstNonEmpty(payload.Message, payload.Error, "node unavailable")
+		info.err = fmt.Errorf(msg)
+		return info
+	}
+	info.nodeID = payload.NodeID
+	info.connected = payload.Connected
+	info.max = payload.Max
+	info.accepting = payload.Accepting
+	info.addrs = payload.Addrs
+	return info
 }
 
 func loadSwarmKey(path string) ([]byte, error) {

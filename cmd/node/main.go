@@ -23,7 +23,6 @@ import (
 	"pose/internal/iot"
 	"pose/internal/logx"
 	"pose/internal/mempool"
-	"pose/internal/orchestrator"
 	"pose/internal/p2p"
 )
 
@@ -282,25 +281,29 @@ func main() {
 		logx.Info("http api", "listen", *httpIn)
 	}
 
-	orch := orchestrator.Start(orchestrator.Config{
-		Context:       ctx,
-		Host:          h,
-		Members:       members,
-		Directory:     directory,
-		Registry:      devReg,
-		Cells:         cellMgr,
-		CellThreshold: cellThreshold,
-		MinNodes:      3,
-		MinPeers:      1,
-		Interval:      time.Second,
-		RegisterCell:  registerCell,
-	})
-	defer orch.Stop()
-
-	select {
-	case <-orch.Ready():
-	case <-ctx.Done():
-		return
+	// Preflight: ensure at least 2 nodes present and minimum devices are connected locally
+	// before starting blockchain services. Log progress while waiting.
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		total := members.CountAndSweep()
+		peers := len(h.Network().Peers())
+		devs := devReg.List()
+		haveNodes := total >= 3 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
+		haveDevices := len(devs) >= cellThreshold
+		if haveDevices {
+			if c := cellMgr.TryForm(devReg); c != nil && c.Active {
+				// formed; proceed to node start after both conditions satisfied
+				registerCell(c)
+			}
+		}
+		if haveNodes && haveDevices {
+			logx.Info("preflight Ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "cell_threshold", cellThreshold)
+			break
+		}
+		logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", cellThreshold)
+		time.Sleep(1 * time.Second)
 	}
 
 	// AION network service (commit/reveal/VRF + selection); enabled by default
