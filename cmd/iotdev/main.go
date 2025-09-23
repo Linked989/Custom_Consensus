@@ -7,33 +7,24 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	cbor "github.com/fxamacker/cbor/v2"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-
-	"pose/internal/coseutil"
-	"pose/internal/gossip"
-	"pose/internal/iot"
-	"pose/internal/p2p"
 )
 
+// Deterministic CBOR mode (matches server).
 var encMode cbor.EncMode
 
 func init() {
@@ -42,479 +33,270 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-const (
-	joinRetry       = 5 * time.Minute
-	discoveryRetry  = 5 * time.Second
-	txTopicDefault  = "pose/tx/1.0.0"
-	defaultFirmware = "1.0.0"
-	defaultModel    = "sim-sensor"
-)
-
 type device struct {
-	id           string
-	pub          ed25519.PublicKey
-	priv         ed25519.PrivateKey
-	kid          []byte
-	seq          uint64
-	attester     bool
-	assigned     peer.ID
-	assignedNode string
-	assignedBase string
-	fallback     bool
-	registered   bool
-	nextJoin     time.Time
-	baseOffset   int
-	lastAttested string
-}
-
-type addrBook struct {
-	mu    sync.RWMutex
-	addrs map[string]struct{}
-}
-
-func newAddrBook() *addrBook { return &addrBook{addrs: make(map[string]struct{})} }
-
-func (ab *addrBook) add(addrs []string) []string {
-	ab.mu.Lock()
-	defer ab.mu.Unlock()
-	var fresh []string
-	for _, addr := range addrs {
-		addr = strings.TrimSpace(addr)
-		if addr == "" {
-			continue
-		}
-		if _, ok := ab.addrs[addr]; ok {
-			continue
-		}
-		ab.addrs[addr] = struct{}{}
-		fresh = append(fresh, addr)
-	}
-	return fresh
-}
-
-func (ab *addrBook) list() []string {
-	ab.mu.RLock()
-	defer ab.mu.RUnlock()
-	out := make([]string, 0, len(ab.addrs))
-	for addr := range ab.addrs {
-		out = append(out, addr)
-	}
-	sort.Strings(out)
-	return out
-}
-
-type httpRegisterRequest struct {
-	DeviceID string   `json:"device_id"`
-	Firmware string   `json:"firmware,omitempty"`
-	Model    string   `json:"model,omitempty"`
-	Kid      string   `json:"kid,omitempty"`
-	Pub      string   `json:"pub"`
-	Sensors  []string `json:"sensors,omitempty"`
-	Caps     []string `json:"caps,omitempty"`
-	ChainID  string   `json:"chain_id,omitempty"`
-}
-
-type httpRegisterResponse struct {
-	OK         bool     `json:"ok"`
-	Error      string   `json:"error,omitempty"`
-	Message    string   `json:"message,omitempty"`
-	NodeID     string   `json:"node_id,omitempty"`
-	Connected  int      `json:"connected,omitempty"`
-	MaxDevices int      `json:"max_devices,omitempty"`
-	Accepting  bool     `json:"accepting,omitempty"`
-	P2PAddrs   []string `json:"p2p_addrs,omitempty"`
+	id   string
+	pub  ed25519.PublicKey
+	priv ed25519.PrivateKey
+	kid  []byte
+	seq  uint64
 }
 
 func main() {
-	listen := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr")
-	var peers multiFlag
-	flag.Var(&peers, "peer", "target node multiaddr (repeatable)")
-	var nodes multiFlag
-	flag.Var(&nodes, "node", "node HTTP base URL for registration (repeatable)")
+	// Flags
+	base := flag.String("base", "http://localhost:14000", "default base URL (no trailing slash); used for TX unless -tx-base provided")
+	txBase := flag.String("tx-base", "", "HTTP base URL to POST /tx and /keys/register (defaults to -base)")
+	regBasesCSV := flag.String("reg-bases", "", "comma-separated HTTP base URLs for /iot/register assignment (defaults to -base)")
+	regCapsCSV := flag.String("reg-caps", "", "comma-separated caps per -reg-bases (0=unlimited). Example: 3,0 means first base gets up to 3, rest unlimited on second")
 	chain := flag.String("chain", "iotnet-main", "chain/network id")
-	devices := flag.Int("devices", 5, "number of simulated devices")
-	l3Attesters := flag.Int("l3-attesters", 0, "number of dedicated L3 attester devices")
+	n := flag.Int("devices", 5, "number of simulated devices")
 	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
-	attesterInterval := flag.Duration("l3-attester-interval", 150*time.Millisecond, "send interval per L3 attester")
 	jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
 	once := flag.Bool("once", false, "send just one reading per device then exit")
-	list := flag.Bool("list", false, "list devices from first HTTP node and exit")
-	topicName := flag.String("topic", txTopicDefault, "pubsub topic for COSE telemetry")
-	pnetPath := flag.String("pnet", "", "path to swarm.key for private network")
-	orchInterval := flag.Duration("orchestrator-interval", 2*time.Second, "interval between orchestrator coordination passes")
-	orchMinNodes := flag.Int("orchestrator-min-nodes", 2, "minimum nodes before devices attempt registration")
-	orchMinAccepting := flag.Int("orchestrator-min-accepting", 1, "minimum accepting nodes to distribute devices")
-	orchRefresh := flag.Duration("orchestrator-refresh", 15*time.Second, "how often to refresh node capacity snapshots")
+	list := flag.Bool("list", false, "list devices connected to the node and exit")
 	flag.Parse()
 
-	if len(nodes) == 0 {
-		log.Fatalf("at least one -node HTTP address is required")
-	}
-	endpoints := make([]*nodeEndpoint, len(nodes))
-	for i, base := range nodes {
-		endpoints[i] = newNodeEndpoint(base)
-	}
-
+	// Context and signals
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	var psk []byte
-	if *pnetPath != "" {
-		key, err := loadSwarmKey(*pnetPath)
-		if err != nil {
-			log.Fatalf("pnet: %v", err)
-		}
-		psk = key
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	book := newAddrBook()
-	if newAddrs := book.add([]string(peers)); len(newAddrs) > 0 {
-		log.Printf("seeded %d libp2p peers from flags", len(newAddrs))
-	}
-
-	p2p.SetChainID(*chain)
-	h, err := p2p.NewHost(*listen, psk)
-	if err != nil {
-		log.Fatalf("host: %v", err)
-	}
-	defer h.Close()
-
-	log.Printf("host id=%s", h.ID())
-	for _, a := range h.Addrs() {
-		log.Printf("listen %s/p2p/%s", a.String(), h.ID())
-	}
-
-	p2p.RegisterHelloHandler(h)
-	if existing := book.list(); len(existing) > 0 {
-		p2p.ConnectToAddrs(h, existing)
-	}
-
-	ps, err := gossip.InitPubSub(ctx, h)
-	if err != nil {
-		log.Fatalf("pubsub: %v", err)
-	}
-	txTopic, err := ps.Join(*topicName)
-	if err != nil {
-		log.Fatalf("topic join: %v", err)
-	}
-	defer txTopic.Close()
-
 	if *list {
-		if err := listDevicesHTTP(ctx, client, endpoints[0].base); err != nil {
+		if err := listDevices(ctx, *base); err != nil {
 			log.Fatalf("list: %v", err)
 		}
 		return
 	}
 
-	totalDevices := *devices + *l3Attesters
-	devs := make([]device, 0, totalDevices)
-	for i := 0; i < *devices; i++ {
+	// Resolve TX and registration bases
+	regBases := parseCSV(*regBasesCSV)
+	if len(regBases) == 0 {
+		regBases = []string{strings.TrimRight(*base, "/")}
+	}
+	if *txBase == "" {
+		*txBase = strings.TrimRight(*base, "/")
+	} else {
+		*txBase = strings.TrimRight(*txBase, "/")
+	}
+	regCaps := parseCaps(*regCapsCSV, len(regBases))
+
+	// Create devices and register
+	devs := make([]device, *n)
+	assign := planAssignments(*n, regBases, regCaps)
+	for i := 0; i < *n; i++ {
 		pub, priv, err := ed25519.GenerateKey(crand.Reader)
 		if err != nil {
 			log.Fatalf("keygen: %v", err)
 		}
-		kid := coseutil.KidFromPub(pub)
-		devs = append(devs, device{
-			id:         fmt.Sprintf("did:iot:SIM-%x", kid),
-			pub:        pub,
-			priv:       priv,
-			kid:        kid,
-			seq:        0,
-			nextJoin:   time.Now(),
-			baseOffset: len(devs),
-		})
-	}
-	for i := 0; i < *l3Attesters; i++ {
-		pub, priv, err := ed25519.GenerateKey(crand.Reader)
-		if err != nil {
-			log.Fatalf("keygen: %v", err)
+		kid := kidFromPub(pub)
+		id := fmt.Sprintf("did:iot:SIM-%x", kid)
+		devs[i] = device{id: id, pub: pub, priv: priv, kid: kid, seq: 0}
+		// Register device to assigned registration base for cell membership
+		regBase := assign[i]
+		if err := registerDevice(ctx, regBase, devs[i]); err != nil {
+			log.Fatalf("register %d at %s: %v", i+1, regBase, err)
 		}
-		kid := coseutil.KidFromPub(pub)
-		// Dedicated attesters only perform L3 validation duties.
-		devs = append(devs, device{
-			id:         fmt.Sprintf("%s%03d-%x", iot.L3AttesterPrefix, i, kid),
-			pub:        pub,
-			priv:       priv,
-			kid:        kid,
-			seq:        0,
-			nextJoin:   time.Now(),
-			baseOffset: len(devs),
-			attester:   true,
-		})
-	}
-	log.Printf("initialized %d devices (%d telemetry, %d L3 attesters)", len(devs), *devices, *l3Attesters)
-	devPtrs := make([]*device, len(devs))
-	for i := range devs {
-		devs[i].baseOffset = i
-		devPtrs[i] = &devs[i]
-	}
-
-	reg := newRegistrar(h, book, client, *chain, endpoints)
-	reg.start(ctx)
-	orchPlan, err := runOrchestrator(orchestratorConfig{
-		ctx:         ctx,
-		client:      client,
-		host:        h,
-		book:        book,
-		nodes:       endpoints,
-		minNodes:    *orchMinNodes,
-		minAccept:   *orchMinAccepting,
-		interval:    *orchInterval,
-		refresh:     *orchRefresh,
-		reg:         reg,
-		deviceCount: len(devPtrs),
-	})
-	if err != nil {
-		log.Printf("orchestrator warning: %v", err)
-	}
-	if len(orchPlan) > 0 {
-		for i, d := range devPtrs {
-			d.baseOffset = orchPlan[i%len(orchPlan)]
+		// Also register key on TX node so this device can send TXs there regardless of cell
+		if err := registerKey(ctx, *txBase, devs[i]); err != nil {
+			log.Fatalf("register key %d at %s: %v", i+1, *txBase, err)
 		}
 	}
+	log.Printf("registered %d devices (cell assign=%v) and keys on tx-base=%s", *n, summarizeAssignments(assign), *txBase)
 
+	// Start senders
 	var wg sync.WaitGroup
 	for i := range devs {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			runDevice(ctx, txTopic, reg, client, *chain, interval, jitter, attesterInterval, once, d)
+			cli := &http.Client{Timeout: 5 * time.Second}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				// Build COSE tx and POST /tx (always to tx-base)
+				d.seq++
+				cose, txid, err := buildCOSE(d.priv, d.kid, *chain, d.id, d.seq)
+				if err != nil {
+					log.Printf("build error (%s): %v", d.id, err)
+					return
+				}
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, *txBase+"/tx", bytes.NewReader(cose))
+				req.Header.Set("Content-Type", "application/cbor")
+
+				// Retry until success or context canceled.
+				resp, err := doHTTPWithRetry(ctx, cli, req)
+				if err != nil {
+					// Happens on context cancellation; exit cleanly.
+					log.Printf("post aborted (%s): %v", d.id, err)
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				log.Printf("sent device=%s txid=%s status=%s", short(d.id), txid[:12], resp.Status)
+
+				if *once {
+					return
+				}
+				// Sleep with jitter
+				delay := *interval + time.Duration(rand.Int63n(int64(*jitter)))
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+				}
+			}
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client *http.Client, chain string, interval, jitter, attesterInterval *time.Duration, once *bool, d *device) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+func registerDevice(ctx context.Context, base string, d device) error {
+	// HTTP: POST /iot/register {device_id, firmware, model, kid, pub}
+	body := fmt.Sprintf(`{"device_id":"%s","firmware":"1.0.0","model":"sim-sensor","kid":"%s","pub":"%s","sensors":["temp","humidity"],"caps":["push"]}`,
+		d.id, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/iot/register", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	cli := &http.Client{Timeout: 5 * time.Second}
 
-		if (!d.registered || d.fallback) && time.Now().After(d.nextJoin) {
-			res, ok := reg.Register(ctx, d)
-			if !ok {
-				return
-			}
-			retry := res.retry
-			if retry <= 0 {
-				retry = joinRetry
-			}
-			d.nextJoin = time.Now().Add(retry)
-			if res.ok {
-				if res.fallback {
-					log.Printf("device=%s fallback mode active", short(d.id))
-				} else {
-					log.Printf("device=%s registered via node=%s", short(d.id), d.assignedNode)
-				}
-			} else {
-				log.Printf("device=%s retry register in %s", short(d.id), retry)
-			}
-		}
-		if !d.registered {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
-			}
-			continue
-		}
-
-		if !d.attester {
-			d.seq++
-			cose, txid, err := buildCOSE(d.priv, d.kid, chain, d.id, d.seq)
-			if err != nil {
-				log.Printf("build error (%s): %v", short(d.id), err)
-				continue
-			}
-			sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err = topic.Publish(sendCtx, cose)
-			cancel()
-			if err != nil {
-				log.Printf("publish failed (%s): %v", short(d.id), err)
-				d.registered = false
-				d.nextJoin = time.Now().Add(discoveryRetry)
-				continue
-			}
-			if d.assignedNode != "" {
-				log.Printf("sent device=%s node=%s txid=%s", short(d.id), d.assignedNode, txid[:12])
-			} else if d.fallback {
-				log.Printf("sent device=%s node=fallback txid=%s", short(d.id), txid[:12])
-			} else {
-				log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
-			}
-		}
-		if client != nil && d.assignedBase != "" {
-			loops := 1
-			if d.attester {
-				loops = 3
-			}
-			for i := 0; i < loops; i++ {
-				next, votes, required, total, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested)
-				if err != nil {
-					if !d.attester {
-						log.Printf("attest failed (device %s): %v", short(d.id), err)
-					}
-					break
-				}
-				if next == "" || next == d.lastAttested {
-					break
-				}
-				if !d.attester {
-					log.Printf("attested device=%s block=%s votes=%d/%d total_devices=%d", short(d.id), short(next), votes, required, total)
-				}
-				d.lastAttested = next
-			}
-		}
-		if *once && !d.attester {
-			return
-		}
-		delay := *interval
-		if d.attester {
-			delay = time.Second
-			if attesterInterval != nil && *attesterInterval > 0 {
-				delay = *attesterInterval
-			}
-		} else if jitter != nil && *jitter > 0 {
-			delay += time.Duration(rand.Int63n(int64(*jitter)))
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(delay):
-		}
-	}
-}
-
-func httpRegisterDevice(ctx context.Context, client *http.Client, base string, req httpRegisterRequest) (httpRegisterResponse, error) {
-	var resp httpRegisterResponse
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return resp, err
-	}
-	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, requestURL(base, "/iot/register"), bytes.NewReader(payload))
-	if err != nil {
-		return resp, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpResp, err := client.Do(httpReq)
-	if err != nil {
-		return resp, err
-	}
-	defer httpResp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
-	if err != nil {
-		return resp, err
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return resp, err
-	}
-	if !resp.OK && httpResp.StatusCode >= 400 && resp.Error == "" {
-		resp.Error = httpResp.Status
-	}
-	return resp, nil
-}
-
-func listDevicesHTTP(ctx context.Context, client *http.Client, base string) error {
-	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, requestURL(base, "/iot/devices"), nil)
+	resp, err := doHTTPWithRetry(ctx, cli, req)
 	if err != nil {
 		return err
 	}
-	resp, err := client.Do(req)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status %s", resp.Status)
+	}
+	return nil
+}
+
+func registerKey(ctx context.Context, base string, d device) error {
+	// HTTP: POST /keys/register {kid: hex, pub: hex}
+	body := fmt.Sprintf(`{"kid":"%s","pub":"%s"}`, hex.EncodeToString(d.kid), hex.EncodeToString(d.pub))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/keys/register", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	cli := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := doHTTPWithRetry(ctx, cli, req)
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status %s", resp.Status)
+	}
+	return nil
+}
+
+func listDevices(ctx context.Context, base string) error {
+	cli := &http.Client{Timeout: 5 * time.Second}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/iot/devices", nil)
+	resp, err := doHTTPWithRetry(ctx, cli, req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status %s", resp.Status)
 	}
-	fmt.Println(string(body))
+	io.Copy(os.Stdout, resp.Body)
 	return nil
 }
 
-func requestURL(base, path string) string {
-	trim := strings.TrimRight(base, "/")
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-	return trim + path
-}
+// --- Retry machinery ---
 
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return v
+func retryable(resp *http.Response, err error) bool {
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) {
+			return true // timeouts, temporary, etc.
 		}
+		msg := strings.ToLower(err.Error())
+		// Canonical dial/transport failures worth retrying.
+		if strings.Contains(msg, "connection refused") ||
+			strings.Contains(msg, "dial tcp") ||
+			strings.Contains(msg, "no such host") ||
+			strings.Contains(msg, "connection reset") ||
+			strings.Contains(msg, "tls handshake timeout") ||
+			strings.Contains(msg, "server misbehaving") {
+			return true
+		}
+		return false
 	}
-	return ""
+	// Retry on 425/429/5xx
+	if resp.StatusCode == 425 || resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode <= 599) {
+		return true
+	}
+	return false
 }
 
-func nodeHost(base string) string {
-	u, err := url.Parse(base)
+func doHTTPWithRetry(ctx context.Context, cli *http.Client, req *http.Request) (*http.Response, error) {
+	const (
+		base   = 500 * time.Millisecond
+		max    = 30 * time.Second
+		factor = 2.0
+	)
+	backoff := base
+
+	for attempt := 0; ; attempt++ {
+		// Ensure the request carries the latest context on each attempt.
+		r := req.Clone(ctx)
+		resp, err := cli.Do(r)
+		if !retryable(resp, err) {
+			return resp, err
+		}
+		// Drain/close on retry to free connection.
+		if resp != nil && resp.Body != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		log.Printf("retrying %s %s (attempt=%d, next=%s): %s",
+			req.Method, req.URL.String(), attempt+1, backoff, errOrStatus(err, resp))
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff + time.Duration(rand.Int63n(int64(backoff/2)))):
+		}
+
+		// Exponential backoff with cap.
+		next := time.Duration(float64(backoff) * factor)
+		if next > max {
+			next = max
+		}
+		backoff = next
+	}
+}
+
+func errOrStatus(err error, resp *http.Response) string {
 	if err != nil {
-		return base
+		return err.Error()
 	}
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		return host
+	if resp != nil {
+		return resp.Status
 	}
-	parts := strings.Split(host, ":")
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return host
+	return "unknown"
 }
 
-func nodePort(base string) string {
-	u, err := url.Parse(base)
-	if err != nil {
-		return ""
-	}
-	if p := u.Port(); p != "" {
-		return p
-	}
-	switch u.Scheme {
-	case "https":
-		return "443"
-	case "http":
-		return "80"
-	default:
-		return ""
-	}
-}
-
-func rotateIndices(length, offset int) []int {
-	if length == 0 {
-		return nil
-	}
-	out := make([]int, length)
-	for i := 0; i < length; i++ {
-		out[i] = (offset + i) % length
-	}
-	return out
-}
+// --- Payload/COSE ---
 
 func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID string, seq uint64) ([]byte, string, error) {
 	payload := map[int]interface{}{
 		0: int64(1),
 		1: chain,
 		2: "data",
-		3: map[int]interface{}{0: deviceID, 1: defaultFirmware, 2: "ed25519:DEV"},
+		3: map[int]interface{}{0: deviceID, 1: "1.0.0", 2: "ed25519:SIM"},
 		4: int64(seq),
 		5: time.Now().UTC(),
 		6: map[int]interface{}{0: int64(25), 1: "uCR"},
 		7: []interface{}{randBytes(7), randBytes(7)},
 		8: map[int]interface{}{
 			0: "urn:example:sensor:v1",
-			1: map[string]interface{}{"temp_c": 21.5, "humidity": 0.45},
+			1: map[string]interface{}{"temp_c": 18 + rand.Float64()*8, "humidity": 0.35 + rand.Float64()*0.25},
 			2: map[string]interface{}{"gps": []interface{}{52.520008, 13.404954, 8.0}, "site": "plant-berlin-a"},
 			3: randBytes(6),
 		},
@@ -544,555 +326,94 @@ func buildCOSE(priv ed25519.PrivateKey, kid []byte, chain string, deviceID strin
 	return out, hex.EncodeToString(txid[:]), nil
 }
 
+// --- Misc helpers ---
+
+func kidFromPub(pub ed25519.PublicKey) []byte { sum := sha256.Sum256(pub); return sum[:8] }
+
 func randBytes(n int) []byte { b := make([]byte, n); io.ReadFull(crand.Reader, b); return b }
 
 func short(s string) string {
-	if len(s) <= 12 {
-		return s
+	if len(s) > 12 {
+		return s[len(s)-12:]
 	}
-	return s[:12]
+	return s
 }
 
-type multiFlag []string
-
-func (m *multiFlag) String() string     { return fmt.Sprint([]string(*m)) }
-func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
-
-type nodeEndpoint struct {
-	base    string
-	host    string
-	port    string
-	retryAt time.Time
-}
-
-func newNodeEndpoint(base string) *nodeEndpoint {
-	host := nodeHost(base)
-	port := nodePort(base)
-	return &nodeEndpoint{base: base, host: host, port: port}
-}
-
-func (n *nodeEndpoint) label() string {
-	if n == nil {
-		return ""
-	}
-	if n.port != "" {
-		return fmt.Sprintf("%s:%s", n.host, n.port)
-	}
-	return n.host
-}
-
-func attestPending(ctx context.Context, client *http.Client, base string, deviceID string, last string) (string, int, int, int, error) {
-	target, _, votes, required, total, err := fetchPendingBlock(ctx, client, base)
-	if err != nil {
-		if errors.Is(err, errNoPending) {
-			return last, votes, required, total, nil
-		}
-		return last, votes, required, total, err
-	}
-	if target == "" || target == last {
-		return last, votes, required, total, nil
-	}
-	votes, required, total, err = postDeviceAttestation(ctx, client, base, deviceID, target)
-	if err != nil {
-		return last, votes, required, total, err
-	}
-	return target, votes, required, total, nil
-}
-
-var errNoPending = errors.New("no pending block")
-
-func fetchPendingBlock(ctx context.Context, client *http.Client, base string) (string, int64, int, int, int, error) {
-	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, requestURL(base, "/helios/l3/pending"), nil)
-	if err != nil {
-		return "", 0, 0, 0, 0, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", 0, 0, 0, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return "", 0, 0, 0, 0, errNoPending
-	}
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		return "", 0, 0, 0, 0, fmt.Errorf("pending status %s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	var out struct {
-		Block    string `json:"block"`
-		Height   int64  `json:"height"`
-		Votes    int    `json:"votes"`
-		Required int    `json:"required"`
-		Total    int    `json:"total"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", 0, 0, 0, 0, err
-	}
-	return strings.ToLower(strings.TrimSpace(out.Block)), out.Height, out.Votes, out.Required, out.Total, nil
-}
-
-func postDeviceAttestation(ctx context.Context, client *http.Client, base, deviceID, block string) (int, int, int, error) {
-	payload := map[string]string{"device_id": deviceID, "block": block}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, requestURL(base, "/iot/attest"), bytes.NewReader(body))
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		return 0, 0, 0, fmt.Errorf("attest status %s: %s", resp.Status, strings.TrimSpace(string(buf)))
-	}
-	var out struct {
-		OK       bool `json:"ok"`
-		Votes    int  `json:"votes"`
-		Required int  `json:"required"`
-		Total    int  `json:"total"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, 0, 0, err
-	}
-	return out.Votes, out.Required, out.Total, nil
-}
-
-type regRequest struct {
-	device *device
-	resp   chan regResult
-}
-
-type regResult struct {
-	ok       bool
-	fallback bool
-	retry    time.Duration
-}
-
-type orchestratorConfig struct {
-	ctx         context.Context
-	client      *http.Client
-	host        host.Host
-	book        *addrBook
-	nodes       []*nodeEndpoint
-	minNodes    int
-	minAccept   int
-	interval    time.Duration
-	refresh     time.Duration
-	reg         *registrar
-	deviceCount int
-}
-
-type registrar struct {
-	host      host.Host
-	book      *addrBook
-	client    *http.Client
-	chain     string
-	endpoints []*nodeEndpoint
-	reqCh     chan regRequest
-	prefMu    sync.RWMutex
-	pref      []int
-}
-
-func newRegistrar(h host.Host, book *addrBook, client *http.Client, chain string, endpoints []*nodeEndpoint) *registrar {
-	return &registrar{
-		host:      h,
-		book:      book,
-		client:    client,
-		chain:     chain,
-		endpoints: endpoints,
-		reqCh:     make(chan regRequest),
-	}
-}
-
-func (r *registrar) start(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case req := <-r.reqCh:
-				res := r.handle(req.device)
-				req.resp <- res
-			}
-		}
-	}()
-}
-
-func (r *registrar) Register(ctx context.Context, d *device) (regResult, bool) {
-	respCh := make(chan regResult, 1)
-	select {
-	case <-ctx.Done():
-		return regResult{}, false
-	case r.reqCh <- regRequest{device: d, resp: respCh}:
-	}
-	select {
-	case <-ctx.Done():
-		return regResult{}, false
-	case res := <-respCh:
-		return res, true
-	}
-}
-
-func (r *registrar) setPreferred(order []int) {
-	r.prefMu.Lock()
-	r.pref = append([]int(nil), order...)
-	r.prefMu.Unlock()
-}
-
-func (r *registrar) orderFor(base int) []int {
-	max := len(r.endpoints)
-	if max == 0 {
+// parseCSV splits a comma-separated list and trims empties/spaces.
+func parseCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
 		return nil
 	}
-	r.prefMu.RLock()
-	pref := append([]int(nil), r.pref...)
-	r.prefMu.RUnlock()
-	if len(pref) == 0 {
-		return rotateIndices(max, base)
-	}
-	seen := make(map[int]struct{}, len(pref))
-	ordered := make([]int, 0, max)
-	start := 0
-	if len(pref) > 0 && max > 0 {
-		start = base % len(pref)
-	}
-	for i := 0; i < len(pref); i++ {
-		idx := pref[(start+i)%len(pref)]
-		if idx < 0 || idx >= max {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
 			continue
 		}
-		if _, ok := seen[idx]; ok {
-			continue
-		}
-		seen[idx] = struct{}{}
-		ordered = append(ordered, idx)
-	}
-	for _, idx := range rotateIndices(max, base) {
-		if _, ok := seen[idx]; ok {
-			continue
-		}
-		seen[idx] = struct{}{}
-		ordered = append(ordered, idx)
-	}
-	return ordered
-}
-
-func (r *registrar) handle(d *device) regResult {
-	req := httpRegisterRequest{
-		DeviceID: d.id,
-		Firmware: defaultFirmware,
-		Model:    defaultModel,
-		Kid:      hex.EncodeToString(d.kid),
-		Pub:      hex.EncodeToString(d.pub),
-		Sensors:  []string{"temp", "humidity"},
-		Caps:     []string{"push"},
-		ChainID:  r.chain,
-	}
-
-	delay := discoveryRetry
-	order := r.orderFor(d.baseOffset)
-	limitHits := 0
-	attempts := 0
-	blocked := 0
-	var earliest time.Time
-	now := time.Now()
-	var firstBase string
-	for _, idx := range order {
-		ep := r.endpoints[idx]
-		if ep == nil {
-			continue
-		}
-		if firstBase == "" {
-			firstBase = ep.base
-		}
-		if now.Before(ep.retryAt) {
-			blocked++
-			if earliest.IsZero() || ep.retryAt.Before(earliest) {
-				earliest = ep.retryAt
-			}
-			continue
-		}
-		resp, err := httpRegisterDevice(context.Background(), r.client, ep.base, req)
-		if err != nil {
-			log.Printf("register error (%s -> %s): %v", short(d.id), ep.label(), err)
-			continue
-		}
-		attempts++
-		if !resp.OK {
-			if resp.Error == "iot_limit_reached" {
-				delay = joinRetry
-				limitHits++
-				ep.retryAt = time.Now().Add(joinRetry)
-				log.Printf("device=%s cell full for node=%s", short(d.id), ep.label())
-				continue
-			}
-			log.Printf("register rejected (%s -> %s): %s", short(d.id), ep.label(), firstNonEmpty(resp.Message, resp.Error))
-			continue
-		}
-		if len(resp.P2PAddrs) > 0 {
-			if newAddrs := r.book.add(resp.P2PAddrs); len(newAddrs) > 0 {
-				p2p.ConnectToAddrs(r.host, newAddrs)
-			}
-		}
-		if resp.NodeID != "" {
-			if pid, err := peer.Decode(resp.NodeID); err == nil {
-				d.assigned = pid
-			}
-		}
-		d.assignedNode = ep.label()
-		d.assignedBase = ep.base
-		d.registered = true
-		d.fallback = false
-		if resp.Accepting {
-			ep.retryAt = time.Now().Add(discoveryRetry)
-		} else {
-			ep.retryAt = time.Now().Add(joinRetry)
-		}
-		d.nextJoin = time.Now().Add(joinRetry)
-		return regResult{ok: true, fallback: false, retry: joinRetry}
-	}
-
-	if attempts > 0 && limitHits == attempts {
-		d.assigned = ""
-		d.assignedNode = ""
-		if firstBase != "" {
-			d.assignedBase = firstBase
-		}
-		d.registered = true
-		d.fallback = true
-		d.nextJoin = time.Now().Add(joinRetry)
-		log.Printf("device=%s all nodes are full, start send only tx, try connection later", short(d.id))
-		return regResult{ok: true, fallback: true, retry: joinRetry}
-	}
-
-	if blocked > 0 {
-		wait := delay
-		if !earliest.IsZero() {
-			wait = time.Until(earliest)
-			if wait < discoveryRetry {
-				wait = discoveryRetry
-			}
-			if wait > joinRetry {
-				wait = joinRetry
-			}
-		}
-		return regResult{ok: false, fallback: false, retry: wait}
-	}
-
-	return regResult{ok: false, fallback: false, retry: delay}
-}
-
-type nodeCapacity struct {
-	idx       int
-	label     string
-	nodeID    string
-	connected int
-	max       int
-	accepting bool
-	addrs     []string
-	err       error
-}
-
-func runOrchestrator(cfg orchestratorConfig) ([]int, error) {
-	ctx := cfg.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if cfg.interval <= 0 {
-		cfg.interval = 2 * time.Second
-	}
-	if cfg.refresh <= 0 {
-		cfg.refresh = cfg.interval
-	}
-	if cfg.minNodes <= 0 {
-		cfg.minNodes = 1
-	}
-	if cfg.minAccept <= 0 {
-		cfg.minAccept = 1
-	}
-	ticker := time.NewTicker(cfg.interval)
-	defer ticker.Stop()
-	var (
-		lastFetch  time.Time
-		states     []nodeCapacity
-		lastNodes  int
-		lastAccept int
-	)
-	for {
-		if states == nil || time.Since(lastFetch) >= cfg.refresh {
-			now := time.Now()
-			states = fetchCapacities(ctx, cfg.client, cfg.nodes)
-			lastFetch = now
-			if cfg.book != nil && cfg.host != nil {
-				for _, st := range states {
-					if st.err != nil || len(st.addrs) == 0 {
-						continue
-					}
-					if newAddrs := cfg.book.add(st.addrs); len(newAddrs) > 0 {
-						p2p.ConnectToAddrs(cfg.host, newAddrs)
-					}
-				}
-			}
-		}
-		success := make([]nodeCapacity, 0, len(states))
-		for _, st := range states {
-			if st.err == nil {
-				success = append(success, st)
-			}
-		}
-		totalNodes := len(success)
-		accepting := make([]nodeCapacity, 0, len(success))
-		for _, st := range success {
-			if st.accepting {
-				accepting = append(accepting, st)
-			}
-		}
-		if totalNodes != lastNodes || len(accepting) != lastAccept {
-			log.Printf("orchestrator check: nodes=%d accepting=%d devices=%d", totalNodes, len(accepting), cfg.deviceCount)
-			lastNodes = totalNodes
-			lastAccept = len(accepting)
-		}
-		if totalNodes >= cfg.minNodes && len(accepting) >= cfg.minAccept && len(accepting) > 0 {
-			order := rankNodes(accepting)
-			if cfg.reg != nil {
-				cfg.reg.setPreferred(order)
-			}
-			log.Printf("orchestrator ready: using %d nodes", len(order))
-			return order, nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-func rankNodes(nodes []nodeCapacity) []int {
-	if len(nodes) == 0 {
-		return nil
-	}
-	copyNodes := append([]nodeCapacity(nil), nodes...)
-	sort.Slice(copyNodes, func(i, j int) bool {
-		iSlots := slotsLeft(copyNodes[i].max, copyNodes[i].connected)
-		jSlots := slotsLeft(copyNodes[j].max, copyNodes[j].connected)
-		if iSlots == jSlots {
-			return copyNodes[i].label < copyNodes[j].label
-		}
-		return iSlots > jSlots
-	})
-	order := make([]int, 0, len(copyNodes))
-	for _, st := range copyNodes {
-		order = append(order, st.idx)
-	}
-	return order
-}
-
-func slotsLeft(max, connected int) int {
-	if max <= 0 {
-		return 1 << 20
-	}
-	if connected >= max {
-		return 0
-	}
-	return max - connected
-}
-
-func fetchCapacities(ctx context.Context, client *http.Client, nodes []*nodeEndpoint) []nodeCapacity {
-	out := make([]nodeCapacity, len(nodes))
-	for i, ep := range nodes {
-		out[i] = pullCapacity(ctx, client, ep, i)
+		out = append(out, strings.TrimRight(p, "/"))
 	}
 	return out
 }
 
-func pullCapacity(ctx context.Context, client *http.Client, ep *nodeEndpoint, idx int) nodeCapacity {
-	info := nodeCapacity{idx: idx}
-	if ep == nil {
-		info.err = fmt.Errorf("missing endpoint")
-		return info
+// parseCaps parses caps CSV into a slice of length n (or 0s if empty).
+func parseCaps(s string, n int) []int {
+	if strings.TrimSpace(s) == "" {
+		return make([]int, n)
 	}
-	info.label = ep.label()
-	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, requestURL(ep.base, "/iot/capacity"), nil)
-	if err != nil {
-		info.err = err
-		return info
+	parts := strings.Split(s, ",")
+	caps := make([]int, n)
+	for i := 0; i < n; i++ {
+		if i < len(parts) {
+			v := strings.TrimSpace(parts[i])
+			if v == "" {
+				caps[i] = 0
+				continue
+			}
+			var val int
+			_, err := fmt.Sscanf(v, "%d", &val)
+			if err != nil {
+				val = 0
+			}
+			if val < 0 {
+				val = 0
+			}
+			caps[i] = val
+		} else {
+			caps[i] = 0
+		}
 	}
-	cli := client
-	if cli == nil {
-		cli = http.DefaultClient
-	}
-	resp, err := cli.Do(req)
-	if err != nil {
-		info.err = err
-		return info
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		info.err = fmt.Errorf("capacity status %s", resp.Status)
-		return info
-	}
-	var payload struct {
-		OK        bool     `json:"ok"`
-		NodeID    string   `json:"node_id"`
-		Connected int      `json:"connected"`
-		Max       int      `json:"max_devices"`
-		Accepting bool     `json:"accepting"`
-		Addrs     []string `json:"p2p_addrs"`
-		Error     string   `json:"error"`
-		Message   string   `json:"message"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
-		info.err = err
-		return info
-	}
-	if !payload.OK {
-		msg := firstNonEmpty(payload.Message, payload.Error, "node unavailable")
-		info.err = fmt.Errorf(msg)
-		return info
-	}
-	info.nodeID = payload.NodeID
-	info.connected = payload.Connected
-	info.max = payload.Max
-	info.accepting = payload.Accepting
-	info.addrs = payload.Addrs
-	return info
+	return caps
 }
 
-func loadSwarmKey(path string) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	s := strings.TrimSpace(string(data))
-	lines := strings.Split(s, "\n")
-	var keyHex string
-	if len(lines) >= 3 && strings.HasPrefix(lines[0], "/key/swarm/psk/") {
-		keyHex = strings.TrimSpace(lines[2])
-	} else if len(lines) == 1 && len(lines[0]) >= 64 {
-		keyHex = strings.TrimSpace(lines[0])
-	}
-	if keyHex != "" {
-		b, err := hex.DecodeString(keyHex)
-		if err != nil {
-			return nil, err
+// planAssignments returns a per-device chosen registration base URL,
+// honoring caps (0 = unlimited). Devices are assigned in order, filling
+// the first base up to its cap, then the next, etc.
+func planAssignments(n int, bases []string, caps []int) []string {
+	assign := make([]string, n)
+	counts := make([]int, len(bases))
+	for i := 0; i < n; i++ {
+		chosen := -1
+		for j := 0; j < len(bases); j++ {
+			if caps[j] == 0 || counts[j] < caps[j] {
+				chosen = j
+				break
+			}
 		}
-		return b, nil
+		if chosen == -1 {
+			chosen = len(bases) - 1
+		}
+		assign[i] = bases[chosen]
+		counts[chosen]++
 	}
-	if len(data) == 32 {
-		return data, nil
+	return assign
+}
+
+// summarizeAssignments prints counts per base for logging.
+func summarizeAssignments(assign []string) map[string]int {
+	counts := map[string]int{}
+	for _, b := range assign {
+		counts[b]++
 	}
-	return nil, fmt.Errorf("invalid swarm.key format")
+	return counts
 }
