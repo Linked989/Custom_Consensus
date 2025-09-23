@@ -390,7 +390,7 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client 
 			// attesters retry pending checks to ensure quorum
 			loops := 3
 			for i := 0; i < loops; i++ {
-				next, votes, required, total, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested)
+				next, _, _, _, err := attestPending(ctx, client, d.assignedBase, d.id, d.lastAttested)
 				if err != nil {
 					break
 				}
