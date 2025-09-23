@@ -158,31 +158,78 @@ func StartTxGossipToPool(ctx context.Context, ps *pubsub.PubSub, topicName strin
 		Mu sync.Mutex
 		M  map[string]time.Time
 	}{M: make(map[string]time.Time)}
+	type retryTx struct {
+		Data     []byte
+		Attempts int
+	}
+	const maxRetry = 5
+	retries := make(chan retryTx, 256)
+	process := func(data []byte, sender string, viaRetry bool) (bool, bool) {
+		e, err := pool.AddValidatedCOSE(data)
+		if err != nil {
+			unknown := strings.Contains(err.Error(), "unknown kid")
+			if unknown && !viaRetry {
+				copyData := append([]byte(nil), data...)
+				select {
+				case retries <- retryTx{Data: copyData, Attempts: 1}:
+				default:
+				}
+			}
+			return false, unknown
+		}
+		seen.Mu.Lock()
+		if _, ok := seen.M[e.TxID]; ok {
+			seen.Mu.Unlock()
+			return true, false
+		}
+		seen.M[e.TxID] = time.Now()
+		seen.Mu.Unlock()
+		if logTx {
+			logx.Info("tx accepted", "txid", e.TxID, "dev", e.DevID, "seq", e.Seq, "from", sender)
+		}
+		if bridgeURL != "" {
+			go forwardCOSE(bridgeURL, data)
+		}
+		return true, false
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case rt := <-retries:
+				if len(rt.Data) == 0 {
+					continue
+				}
+				sleep := time.Duration(rt.Attempts) * 150 * time.Millisecond
+				if sleep > 750*time.Millisecond {
+					sleep = 750 * time.Millisecond
+				}
+				timer := time.NewTimer(sleep)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				success, unknown := process(rt.Data, "retry", true)
+				if !success && unknown && rt.Attempts < maxRetry {
+					rt.Attempts++
+					select {
+					case retries <- rt:
+					default:
+					}
+				}
+			}
+		}
+	}()
 	go func() {
 		for {
 			msg, err := sub.Next(ctx)
 			if err != nil {
 				return
 			}
-			// Validate and add to mempool
-			e, err := pool.AddValidatedCOSE(msg.Message.GetData())
-			if err != nil {
-				continue
-			}
-			// Dedup notice for logs only
-			seen.Mu.Lock()
-			if _, ok := seen.M[e.TxID]; ok {
-				seen.Mu.Unlock()
-				continue
-			}
-			seen.M[e.TxID] = time.Now()
-			seen.Mu.Unlock()
-			if logTx {
-				logx.Info("tx accepted", "txid", e.TxID, "dev", e.DevID, "seq", e.Seq, "from", msg.ReceivedFrom.String())
-			}
-			if bridgeURL != "" {
-				go forwardCOSE(bridgeURL, msg.Message.GetData())
-			}
+			process(msg.Message.GetData(), msg.ReceivedFrom.String(), false)
 		}
 	}()
 	return topic, nil

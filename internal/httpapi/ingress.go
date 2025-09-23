@@ -692,6 +692,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			return
 		}
 		coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
+		p2p.AnnounceDeviceKey(r.Context(), h, kidBytes[:8], ed25519.PublicKey(pubBytes))
 		total := reg.Count()
 		nonAtt := reg.NonAttesterCount()
 		accepting := limit == 0 || nonAtt < limit

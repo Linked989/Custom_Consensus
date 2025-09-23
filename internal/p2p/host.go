@@ -30,7 +30,7 @@ const ProtocolID = "/pose/simple/1.0.0"
 type PeerMsg struct {
 	Type  string   `json:"type"`
 	From  string   `json:"from"`
-	Addrs []string `json:"addrs"`
+	Addrs []string `json:"addrs,omitempty"`
 	Kid   string   `json:"kid,omitempty"`   // hex ed25519 key id (prefix)
 	Pub   string   `json:"pub,omitempty"`   // hex ed25519 public key
 	Chain string   `json:"chain,omitempty"` // chain/network id
@@ -134,6 +134,38 @@ func SendHelloToAllPeers(ctx context.Context, h host.Host) {
 	}
 }
 
+// AnnounceDeviceKey shares a device public key with connected peers so they can verify telemetry.
+func AnnounceDeviceKey(ctx context.Context, h host.Host, kid []byte, pub ed25519.PublicKey) {
+	if len(kid) == 0 || len(pub) != ed25519.PublicKeySize {
+		return
+	}
+	msg := PeerMsg{Type: "device_key", From: h.ID().String(), Kid: hex.EncodeToString(kid), Pub: hex.EncodeToString(pub)}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	for _, pid := range h.Network().Peers() {
+		if pid == h.ID() {
+			continue
+		}
+		streamCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		s, err := h.NewStream(streamCtx, pid, ProtocolID)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if err := s.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			_ = s.Close()
+			continue
+		}
+		if _, err := s.Write(append(payload, '\n')); err != nil {
+			_ = s.Close()
+			continue
+		}
+		_ = s.Close()
+	}
+}
+
 // RegisterHelloHandler sets a stream handler that parses hello messages,
 // registers announced device keys, and optionally dials additional addrs.
 func RegisterHelloHandler(h host.Host) { RegisterHelloHandlerWithCallback(h, nil) }
@@ -145,24 +177,35 @@ func RegisterHelloHandlerWithCallback(h host.Host, onHello func(PeerMsg)) {
 		r := bufio.NewReader(s)
 		line, _ := r.ReadString('\n')
 		var pm PeerMsg
-		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &pm); err == nil && pm.Type == "hello" {
-			if pm.Chain != "" && expectedChain != "" && pm.Chain != expectedChain {
-				_ = s.Close()
-				_ = h.Network().ClosePeer(s.Conn().RemotePeer())
-				return
-			}
-			if pm.Kid != "" && pm.Pub != "" {
-				if kidBytes, err1 := hex.DecodeString(pm.Kid); err1 == nil {
-					if pubBytes, err2 := hex.DecodeString(pm.Pub); err2 == nil && len(pubBytes) == ed25519.PublicKeySize {
-						coseutil.RegistryRegister(kidBytes, ed25519.PublicKey(pubBytes))
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &pm); err == nil {
+			switch pm.Type {
+			case "hello":
+				if pm.Chain != "" && expectedChain != "" && pm.Chain != expectedChain {
+					_ = s.Close()
+					_ = h.Network().ClosePeer(s.Conn().RemotePeer())
+					return
+				}
+				if pm.Kid != "" && pm.Pub != "" {
+					if kidBytes, err1 := hex.DecodeString(pm.Kid); err1 == nil {
+						if pubBytes, err2 := hex.DecodeString(pm.Pub); err2 == nil && len(pubBytes) == ed25519.PublicKeySize {
+							coseutil.RegistryRegister(kidBytes, ed25519.PublicKey(pubBytes))
+						}
 					}
 				}
-			}
-			if len(pm.Addrs) > 0 {
-				ConnectToAddrs(h, pm.Addrs)
-			}
-			if onHello != nil {
-				onHello(pm)
+				if len(pm.Addrs) > 0 {
+					ConnectToAddrs(h, pm.Addrs)
+				}
+				if onHello != nil {
+					onHello(pm)
+				}
+			case "device_key":
+				if pm.Kid != "" && pm.Pub != "" {
+					if kidBytes, err1 := hex.DecodeString(pm.Kid); err1 == nil {
+						if pubBytes, err2 := hex.DecodeString(pm.Pub); err2 == nil && len(pubBytes) == ed25519.PublicKeySize {
+							coseutil.RegistryRegister(kidBytes, ed25519.PublicKey(pubBytes))
+						}
+					}
+				}
 			}
 		}
 		_, _ = io.WriteString(s, "ack\n")
