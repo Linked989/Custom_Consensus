@@ -148,7 +148,7 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 		}
 	} else {
 		// New device - check capacity if limit is set
-		if max > 0 && len(r.byID) >= max {
+		if max > 0 && len(r.byID) >= max && !IsL3Attester(d.DeviceID) {
 			return ErrRegistryFull
 		}
 		if d.FirstSeen.IsZero() {
