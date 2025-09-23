@@ -104,3 +104,4 @@
 - [x] Log bold IoT payloads on node admission
 - [x] Restore legacy iotdev telemetry+cell formation simulator
 - [x] Align iotdev telemetry payloads with dev generator format
+- [x] Normalize IoT payload logging to emit JSON-friendly data

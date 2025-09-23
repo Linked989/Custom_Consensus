@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -213,7 +214,8 @@ func StartTxGossipToPool(ctx context.Context, h host.Host, ps *pubsub.PubSub, to
 		if devID, dataPart, ok := entropy.ExtractDevIDAndData(data); ok {
 			var decoded interface{}
 			if err := cbor.Unmarshal(dataPart, &decoded); err == nil {
-				if js, err2 := json.Marshal(decoded); err2 == nil {
+				jsReady := normalizeForJSON(decoded)
+				if js, err2 := json.Marshal(jsReady); err2 == nil {
 					logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload", string(js))
 				} else {
 					logx.Info("\x1b[1mIOT DATA RECEIVED\x1b[0m", "device", devID, "payload_err", err2.Error())
@@ -283,4 +285,47 @@ func forwardCOSE(url string, cose []byte) {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+}
+
+func normalizeForJSON(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			out[k] = normalizeForJSON(vv)
+		}
+		return out
+	case map[int]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			out[fmt.Sprintf("%d", k)] = normalizeForJSON(vv)
+		}
+		return out
+	case map[int64]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			out[fmt.Sprintf("%d", k)] = normalizeForJSON(vv)
+		}
+		return out
+	case map[uint64]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			out[fmt.Sprintf("%d", k)] = normalizeForJSON(vv)
+		}
+		return out
+	case map[interface{}]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			out[fmt.Sprint(k)] = normalizeForJSON(vv)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i := range val {
+			out[i] = normalizeForJSON(val[i])
+		}
+		return out
+	default:
+		return v
+	}
 }
