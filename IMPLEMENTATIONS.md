@@ -43,3 +43,4 @@
 - [x] Implement fix so `cellThreshold` honors `iotMax`
 - [x] Validate runtime logs reflect configured IoT device limit
 - [x] Normalize boolean flag parsing so `-iot-max-devices` is always read
+- [x] Design orchestrator to auto-connect nodes and IoT devices within limits

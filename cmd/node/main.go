@@ -23,6 +23,7 @@ import (
 	"pose/internal/iot"
 	"pose/internal/logx"
 	"pose/internal/mempool"
+	"pose/internal/orchestrator"
 	"pose/internal/p2p"
 )
 
@@ -274,36 +275,32 @@ func main() {
 			l3.RegisterCell(helios.CellRecord{ID: c.ID, RegionID: c.NodeID, PubKey: pub})
 		}
 	}
-	// Start HTTP API early so devices can register while we wait for preflight.
+	// Start HTTP API early so devices can register while we wait for orchestration.
 	if *httpIn != "" {
 		srv := httpapi.StartHTTPAPI(ctx, *httpIn, txTopic, h, pool, *chainID, directory, devReg, cellMgr, getAION, getHELIOS, getL2, getL3)
 		defer srv.Shutdown(ctx)
 		logx.Info("http api", "listen", *httpIn)
 	}
 
-	// Preflight: ensure at least 2 nodes present and minimum devices are connected locally
-	// before starting blockchain services. Log progress while waiting.
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		total := members.CountAndSweep()
-		peers := len(h.Network().Peers())
-		devs := devReg.List()
-		haveNodes := total >= 3 || peers >= 1 // at least 2 nodes total implies >=1 peer besides self
-		haveDevices := len(devs) >= cellThreshold
-		if haveDevices {
-			if c := cellMgr.TryForm(devReg); c != nil && c.Active {
-				// formed; proceed to node start after both conditions satisfied
-				registerCell(c)
-			}
-		}
-		if haveNodes && haveDevices {
-			logx.Info("preflight Ok: starting blockchain services", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "cell_threshold", cellThreshold)
-			break
-		}
-		logx.Info("preflight waiting", "nodes_seen", total, "peers_connected", peers, "devices", len(devs), "min_devices", cellThreshold)
-		time.Sleep(1 * time.Second)
+	orch := orchestrator.Start(orchestrator.Config{
+		Context:       ctx,
+		Host:          h,
+		Members:       members,
+		Directory:     directory,
+		Registry:      devReg,
+		Cells:         cellMgr,
+		CellThreshold: cellThreshold,
+		MinNodes:      3,
+		MinPeers:      1,
+		Interval:      time.Second,
+		RegisterCell:  registerCell,
+	})
+	defer orch.Stop()
+
+	select {
+	case <-orch.Ready():
+	case <-ctx.Done():
+		return
 	}
 
 	// AION network service (commit/reveal/VRF + selection); enabled by default
