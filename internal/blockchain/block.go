@@ -517,7 +517,7 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
 				return
 			}
 			// validate tx quickly
-			if _, _, _, err := coseutil.ValidateCOSETx(msg.Message.GetData()); err != nil {
+			if _, _, _, _, err := coseutil.ValidateCOSETx(msg.Message.GetData()); err != nil {
 				continue
 			}
 			select {
@@ -554,7 +554,7 @@ func StartBlockBuilder(ctx context.Context, h host.Host, txTopic *pubsub.Topic, 
 				// build block
 				blk := Block{Version: 1, ChainID: chainID, Height: height, PrevHash: prev, Timestamp: time.Now().UTC()}
 				for _, tx := range batch {
-					txid, _, _, _ := coseutil.ValidateCOSETx(tx)
+					txid, _, _, _, _ := coseutil.ValidateCOSETx(tx)
 					blk.TxIDs = append(blk.TxIDs, txid)
 					blk.Txs = append(blk.Txs, tx)
 				}
@@ -639,7 +639,7 @@ func StartBlockBuilderFromPool(ctx context.Context, h host.Host, pool *mempool.P
 					if maxBytes > 0 && total+len(tx) > maxBytes {
 						break
 					}
-					txid, _, _, _ := coseutil.ValidateCOSETx(tx)
+					txid, _, _, _, _ := coseutil.ValidateCOSETx(tx)
 					blk.TxIDs = append(blk.TxIDs, txid)
 					blk.Txs = append(blk.Txs, tx)
 					total += len(tx)
@@ -774,11 +774,11 @@ func StartBlockSubscriber(ctx context.Context, h host.Host, ps *pubsub.PubSub, b
 			// re-validate txs (basic) with on-demand key fetch
 			ok := true
 			for _, tx := range blk.Txs {
-				if _, _, _, err := coseutil.ValidateCOSETx(tx); err != nil {
+				if _, _, _, _, err := coseutil.ValidateCOSETx(tx); err != nil {
 					if strings.Contains(err.Error(), "unknown kid") {
 						if kid, kerr := coseutil.ExtractKid(tx); kerr == nil {
 							if fetchAndRegisterKey(ctx, h, kid) {
-								if _, _, _, err2 := coseutil.ValidateCOSETx(tx); err2 == nil {
+								if _, _, _, _, err2 := coseutil.ValidateCOSETx(tx); err2 == nil {
 									continue
 								}
 							}

@@ -81,3 +81,6 @@
 - [x] Add HTTP endpoint exposing mempool stats
 
 - [ ] Confirm IoT telemetry reaches mempool
+- [x] Analyze IoT tx submission vs mempool admission
+- [x] Fix mempool admission path so IoT tx persist
+- [ ] Validate mempool fills when IoT tx arrive

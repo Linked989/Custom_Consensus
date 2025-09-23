@@ -54,12 +54,12 @@ func (p *Pool) Snapshot() []*Entry {
 
 // AddValidatedCOSE validates a COSE tx, applies replay rules, and inserts it if new.
 func (p *Pool) AddValidatedCOSE(b []byte) (*Entry, error) {
-	txid, devID, seq, err := coseutil.ValidateCOSETx(b)
+	txid, devID, kid, seq, err := coseutil.ValidateCOSETx(b)
 	if err != nil {
 		return nil, err
 	}
 	// replay protection
-	if !coseutil.UpdateLastSeq(devID, seq) {
+	if !coseutil.UpdateLastSeq(devID, kid, seq) {
 		return nil, errors.New("replay")
 	}
 	p.mu.Lock()
@@ -95,7 +95,8 @@ func (p *Pool) AddValidatedCOSE(b []byte) (*Entry, error) {
 			return nil, errors.New("mempool_full")
 		}
 	}
-	e := &Entry{TxID: txid, DevID: devID, Seq: seq, Bytes: b, Added: time.Now()}
+	raw := append([]byte(nil), b...)
+	e := &Entry{TxID: txid, DevID: devID, Seq: seq, Bytes: raw, Added: time.Now()}
 	p.entries[txid] = e
 	p.order = append(p.order, txid)
 	p.curBytes += len(b)
