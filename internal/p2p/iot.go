@@ -111,21 +111,23 @@ func handleIoTRegister(s network.Stream, h host.Host, reg *iot.Registry, req IoT
 	}
 	if err := reg.UpsertWithLimit(device, limit); err != nil {
 		if errors.Is(err, iot.ErrRegistryFull) {
-			count := reg.Count()
-			writeIoTResponse(s, IoTResponse{OK: false, Error: "iot_limit_reached", Message: "node at capacity", NodeID: h.ID().String(), Connected: count, MaxDevices: limit, Accepting: false, Timestamp: time.Now().UTC()})
+			nonAtt := reg.NonAttesterCount()
+			writeIoTResponse(s, IoTResponse{OK: false, Error: "iot_limit_reached", Message: "node at capacity", NodeID: h.ID().String(), Connected: nonAtt, MaxDevices: limit, Accepting: false, Timestamp: time.Now().UTC()})
 			return
 		}
 		writeIoTResponse(s, IoTResponse{OK: false, Error: "registry_error", Message: err.Error()})
 		return
 	}
 	coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
-	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: reg.Count(), MaxDevices: limit, Accepting: limit == 0 || reg.Count() < limit, Timestamp: time.Now().UTC()})
+	nonAtt := reg.NonAttesterCount()
+	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: reg.Count(), MaxDevices: limit, Accepting: limit == 0 || nonAtt < limit, Timestamp: time.Now().UTC()})
 }
 
 func handleIoTCapacity(s network.Stream, h host.Host, reg *iot.Registry) {
 	count := reg.Count()
 	max := reg.Max()
-	accepting := max == 0 || count < max
+	nonAtt := reg.NonAttesterCount()
+	accepting := max == 0 || nonAtt < max
 	writeIoTResponse(s, IoTResponse{OK: true, NodeID: h.ID().String(), Connected: count, MaxDevices: max, Accepting: accepting, Timestamp: time.Now().UTC()})
 }
 

@@ -69,3 +69,6 @@
 - [x] Auto-discover L3 attesters without flags
 
 - [x] Enrich L3 attester progress reporting
+
+- [x] Allow L3 attesters without consuming IoT capacity
+

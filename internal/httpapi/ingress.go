@@ -640,7 +640,7 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 					"error":       "iot_limit_reached",
 					"message":     "node at capacity",
 					"node_id":     h.ID().String(),
-					"connected":   reg.Count(),
+					"connected":   reg.NonAttesterCount(),
 					"max_devices": limit,
 					"accepting":   false,
 					"timestamp":   time.Now().UTC(),
@@ -655,7 +655,8 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 		coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
 		count := reg.Count()
-		accepting := limit == 0 || count < limit
+		nonAtt := reg.NonAttesterCount()
+		accepting := limit == 0 || nonAtt < limit
 		resp := map[string]any{
 			"ok":          true,
 			"node_id":     h.ID().String(),

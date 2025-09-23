@@ -114,6 +114,13 @@ func (r *Registry) Count() int {
 	return len(r.byID)
 }
 
+// NonAttesterCount returns count of non-attester devices.
+func (r *Registry) NonAttesterCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nonAttesterCountLocked()
+}
+
 // Get returns the stored device if present.
 func (r *Registry) Get(deviceID string) (Device, bool) {
 	r.mu.Lock()
@@ -148,7 +155,7 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 		}
 	} else {
 		// New device - check capacity if limit is set
-		if max > 0 && len(r.byID) >= max && !IsL3Attester(d.DeviceID) {
+		if max > 0 && !IsL3Attester(d.DeviceID) && r.nonAttesterCountLocked() >= max {
 			return ErrRegistryFull
 		}
 		if d.FirstSeen.IsZero() {
@@ -161,6 +168,16 @@ func (r *Registry) UpsertWithLimit(d Device, max int) error {
 	}
 	r.byID[d.DeviceID] = d
 	return r.saveLocked()
+}
+
+func (r *Registry) nonAttesterCountLocked() int {
+	count := 0
+	for id := range r.byID {
+		if !IsL3Attester(id) {
+			count++
+		}
+	}
+	return count
 }
 
 // ---- persistence ----
