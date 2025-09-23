@@ -73,3 +73,5 @@
 - [x] Allow L3 attesters without consuming IoT capacity
 
 - [x] Ensure IoT attester registration does not consume device slots
+
+- [x] Drain mempool directly during block proposals

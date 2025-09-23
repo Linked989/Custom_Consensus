@@ -567,20 +567,20 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			http.Error(w, "GET only", http.StatusMethodNotAllowed)
 			return
 		}
-	count := reg.Count()
-	max := reg.Max()
-	nonAtt := reg.NonAttesterCount()
-	accepting := max == 0 || nonAtt < max
-	resp := map[string]any{
-		"ok":          true,
-		"node_id":     h.ID().String(),
-		"connected":   nonAtt,
-		"max_devices": max,
-		"accepting":   accepting,
-		"total_devices": count,
-		"p2p_addrs":   p2p.LocalAddrs(h),
-		"timestamp":   time.Now().UTC(),
-	}
+		count := reg.Count()
+		max := reg.Max()
+		nonAtt := reg.NonAttesterCount()
+		accepting := max == 0 || nonAtt < max
+		resp := map[string]any{
+			"ok":            true,
+			"node_id":       h.ID().String(),
+			"connected":     nonAtt,
+			"max_devices":   max,
+			"accepting":     accepting,
+			"total_devices": count,
+			"p2p_addrs":     p2p.LocalAddrs(h),
+			"timestamp":     time.Now().UTC(),
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
@@ -658,20 +658,19 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			return
 		}
 		coseutil.RegistryRegister(kidBytes[:8], ed25519.PublicKey(pubBytes))
-		count := reg.Count()
+		total := reg.Count()
 		nonAtt := reg.NonAttesterCount()
 		accepting := limit == 0 || nonAtt < limit
-	nonAtt := reg.NonAttesterCount()
-	resp := map[string]any{
-		"ok":          true,
-		"node_id":     h.ID().String(),
-		"connected":   nonAtt,
-		"max_devices": limit,
-		"accepting":   accepting,
-		"total_devices": count,
-		"p2p_addrs":   p2p.LocalAddrs(h),
-		"timestamp":   time.Now().UTC(),
-	}
+		resp := map[string]any{
+			"ok":            true,
+			"node_id":       h.ID().String(),
+			"connected":     nonAtt,
+			"max_devices":   limit,
+			"accepting":     accepting,
+			"total_devices": total,
+			"p2p_addrs":     p2p.LocalAddrs(h),
+			"timestamp":     time.Now().UTC(),
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
