@@ -395,6 +395,27 @@ func main() {
 			}
 		}()
 	}
+	if l3svc != nil && devReg != nil {
+		l3svc.UpdateDeviceTotal(devReg.Count())
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			lastDevices := -1
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					total := devReg.Count()
+					if total == lastDevices {
+						continue
+					}
+					lastDevices = total
+					l3svc.UpdateDeviceTotal(total)
+				}
+			}
+		}()
+	}
 	// Always start builder; AllowProduceSlot gates production to elected leader.
 	{
 		allow := func() bool { return aionSvc.AllowProduceSlot() }

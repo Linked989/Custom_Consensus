@@ -263,6 +263,7 @@ func (st L3Status) String() string {
 type blockCounters struct {
 	cells        map[string]struct{}
 	attestations map[string]L3Attestation
+	deviceVotes  map[string]struct{}
 	auditsPassed int
 	auditsFailed int
 	qcWeight     float64
@@ -298,6 +299,8 @@ type L3Service struct {
 	misbehave map[string]int
 
 	cells *CellRegistry
+
+	devicesTotal int
 }
 
 // StartL3Finality configures subscriptions and processing loops.
@@ -433,6 +436,7 @@ func (s *L3Service) ensureBlock(blockHex string) *blockCounters {
 	blk = &blockCounters{
 		cells:        make(map[string]struct{}),
 		attestations: make(map[string]L3Attestation),
+		deviceVotes:  make(map[string]struct{}),
 		firstSeen:    time.Now().UTC(),
 		status:       L3StatusPending,
 	}
@@ -461,6 +465,17 @@ func (s *L3Service) RecordBlockMeta(blockID []byte, parent []byte, height int64,
 		blk.l2Committed = true
 		logx.Info("helios l3 l2 commit", "block", shortHex(hexID), "height", height)
 	}
+}
+
+// UpdateDeviceTotal refreshes the number of registered IoT devices.
+func (s *L3Service) UpdateDeviceTotal(total int) {
+	if total < 0 {
+		total = 0
+	}
+	s.mu.Lock()
+	s.devicesTotal = total
+	s.mu.Unlock()
+	logx.Info("helios l3 device total", "devices", total)
 }
 
 // RegisterCell exposes cells to the service.
@@ -540,6 +555,34 @@ func (s *L3Service) onAttestation(data []byte, from peer.ID) {
 	blk.status = L3StatusPending
 	logx.Debug("helios l3 attestation accepted", "cell", att.CellID, "from", from)
 	s.maybeFinalizeLocked(hex.EncodeToString(att.BlockID), blk)
+}
+
+// RecordDeviceAttestation records a device's vote for a block and returns progress stats.
+func (s *L3Service) RecordDeviceAttestation(blockID []byte, deviceID string) (votes int, required int, total int, recorded bool) {
+	if len(blockID) == 0 || deviceID == "" {
+		return 0, 0, 0, false
+	}
+	hexID := hex.EncodeToString(blockID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	blk := s.ensureBlock(hexID)
+	if blk.status == L3StatusFinal {
+		return len(blk.deviceVotes), requiredDevices(s.devicesTotal), s.devicesTotal, false
+	}
+	if blk.deviceVotes == nil {
+		blk.deviceVotes = make(map[string]struct{})
+	}
+	if _, seen := blk.deviceVotes[deviceID]; seen {
+		return len(blk.deviceVotes), requiredDevices(s.devicesTotal), s.devicesTotal, false
+	}
+	blk.deviceVotes[deviceID] = struct{}{}
+	votes = len(blk.deviceVotes)
+	required = requiredDevices(s.devicesTotal)
+	total = s.devicesTotal
+	recorded = true
+	logx.Info("helios l3 device attest", "block", shortHex(hexID), "device", shortDevice(deviceID), "votes", votes, "required", required, "total", total)
+	s.maybeFinalizeLocked(hexID, blk)
+	return votes, required, total, true
 }
 
 func (s *L3Service) verifyAttestationSignature(att L3Attestation, pub []byte) bool {
@@ -624,7 +667,7 @@ func (s *L3Service) maybeFinalizeLocked(blockHex string, blk *blockCounters) {
 		env := s.buildEnvelopeLocked(blockHex, blk)
 		blk.envelope = env
 		blk.status = L3StatusFinal
-		logx.Info("helios l3 finalized", "block", shortHex(blockHex), "height", blk.height, "cells", len(blk.cells))
+		logx.Info("helios l3 finalized", "block", shortHex(blockHex), "height", blk.height, "cells", len(blk.cells), "device_votes", len(blk.deviceVotes), "device_total", s.devicesTotal)
 		s.broadcastEnvelope(env)
 	}
 }
@@ -662,6 +705,10 @@ func (s *L3Service) isReadyLocked(blk *blockCounters) bool {
 		if len(blk.cells) < effectiveCells {
 			return false
 		}
+	}
+	deviceRequired := requiredDevices(s.devicesTotal)
+	if deviceRequired > 0 && len(blk.deviceVotes) < deviceRequired {
+		return false
 	}
 	if s.params.TotalStake <= 0 {
 		return false
@@ -789,7 +836,7 @@ func (s *L3Service) GetFinalityEnvelope(blockID []byte) (*FinalityEnvelope, erro
 }
 
 // MetricsForBlock returns counts for operators.
-func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, auditsPassed int, auditsFailed int) {
+func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, deviceVotes int, deviceNeeded int, deviceTotal int, auditsPassed int, auditsFailed int) {
 	hexID := hex.EncodeToString(blockID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -797,7 +844,7 @@ func (s *L3Service) MetricsForBlock(blockID []byte) (cells int, auditsPassed int
 	if !ok {
 		return
 	}
-	return len(blk.cells), blk.auditsPassed, blk.auditsFailed
+	return len(blk.cells), len(blk.deviceVotes), requiredDevices(s.devicesTotal), s.devicesTotal, blk.auditsPassed, blk.auditsFailed
 }
 
 // L3BlockProgress summarizes tracked blocks for monitoring.
@@ -815,6 +862,9 @@ type L3BlockProgress struct {
 	StakeTarget  float64    `json:"stake_target"`
 	FirstSeen    time.Time  `json:"first_seen"`
 	FinalizedAt  *time.Time `json:"finalized_at,omitempty"`
+	DeviceVotes  int        `json:"device_votes"`
+	DeviceNeeded int        `json:"device_required"`
+	DeviceTotal  int        `json:"device_total"`
 }
 
 // Snapshot returns up to limit block progress entries ordered by height desc.
@@ -837,6 +887,9 @@ func (s *L3Service) Snapshot(limit int) []L3BlockProgress {
 			QCWeight:     blk.qcWeight,
 			StakeTarget:  target,
 			FirstSeen:    blk.firstSeen,
+			DeviceVotes:  len(blk.deviceVotes),
+			DeviceNeeded: requiredDevices(s.devicesTotal),
+			DeviceTotal:  s.devicesTotal,
 		}
 		if blk.envelope != nil {
 			final := blk.envelope.FinalizedAt
@@ -862,4 +915,18 @@ func shortHex(in string) string {
 		return in
 	}
 	return fmt.Sprintf("%s…%s", in[:4], in[len(in)-2:])
+}
+
+func shortDevice(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return fmt.Sprintf("%s…%s", id[:6], id[len(id)-4:])
+}
+
+func requiredDevices(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	return (2*total + 2) / 3
 }

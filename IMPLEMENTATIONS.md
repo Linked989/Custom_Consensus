@@ -47,3 +47,6 @@
 - [x] Investigate L3 pending status under multi-node deployments
 - [x] Evaluate consensus resilience to latency and low-power nodes
 - [x] Simplify L3 finality by removing region quorum requirements
+- [x] Design lightweight IoT device L3 attestation flow
+- [x] Implement IoT-driven finality quorum and device attestation APIs
+- [x] Update IoT simulator to submit L3 attestations and report participation

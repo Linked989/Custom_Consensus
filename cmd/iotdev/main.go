@@ -55,10 +55,12 @@ type device struct {
 	seq          uint64
 	assigned     peer.ID
 	assignedNode string
+	assignedBase string
 	fallback     bool
 	registered   bool
 	nextJoin     time.Time
 	baseOffset   int
+	lastAttested string
 }
 
 type addrBook struct {
@@ -252,14 +254,14 @@ func main() {
 		wg.Add(1)
 		go func(d *device) {
 			defer wg.Done()
-			runDevice(ctx, txTopic, reg, *chain, interval, jitter, once, d)
+			runDevice(ctx, txTopic, reg, client, *chain, interval, jitter, once, d)
 		}(&devs[i])
 	}
 
 	wg.Wait()
 }
 
-func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, chain string, interval, jitter *time.Duration, once *bool, d *device) {
+func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, client *http.Client, chain string, interval, jitter *time.Duration, once *bool, d *device) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -317,6 +319,14 @@ func runDevice(ctx context.Context, topic *pubsub.Topic, reg *registrar, chain s
 			log.Printf("sent device=%s node=fallback txid=%s", short(d.id), txid[:12])
 		} else {
 			log.Printf("sent device=%s txid=%s", short(d.id), txid[:12])
+		}
+		if client != nil && d.assignedBase != "" {
+			if tip, votes, required, total, err := attestLatest(ctx, client, d.assignedBase, d.id, d.lastAttested); err != nil {
+				log.Printf("attest failed (%s): %v", short(d.id), err)
+			} else if tip != d.lastAttested {
+				log.Printf("attested device=%s block=%s votes=%d/%d total_devices=%d", short(d.id), short(tip), votes, required, total)
+				d.lastAttested = tip
+			}
 		}
 		if *once {
 			return
@@ -527,6 +537,80 @@ func (n *nodeEndpoint) label() string {
 	return n.host
 }
 
+func attestLatest(ctx context.Context, client *http.Client, base string, deviceID string, last string) (string, int, int, int, error) {
+	tip, err := fetchTipHash(ctx, client, base)
+	if err != nil {
+		return last, 0, 0, 0, err
+	}
+	if tip == "" || tip == last {
+		return last, 0, 0, 0, nil
+	}
+	votes, required, total, err := postDeviceAttestation(ctx, client, base, deviceID, tip)
+	if err != nil {
+		return last, 0, 0, 0, err
+	}
+	return tip, votes, required, total, nil
+}
+
+func fetchTipHash(ctx context.Context, client *http.Client, base string) (string, error) {
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, requestURL(base, "/status"), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return "", fmt.Errorf("status %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var out struct {
+		TipHash string `json:"tip_hash"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(out.TipHash)), nil
+}
+
+func postDeviceAttestation(ctx context.Context, client *http.Client, base, deviceID, block string) (int, int, int, error) {
+	payload := map[string]string{"device_id": deviceID, "block": block}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, requestURL(base, "/iot/attest"), bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return 0, 0, 0, fmt.Errorf("attest status %s: %s", resp.Status, strings.TrimSpace(string(buf)))
+	}
+	var out struct {
+		OK       bool `json:"ok"`
+		Votes    int  `json:"votes"`
+		Required int  `json:"required"`
+		Total    int  `json:"total"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, 0, 0, err
+	}
+	return out.Votes, out.Required, out.Total, nil
+}
+
 type regRequest struct {
 	device *device
 	resp   chan regResult
@@ -706,6 +790,7 @@ func (r *registrar) handle(d *device) regResult {
 			}
 		}
 		d.assignedNode = ep.label()
+		d.assignedBase = ep.base
 		d.registered = true
 		d.fallback = false
 		if resp.Accepting {

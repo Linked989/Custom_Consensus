@@ -437,14 +437,17 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 		}
 		status := svc.QueryL3Status(blockID)
 		ready := svc.IsL3Ready(blockID)
-		cells, auditsPassed, auditsFailed := svc.MetricsForBlock(blockID)
+		cells, deviceVotes, deviceNeeded, deviceTotal, auditsPassed, auditsFailed := svc.MetricsForBlock(blockID)
 		resp := map[string]any{
-			"block":         blockHex,
-			"status":        status.String(),
-			"ready":         ready,
-			"cells":         cells,
-			"audits_passed": auditsPassed,
-			"audits_failed": auditsFailed,
+			"block":           blockHex,
+			"status":          status.String(),
+			"ready":           ready,
+			"cells":           cells,
+			"device_votes":    deviceVotes,
+			"device_required": deviceNeeded,
+			"device_total":    deviceTotal,
+			"audits_passed":   auditsPassed,
+			"audits_failed":   auditsFailed,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -635,6 +638,56 @@ func StartHTTPAPI(ctx context.Context, addr string, txTopic *pubsub.Topic, h hos
 			"accepting":   accepting,
 			"p2p_addrs":   p2p.LocalAddrs(h),
 			"timestamp":   time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc("/iot/attest", func(w http.ResponseWriter, r *http.Request) {
+		if reg == nil {
+			http.Error(w, "iot registry disabled", http.StatusServiceUnavailable)
+			return
+		}
+		if getL3 == nil {
+			http.Error(w, "helios l3 not available", http.StatusServiceUnavailable)
+			return
+		}
+		svc := getL3()
+		if svc == nil {
+			http.Error(w, "helios l3 not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			DeviceID string `json:"device_id"`
+			Block    string `json:"block"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if req.DeviceID == "" || req.Block == "" {
+			http.Error(w, "device_id and block required", http.StatusBadRequest)
+			return
+		}
+		if _, ok := reg.Get(req.DeviceID); !ok {
+			http.Error(w, "device not registered", http.StatusNotFound)
+			return
+		}
+		blockID, err := hex.DecodeString(strings.ToLower(req.Block))
+		if err != nil {
+			http.Error(w, "bad block", http.StatusBadRequest)
+			return
+		}
+		votes, required, total, recorded := svc.RecordDeviceAttestation(blockID, req.DeviceID)
+		resp := map[string]any{
+			"ok":       recorded,
+			"votes":    votes,
+			"required": required,
+			"total":    total,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
