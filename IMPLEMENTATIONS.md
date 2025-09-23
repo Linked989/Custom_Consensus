@@ -84,3 +84,6 @@
 - [x] Analyze IoT tx submission vs mempool admission
 - [x] Fix mempool admission path so IoT tx persist
 - [ ] Validate mempool fills when IoT tx arrive
+- [x] Split IoT attester simulator into separate binary
+- [x] Update iotdev to emit telemetry only
+- [x] Implement dedicated attester runner

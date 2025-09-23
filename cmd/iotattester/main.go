@@ -24,10 +24,8 @@ func main() {
 	var nodes multiFlag
 	flag.Var(&nodes, "node", "node HTTP base URL for registration (repeatable)")
 	chain := flag.String("chain", "iotnet-main", "chain/network id")
-	devices := flag.Int("devices", 5, "number of simulated devices")
-	interval := flag.Duration("interval", 1500*time.Millisecond, "send interval per device")
-	jitter := flag.Duration("jitter", 500*time.Millisecond, "random jitter added to interval")
-	once := flag.Bool("once", false, "send just one reading per device then exit")
+	attesters := flag.Int("attesters", 2, "number of dedicated L3 attester devices")
+	attesterInterval := flag.Duration("attester-interval", 150*time.Millisecond, "send interval per L3 attester")
 	list := flag.Bool("list", false, "list devices from first HTTP node and exit")
 	topicName := flag.String("topic", "", "pubsub topic for COSE telemetry")
 	pnetPath := flag.String("pnet", "", "path to swarm.key for private network")
@@ -49,12 +47,12 @@ func main() {
 		Peers:                    peers,
 		Nodes:                    nodes,
 		Chain:                    *chain,
-		TelemetryDevices:         *devices,
-		AttesterDevices:          0,
-		Interval:                 *interval,
-		AttesterInterval:         0,
-		Jitter:                   *jitter,
-		Once:                     *once,
+		TelemetryDevices:         0,
+		AttesterDevices:          *attesters,
+		Interval:                 0,
+		AttesterInterval:         *attesterInterval,
+		Jitter:                   0,
+		Once:                     false,
 		ListOnly:                 *list,
 		Topic:                    *topicName,
 		PNetPath:                 *pnetPath,
